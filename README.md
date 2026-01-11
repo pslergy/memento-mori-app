@@ -68,6 +68,16 @@ During development, we encountered a critical issue where aggressive battery opt
 
 ---
 
+
+## 🕊️ Ethical & Humanitarian Architecture
+Memento Mori is built for scenarios where communication equals survival. 
+We explicitly reject monetization of bridge access in conflict zones.
+
+**Implemented Ethical Protocols:**
+*   **Proof of Cooperation (PoC):** Priority routing is granted based on the node's contribution to the mesh network, not financial status.
+*   **RF Stealth Handshake:** Bridge nodes use randomized transmission intervals to evade signal triangulation by military-grade sensors.
+*   **Anti-Traffic Analysis:** Data padding and traffic mixing to protect the physical location of Starlink/Backhaul gateways.
+
 ## 💰 Monetization Strategy: Gossip Ad-Network
 Memento Mori introduces a unique **Offline Advertising Protocol**. Using a Gossip-based synchronization, nodes exchange signed "Tactical Ad Packets" during P2P handshakes. This creates a decentralized ad network that earns revenue even when the global internet is unreachable.
 
