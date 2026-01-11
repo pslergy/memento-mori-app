@@ -40,6 +40,24 @@ The messenger dynamically switches between three transport layers:
 
 ---
 
+
+---
+
+## 🖥️ Backend Architecture & Privacy
+The Memento Mori server infrastructure is a robust system built on **Node.js (Express), PostgreSQL, and PostGIS** for geospatial indexing.
+
+**Why is the backend repository private?**
+To maintain the security of the relay network and protect the core signal-routing logic from adversarial analysis, the backend source code is kept in a **private repository**. 
+
+**Key Infrastructure Responsibilities:**
+*   **Identity Anchoring:** Secure verification of handshakes to prevent impersonation.
+*   **Bridge Synchronization:** Managing the encrypted Outbox for nodes acting as internet gateways.
+*   **DPI Deception:** Implementation of traffic obfuscation protocols to hide messenger activity from network analysis tools.
+
+*Note: The client-side code is open-source to allow public verification of our End-to-End Encryption (E2EE) implementation.*
+
+---
+
 ## 🎯 The "Tecno/Huawei" Case Study: Overcoming Hardware Isolation
 During development, we encountered a critical issue where aggressive battery optimization and non-standard Android KeyStore implementations on Tecno and Huawei devices caused socket "ghosting" and data decryption failures.
 
