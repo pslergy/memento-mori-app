@@ -73,6 +73,9 @@ Memento Mori introduces a unique **Offline Advertising Protocol**. Using a Gossi
 
 ---
 
+
+Memento Mori is part of a broader engineering portfolio, including **Kismet** — a production-ready AI Social/Dating platform localized in 8 languages, featuring NASA-standard astronomical engines and high-concurrency infrastructure.
+
 ## 👨‍💻 Developer
 **Pslergy**  
 *Focus: Product Engineering, Cybersecurity, Distributed Systems.*
