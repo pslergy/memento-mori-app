@@ -1,0 +1,89 @@
+name: memento_mori_app
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.0.0 # Понизил требование, чтобы пакеты точно подошли (3.9.2 пока не существует в стабильной ветке)
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # --- UI & Локализация ---
+  cupertino_icons: ^1.0.8
+  google_fonts: ^6.3.2
+  animate_do: ^4.2.0
+  flutter_localizations:
+    sdk: flutter
+  intl: ^0.20.2
+
+  app_settings: ^6.1.1
+  math_expressions: ^2.4.0
+  # --- Аудио (ты добавил, пусть будет для звуков таймера/чата) ---
+  audioplayers: ^6.5.1
+
+  # --- Сеть и Данные (Бэкенд) ---
+  http: ^1.5.0
+  web_socket_channel: ^3.0.3
+  flutter_secure_storage: ^9.2.4
+  geolocator: ^13.0.1
+  device_info_plus: ^10.1.0
+  flutter_ble_peripheral: ^2.0.1
+  get_it: ^7.7.0
+  provider: ^6.1.1
+  flutter_foreground_task: ^6.1.1
+  sensors_plus: ^6.1.1
+  shared_preferences: ^2.2.2
+  local_auth: ^2.1.6
+  sqflite: ^2.3.0
+  path: ^1.8.3
+  wakelock_plus: ^1.2.8
+  just_audio: ^0.9.36
+  # Для полноценного декодирования (FFT) позже понадобится:
+  # fftea: ^1.1.0
+  flutter_local_notifications: ^17.1.2
+
+  cryptography: ^2.5.0
+
+  # --- 🔥 НОВЫЕ ЗАВИСИМОСТИ (ОФФЛАЙН/MESH) ---
+  nearby_connections: ^4.0.0
+    # 2. Universal P2P (для Huawei и остальных)
+
+  flutter_blue_plus: ^1.34.5
+
+
+
+  # 3. Проверка наличия Google Services
+
+  permission_handler: ^11.3.1 # Запрос разрешений Android
+  uuid: ^4.4.0                # Генерация уникальных ID для Mesh-запросов
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+  # --- Для смены иконки на Калькулятор ---
+  flutter_launcher_icons: ^0.13.1
+
+flutter:
+  uses-material-design: true
+  generate: true
+  fonts:
+    - family: Orbitron
+      fonts:
+        - asset: assets/fonts/Orbitron Bold.ttf
+  # Ассеты
+  assets:
+    - assets/audio/
+    # Не забудь создать эту папку, если хочешь менять иконку через конфиг:
+    # - assets/icon/
+
+# Настройка иконки (раскомментируй и положи картинку, когда будешь готов)
+# flutter_launcher_icons:
+#   android: "launcher_icon"
+#   ios: true
+#   image_path: "assets/icon/calculator.png"
+#   min_sdk_android: 21

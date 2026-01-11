@@ -1,0 +1,25 @@
+{
+  "disclaimerTitle": "Warning",
+  "disclaimerText": "This application calculates an approximate end-of-life date based on statistical data for entertainment and motivational purposes only. This is not a medical prediction. The creators are not responsible for your emotional state, actions, or decisions made based on the information provided. By continuing, you confirm that you are over 18 years old and accept full responsibility.",
+  "iAgree": "I have read and agree",
+  "proceed": "Proceed",
+  "timerYears": "years",
+  "timerDays": "days",
+
+
+  "@_comment": "User Agreement and Disclaimer",
+    "disclaimerTitle": "Before You Begin",
+    "disclaimerP1": "This application provides a fictional time calculation based on public statistical data. It is intended solely for motivational, philosophical, and entertainment purposes.",
+    "disclaimerP2": "This is NOT a medical, scientific, or factual prediction. The result is arbitrary and should not be taken seriously or used for making any life decisions.",
+    "disclaimerP3": "The creators of this application are NOT responsible for any emotional distress, anxiety, depression, panic attacks, or any other psychological effects that may arise from using this application. You use it at your own risk.",
+    "disclaimerP4": "By checking the box and proceeding, you confirm that:",
+    "disclaimerPoint1": "You are 18 years of age or older.",
+    "disclaimerPoint2": "You are of sound mind and understand the fictional nature of this application.",
+    "disclaimerPoint3": "You take full and sole responsibility for your emotional state and actions while using and after using this application.",
+    "disclaimerPoint4": "You agree to our Privacy Policy and Terms of Service.",
+    "iAgree": "I understand and accept all of the above.",
+    "proceed": "Enter the Countdown",
+    "daysLived": "DAYS LIVED",
+    "totalDaysEstimated": "TOTAL DAYS ESTIMATED",
+    "odysseyComplete": "of your Odyssey complete"
+}

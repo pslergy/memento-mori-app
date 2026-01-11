@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- 🚀 Splash / Launch theme -->
+    <style name="LaunchTheme" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+
+    <!-- 🧱 Основная тема (СТАБИЛЬНАЯ ДЛЯ TECNO / INFINIX / ITEL) -->
+    <style name="NormalTheme" parent="Theme.AppCompat.NoActionBar">
+
+        <!-- Фон -->
+        <item name="android:windowBackground">@android:color/black</item>
+
+        <!-- ❗ ЯВНО задаём EditText (критично для HiOS) -->
+        <item name="android:editTextBackground">@android:drawable/edit_text</item>
+        <item name="android:editTextColor">#FFFFFF</item>
+
+        <!-- Базовые цвета (AppCompat-safe) -->
+        <item name="colorPrimary">#FFFFFF</item>
+        <item name="colorPrimaryDark">#000000</item>
+        <item name="colorAccent">#FF5252</item>
+
+        <!-- ❌ НЕ ИСПОЛЬЗУЕМ Material-атрибуты -->
+        <!-- Никаких colorControl*, DayNight, MaterialComponents -->
+
+    </style>
+
+</resources>

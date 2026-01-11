@@ -1,0 +1,60 @@
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.buildDir = '../build'
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+
+// --- 🔥 ЛЕЧЕБНЫЙ БЛОК 🔥 ---
+subprojects {
+    project.configurations.all {
+        resolutionStrategy {
+            force 'androidx.core:core:1.10.1'
+            force 'androidx.core:core-ktx:1.10.1'
+            // Добавляем фикс для AppCompat, чтобы тема нашлась
+            force 'androidx.appcompat:appcompat:1.6.1'
+        }
+    }
+
+    afterEvaluate { project ->
+        if (project.hasProperty('android')) {
+            project.android {
+                // ✅ Принудительно ставим 36 всем плагинам, чтобы они не ругались
+                compileSdk = 36
+
+                compileOptions {
+                    sourceCompatibility JavaVersion.VERSION_17
+                    targetCompatibility JavaVersion.VERSION_17
+                }
+
+                // Внедряем namespace в старые библиотеки
+                if (namespace == null) {
+                    if (project.name == 'flutter_bluetooth_serial') {
+                        namespace 'io.github.edufolly.flutterbluetoothserial'
+                    }
+                    // Добавь другие плагины здесь, если будут ошибки namespace
+                }
+            }
+        }
+
+        project.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+            kotlinOptions {
+                jvmTarget = "17"
+            }
+        }
+    }
+}
+// -----------------------------------------------------------
+
+subprojects {
+    project.evaluationDependsOn(':app')
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}
