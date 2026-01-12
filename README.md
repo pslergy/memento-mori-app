@@ -3,7 +3,7 @@
 
 | SYSTEM STATUS (Online) | SONAR LINK (Acoustic) | NODE RADAR (Mesh) |
 |:---:|:---:|:---:|
-| <img src="assets/screenshots/system_status.png" width="250"> | <img src="assets/screenshots/photo_2026-01-12_11-11-59.jpg" width="250"> | <img src="assets/screenshots/mesh_radar.png" width="250"> |
+| <img src="assets/screenshots/online_status.png" width="250"> | <img src="assets/screenshots/photo_2026-01-12_11-11-59.jpg" width="250"> | <img src="assets/screenshots/mesh_radar.png" width="250"> |
 
 **Technical Specifications:**
 *   **System Status:** Adaptive UI showing real-time backhaul connectivity (UPLINK) and active SOS Beacon frequencies.
