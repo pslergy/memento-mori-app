@@ -1,3 +1,16 @@
+
+## 📱 Tactical Interface Preview
+
+| GHOST GATE (Calculator) | HYBRID MESH RADAR | SECURE COMMUNICATIONS |
+|:---:|:---:|:---:|
+| <img src="assets/screenshots/calc_gate.png" width="250"> | <img src="assets/screenshots/mesh_radar.png" width="250"> | <img src="assets/screenshots/chat_view.png" width="250"> |
+
+> *Visual identity: Masquerading entry point, real-time node discovery, and E2EE messaging layer.*
+
+---
+
+
+
 # Memento Mori: Tactical Anti-Censorship Messenger
 
 **Memento Mori** is a high-resilience, privacy-focused tactical messenger designed for communication in environments with total internet shutdown or aggressive censorship. It implements a hybrid network topology to ensure message delivery through Cloud, Mesh (Wi-Fi Direct/BLE), and Acoustic channels.
