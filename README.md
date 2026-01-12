@@ -1,11 +1,11 @@
 
-## 📱 Tactical Interface Preview
+## 📱 Tactical Interface & Connectivity Status
 
-| GHOST GATE (Calculator) | HYBRID MESH RADAR | SECURE COMMUNICATIONS |
+| NETWORK UPLINK (Online) | GLOBAL SOS BEACON | NODE RADAR (Offline) |
 |:---:|:---:|:---:|
-| <img src="assets/screenshots/calc_gate.png" width="250"> | <img src="assets/screenshots/mesh_radar.png" width="250"> | <img src="assets/screenshots/chat_view.png" width="250"> |
+| <img src="assets/screenshots/online_status.png" width="250"> | <img src="assets/screenshots/beacon_frequency.png" width="250"> | <img src="assets/screenshots/radar_view.png" width="250"> |
 
-> *Visual identity: Masquerading entry point, real-time node discovery, and E2EE messaging layer.*
+> **Note on Security:** Direct screenshots of the chat interface are hardware-restricted by the app's **Anti-Forensic Protection** (`FLAG_SECURE`). The UI automatically adapts between "UPLINK: STABLE" (Cloud mode) and "GHOST MODE" (Mesh-only) depending on backhaul availability.
 
 ---
 
