@@ -1,11 +1,18 @@
 
-## 📱 Tactical Interface & Connectivity Status
+## 📱 Tactical Interface & System Capabilities
 
-| NETWORK UPLINK (Online) | GLOBAL SOS BEACON | NODE RADAR (Offline) |
+| SYSTEM STATUS (Online) | SONAR LINK (Acoustic) | NODE RADAR (Mesh) |
 |:---:|:---:|:---:|
-| <img src="assets/screenshots/online_status.png" width="250"> | <img src="assets/screenshots/beacon_frequency.png" width="250"> | <img src="assets/screenshots/radar_view.png" width="250"> |
+| <img src="assets/screenshots/system_status.png" width="250"> | <img src="assets/screenshots/photo_2026-01-12_11-11-59.jpg" width="250"> | <img src="assets/screenshots/mesh_radar.png" width="250"> |
 
-> **Note on Security:** Direct screenshots of the chat interface are hardware-restricted by the app's **Anti-Forensic Protection** (`FLAG_SECURE`). The UI automatically adapts between "UPLINK: STABLE" (Cloud mode) and "GHOST MODE" (Mesh-only) depending on backhaul availability.
+**Technical Specifications:**
+*   **System Status:** Adaptive UI showing real-time backhaul connectivity (UPLINK) and active SOS Beacon frequencies.
+*   **Sonar Link:** Experimental ultrasonic data transmission (19kHz) for out-of-band key exchange in RF-denied environments.
+*   **Node Radar:** Live peer discovery via Wi-Fi Direct and BLE, visualizing the "Internet Magnet" proximity gradient.
+
+> **Privacy Notice:** Direct messaging interfaces are protected by `FLAG_SECURE` to prevent unauthorized screen capture at the hardware level.
+
+---
 
 ---
 
