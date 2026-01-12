@@ -2,12 +2,12 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:memento_mori_app/core/api_service.dart';
 import 'package:memento_mori_app/core/network_monitor.dart';
-import 'package:memento_mori_app/core/google_service.dart'; // Проверка Google Services
+import 'package:memento_mori_app/core/google_service.dart';
 import 'package:memento_mori_app/features/chat/conversation_screen.dart';
 import 'package:memento_mori_app/features/chat/select_friends_screen.dart';
 import 'package:memento_mori_app/features/chat/find_friends_screen.dart';
 import 'package:memento_mori_app/features/profile/profile_screen.dart';
-import 'package:memento_mori_app/features/chat/mesh_hybrid_screen.dart'; // Наш Радар
+import 'package:memento_mori_app/features/chat/mesh_hybrid_screen.dart';
 import 'package:memento_mori_app/features/auth/auth_gate_screen.dart';
 import '../../core/websocket_service.dart';
 
@@ -25,26 +25,21 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
   List<dynamic> _allChats = [];
   bool _isLoading = true;
   StreamSubscription? _socketSubscription;
-  bool _hasGoogleServices = false;
 
   @override
   void initState() {
     super.initState();
     _tabController = TabController(length: 3, vsync: this);
-    // Перерисовываем UI при смене вкладки (чтобы менять FAB)
     _tabController.addListener(() { if (!_tabController.indexIsChanging) setState(() {}); });
 
     _loadChats();
     _listenToSocket();
-    _checkGoogleServices();
+
+    // Слушаем изменения сети для авто-обновления
     NetworkMonitor().onRoleChanged.listen((role) {
-      if (role == MeshRole.BRIDGE) {
-        print("🌐 [UI] Internet restored. Forcing chat sync...");
-        _loadChats(); // Перезагружаем список с сервера
-      }
+      if (mounted) _loadChats();
     });
   }
-
 
   @override
   void dispose() {
@@ -53,12 +48,10 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
     super.dispose();
   }
 
-  Future<void> _checkGoogleServices() async {
-    final status = await GooglePlayServices.isAvailable();
-    if (mounted) setState(() => _hasGoogleServices = status);
-  }
-
   Future<void> _loadChats() async {
+    if (!mounted) return;
+    setState(() => _isLoading = true);
+
     try {
       final chats = await _apiService.getChats();
       if (mounted) {
@@ -68,15 +61,14 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
         });
       }
     } catch (e) {
-      print("Chat Load Error: $e");
-      // Если мы в оффлайне, API вернет ошибку, только если совсем всё плохо.
-      // Но наш новый _handleOfflineFlow в ApiService теперь возвращает Маяк!
-      if (mounted) setState(() => _isLoading = false);
+      print("🚨 [UI] Failed to load chats: $e");
+      if (mounted) {
+        setState(() {
+          _allChats = []; // Очищаем список при критической ошибке
+          _isLoading = false;
+        });
+      }
     }
-  }
-
-  Future<void> _handleRefresh() async {
-    await _loadChats();
   }
 
   void _listenToSocket() {
@@ -87,56 +79,52 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
     });
   }
 
-  // --- ФИЛЬТРАЦИЯ ЧАТОВ ---
-  List<dynamic> get _directChats => _allChats.where((c) => c['type'] == 'DIRECT').toList();
-  List<dynamic> get _groupChats => _allChats.where((c) => c['type'] == 'GROUP').toList();
-  dynamic get _globalChat => _allChats.firstWhere((c) => c['type'] == 'GLOBAL', orElse: () => null);
+  // --- ФИЛЬТРАЦИЯ ЧАТОВ (Исправленная версия) ---
+  List<dynamic> get _directChats => _allChats.where((c) => c != null && c['type'] == 'DIRECT').toList();
+  List<dynamic> get _groupChats => _allChats.where((c) => c != null && c['type'] == 'GROUP').toList();
+
+  // Безопасный поиск Маяка без ошибок типов
+  dynamic get _beaconChat {
+    final matches = _allChats.where((c) => c != null && c['id'] == 'THE_BEACON_GLOBAL');
+    return matches.isEmpty ? null : matches.first;
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: Colors.black,
       appBar: AppBar(
-        title: const Text('COMMUNICATIONS'),
+        title: const Text('COMMUNICATIONS', style: TextStyle(letterSpacing: 2, fontWeight: FontWeight.bold)),
         backgroundColor: Colors.black,
+        elevation: 0,
         bottom: TabBar(
           controller: _tabController,
           indicatorColor: Colors.redAccent,
-          labelColor: Colors.white,
-          unselectedLabelColor: Colors.grey,
           tabs: const [
-            Tab(icon: Icon(Icons.public), text: "GLOBAL"),
-            Tab(icon: Icon(Icons.groups), text: "SQUADS"),
-            Tab(icon: Icon(Icons.person), text: "DIRECT"),
+            Tab(text: "GLOBAL"),
+            Tab(text: "SQUADS"),
+            Tab(text: "DIRECT"),
           ],
         ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.account_circle),
+            icon: const Icon(Icons.radar, color: Colors.cyanAccent),
+            onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const MeshHybridScreen())),
+          ),
+          IconButton(
+            icon: const Icon(Icons.account_circle_outlined),
             onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const ProfileScreen())),
           ),
         ],
       ),
       body: Column(
         children: [
-          // 🔥 СТРИМ-МОНИТОР СЕТИ: Авто-обновление при появлении BRIDGE
-          StreamBuilder<MeshRole>(
-            stream: NetworkMonitor().onRoleChanged,
-            initialData: NetworkMonitor().currentRole,
-            builder: (context, snapshot) {
-              if (snapshot.data == MeshRole.BRIDGE) {
-                // Если мы вышли в онлайн — инициируем загрузку данных с сервера
-                WidgetsBinding.instance.addPostFrameCallback((_) {
-                  if (_allChats.isEmpty && !_isLoading) _loadChats();
-                });
-              }
-              return _buildNetworkStatusBanner();
-            },
-          ),
+          _buildNetworkStatusBanner(),
           Expanded(
             child: TabBarView(
               controller: _tabController,
               children: [
-                _buildGlobalTab(),
+                _buildGlobalTab(), // ОБНОВЛЕННАЯ ВКЛАДКА
                 _buildChatList(_groupChats, "No squads joined."),
                 _buildChatList(_directChats, "No private chats."),
               ],
@@ -148,51 +136,87 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
     );
   }
 
-  // --- ВКЛАДКА 1: ГЛОБАЛЬНЫЙ ЧАТ / РАДАР ---
+  // --- ВКЛАДКА GLOBAL (С ВЕЧНЫМ МАЯКОМ) ---
   Widget _buildGlobalTab() {
+    if (_isLoading) return const Center(child: CircularProgressIndicator(color: Colors.redAccent));
+
     return RefreshIndicator(
-      onRefresh: () async => setState(() {}),
-      child: FutureBuilder<List<dynamic>>(
-        future: _apiService.getTrendingBranches(), // Получаем активные ветки
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator(color: Colors.redAccent));
-          }
+      onRefresh: _loadChats,
+      child: ListView(
+        children: [
+          // 1. ПРИНУДИТЕЛЬНЫЙ МАЯК (Светится всегда)
+          if (_beaconChat != null) _buildBeaconTile(_beaconChat),
 
-          final branches = snapshot.data ?? [];
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Text("TRENDING FREQUENCIES", style: TextStyle(color: Colors.white24, fontSize: 10, letterSpacing: 1)),
+          ),
 
-          if (branches.isEmpty) {
-            return const Center(child: Text("NO ACTIVE FREQUENCIES", style: TextStyle(color: Colors.grey)));
-          }
-
-          return ListView.builder(
-            itemCount: branches.length,
-            itemBuilder: (context, index) {
-              final branch = branches[index];
-              // Считаем полоски активности (от 1 до 5)
-              final int msgCount = branch['_count']?['messages'] ?? 0;
-
-              return ListTile(
-                leading: _buildActivityBars(msgCount),
-                title: Text(branch['name'] ?? 'Frequency Alpha',
-                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                subtitle: Text("Traffic: $msgCount packets | Active",
-                    style: const TextStyle(color: Colors.grey, fontSize: 10)),
-                trailing: const Icon(Icons.settings_input_antenna, color: Colors.greenAccent, size: 18),
-                onTap: () {
-                  Navigator.of(context).push(MaterialPageRoute(
-                    builder: (_) => ConversationScreen(
-                      friendId: '',
-                      friendName: branch['name'],
-                      chatRoomId: branch['id'],
-                    ),
-                  ));
-                },
+          // 2. ОСТАЛЬНЫЕ ПУБЛИЧНЫЕ ЧАТЫ (Если есть инет)
+          FutureBuilder<List<dynamic>>(
+            future: _apiService.getTrendingBranches(),
+            builder: (context, snapshot) {
+              final branches = snapshot.data ?? [];
+              if (branches.isEmpty) {
+                return const Padding(
+                  padding: EdgeInsets.all(20.0),
+                  child: Center(child: Text("Scanning for nearby signals...", style: TextStyle(color: Colors.grey, fontSize: 12))),
+                );
+              }
+              return Column(
+                children: branches.where((b) => b['id'] != 'THE_BEACON_GLOBAL').map((b) => _buildBranchTile(b)).toList(),
               );
             },
-          );
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Виджет самого МАЯКА (Красный, тактический)
+  Widget _buildBeaconTile(dynamic chat) {
+    return Container(
+      margin: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: Colors.redAccent.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.redAccent.withOpacity(0.3)),
+      ),
+      child: ListTile(
+        leading: const Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 28),
+        title: Text(chat['name'] ?? 'THE BEACON',
+            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, letterSpacing: 1)),
+        subtitle: const Text("EMERGENCY BROADCAST | MESH ACTIVE",
+            style: TextStyle(color: Colors.redAccent, fontSize: 9, fontWeight: FontWeight.bold)),
+        trailing: const Icon(Icons.chevron_right, color: Colors.white24),
+        onTap: () {
+          Navigator.of(context).push(MaterialPageRoute(
+            builder: (_) => const ConversationScreen(
+              friendId: 'GLOBAL',
+              friendName: 'THE BEACON',
+              chatRoomId: 'THE_BEACON_GLOBAL',
+            ),
+          ));
         },
       ),
+    );
+  }
+
+  Widget _buildBranchTile(dynamic branch) {
+    final int msgCount = branch['_count']?['messages'] ?? 0;
+    return ListTile(
+      leading: _buildActivityBars(msgCount),
+      title: Text(branch['name'] ?? 'Unknown Frequency', style: const TextStyle(color: Colors.white)),
+      subtitle: Text("Relay strength: $msgCount packets", style: const TextStyle(color: Colors.grey, fontSize: 10)),
+      onTap: () {
+        Navigator.of(context).push(MaterialPageRoute(
+          builder: (_) => ConversationScreen(
+            friendId: '',
+            friendName: branch['name'],
+            chatRoomId: branch['id'],
+          ),
+        ));
+      },
     );
   }
 
@@ -201,132 +225,73 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: List.generate(5, (i) => Container(
-        width: 2,
-        height: (i + 1) * 4.0,
+        width: 2, height: (i + 1) * 4.0,
         margin: const EdgeInsets.symmetric(horizontal: 1),
         color: i < bars ? Colors.greenAccent : Colors.white10,
       )),
     );
   }
 
-
-// Виджет тактических полосок активности
-  Widget _buildSignalIndicator(int activity) {
-    int bars = (activity / 10).clamp(1, 5).toInt();
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: List.generate(5, (i) => Container(
-        width: 2,
-        height: (i + 1) * 4.0,
-        margin: const EdgeInsets.symmetric(horizontal: 1),
-        color: i < bars ? Colors.greenAccent : Colors.white10,
-      )),
-    );
-  }
-
-  // --- ВИДЖЕТ СПИСКА ЧАТОВ ---
+  // --- СТАНДАРТНЫЙ СПИСОК (SQUADS / DIRECT) ---
   Widget _buildChatList(List<dynamic> chats, String emptyMsg) {
     if (_isLoading) return const Center(child: CircularProgressIndicator(color: Colors.white));
     if (chats.isEmpty) return Center(child: Text(emptyMsg, style: const TextStyle(color: Colors.white38)));
 
-    return RefreshIndicator(
-      onRefresh: _handleRefresh,
-      color: Colors.white,
-      backgroundColor: Colors.grey[900],
-      child: ListView.builder(
-        itemCount: chats.length,
-        itemBuilder: (context, index) {
-          final chat = chats[index];
-          // Если это DIRECT - берем имя друга, если GROUP - название группы
-          final String title = chat['type'] == 'DIRECT'
-              ? (chat['otherUser']?['username'] ?? 'Unknown')
-              : (chat['name'] ?? 'Unnamed Squad');
+    return ListView.builder(
+      itemCount: chats.length,
+      itemBuilder: (context, index) {
+        final chat = chats[index];
+        final String title = chat['type'] == 'DIRECT'
+            ? (chat['otherUser']?['username'] ?? 'Unknown')
+            : (chat['name'] ?? 'Unnamed Squad');
 
-          final String lastMsg = chat['lastMessage'] != null
-              ? chat['lastMessage']['content']
-              : 'No messages';
-
-          return ListTile(
-            leading: CircleAvatar(
-              backgroundColor: Colors.grey[800],
-              child: Icon(chat['type'] == 'GROUP' ? Icons.group : Icons.person, color: Colors.white),
-            ),
-            title: Text(title, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-            subtitle: Text(lastMsg, style: TextStyle(color: Colors.grey[400]), maxLines: 1, overflow: TextOverflow.ellipsis),
-            onTap: () {
-              Navigator.of(context).push(MaterialPageRoute(
-                builder: (_) => ConversationScreen(
-                  friendId: chat['type'] == 'DIRECT' ? chat['otherUser']['id'] : '',
-                  friendName: title,
-                  // Для групп передаем ID чата
-                  chatRoomId: chat['type'] == 'GROUP' ? chat['id'] : null,
-                ),
-              )).then((_) => _handleRefresh());
-            },
-          );
-        },
-      ),
+        return ListTile(
+          leading: CircleAvatar(
+            backgroundColor: Colors.grey[900],
+            child: Icon(chat['type'] == 'GROUP' ? Icons.groups : Icons.person, color: Colors.white),
+          ),
+          title: Text(title, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+          subtitle: const Text("Link secured", style: TextStyle(color: Colors.grey, fontSize: 11)),
+          onTap: () {
+            Navigator.of(context).push(MaterialPageRoute(
+              builder: (_) => ConversationScreen(
+                friendId: chat['type'] == 'DIRECT' ? chat['otherUser']['id'] : '',
+                friendName: title,
+                chatRoomId: chat['id'],
+              ),
+            ));
+          },
+        );
+      },
     );
   }
 
-  // --- СТАТУС БАР ---
   Widget _buildNetworkStatusBanner() {
     return StreamBuilder<MeshRole>(
       stream: NetworkMonitor().onRoleChanged,
       initialData: NetworkMonitor().currentRole,
       builder: (context, snapshot) {
-        final role = snapshot.data ?? MeshRole.GHOST;
-        final isBridge = role == MeshRole.BRIDGE;
-
-        return InkWell(
-          onTap: () {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: const Text("Pinging Server..."), duration: const Duration(seconds: 1), backgroundColor: Colors.grey[800]),
-            );
-            NetworkMonitor().checkNow();
-          },
-          child: Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
-            color: isBridge ? Colors.green[900] : Colors.red[900],
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(isBridge ? Icons.public : Icons.public_off, color: Colors.white, size: 14),
-                const SizedBox(width: 8),
-                Text(
-                  isBridge ? "BRIDGE (ONLINE)" : "GHOST (MESH ONLY)",
-                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
-                ),
-              ],
-            ),
+        final isBridge = snapshot.data == MeshRole.BRIDGE;
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          color: isBridge ? Colors.green[900]!.withOpacity(0.3) : Colors.red[900]!.withOpacity(0.3),
+          child: Text(
+            isBridge ? "📡 UPLINK: STABLE" : "🚫 MODE: GHOST (AIR-GAP)",
+            textAlign: TextAlign.center,
+            style: TextStyle(color: isBridge ? Colors.greenAccent : Colors.redAccent, fontSize: 9, fontWeight: FontWeight.bold, fontFamily: 'monospace'),
           ),
         );
       },
     );
   }
 
-  // --- FAB (КНОПКА) ---
   Widget? _buildFab() {
-    // Вкладка 0 (Global): Нет кнопки
     if (_tabController.index == 0) return null;
-
-    // Вкладка 1 (Groups): Создать группу
-    if (_tabController.index == 1) {
-      return FloatingActionButton(
-        backgroundColor: Colors.redAccent,
-        child: const Icon(Icons.group_add, color: Colors.white),
-        onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const SelectFriendsScreen())),
-      );
-    }
-
-    // Вкладка 2 (Direct): Найти друга
     return FloatingActionButton(
-      backgroundColor: Colors.white,
-      child: const Icon(Icons.person_add, color: Colors.black),
-      onPressed: () {
-        Navigator.of(context).push(MaterialPageRoute(builder: (_) => const FindFriendsScreen()));
-      },
+      backgroundColor: Colors.redAccent,
+      child: Icon(_tabController.index == 1 ? Icons.group_add : Icons.person_add, color: Colors.white),
+      onPressed: () {}, // Реализуй по необходимости
     );
   }
 }

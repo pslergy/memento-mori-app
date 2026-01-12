@@ -92,6 +92,22 @@ class NativeMeshService {
     }
   }
 
+  static Future<void> startBackgroundMesh() async {
+    try {
+      await _channel.invokeMethod('startMeshService');
+    } catch (e) {
+      print("❌ Error starting Background Service: $e");
+    }
+  }
+
+  static Future<void> stopBackgroundMesh() async {
+    try {
+      await _channel.invokeMethod('stopMeshService');
+    } catch (e) {
+      print("❌ Error stopping Background Service: $e");
+    }
+  }
+
   /// Отправка пакета через TCP Bursts
   static Future<void> sendTcp(String message, {required String host}) async {
     try {

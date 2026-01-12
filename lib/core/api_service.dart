@@ -122,62 +122,52 @@ class ApiService {
   }
 
   // 🔥 ЛОГИКА ВЫЖИВАНИЯ: Если нет сети, пробуем Mesh, если нет Mesh — отдаем из SQLite
+  /// Логика выживания: Фолбек для оффлайна
   Future<dynamic> _handleOfflineFlow(String method, String endpoint, dynamic body) async {
     final db = LocalDatabaseService();
     final mesh = locator<MeshService>();
 
-    // 🔥 ИНЪЕКЦИЯ ТАКТИЧЕСКОГО СПИСКА ЧАТОВ (OFFLINE)
+    // 🔥 ИНЪЕКЦИЯ ДЛЯ ОФФЛАЙНА
     if (endpoint == '/chats' && method == 'GET') {
-      print("📦 [API] Offline: Injecting Tactical Frequencies.");
+      _log("📦 [API] Hard-injecting Beacon into offline list.");
 
-      // 1. Всегда создаем Глобальный Канал
       List<Map<String, dynamic>> offlineList = [
         {
           'id': 'THE_BEACON_GLOBAL',
-          'name': 'THE BEACON (Global)',
+          'name': 'THE BEACON (Global SOS)',
           'type': 'GLOBAL',
-          'lastMessage': {'content': 'Mesh active. Listening...', 'createdAt': DateTime.now().toIso8601String()},
+          'lastMessage': {'content': 'Mesh Active.', 'createdAt': DateTime.now().toIso8601String()},
           'otherUser': null
         }
       ];
 
-      // 2. Добавляем тех, кто виден по Mesh/BT
-      final String myId = currentUserId; // Используем геттер нашего класса
+      // Добавляем соседей, которых видим по Mesh
       for (var node in mesh.nearbyNodes) {
-        if (myId.isEmpty) continue;
-
-        List<String> ids = [myId, node.id];
+        if (currentUserId.isEmpty) continue;
+        List<String> ids = [currentUserId, node.id];
         ids.sort();
-        final String sharedId = "GHOST_${ids.join('_')}";
-
         offlineList.add({
-          'id': sharedId,
+          'id': "GHOST_${ids[0]}_${ids[1]}",
           'name': node.name,
           'type': 'DIRECT',
-          'lastMessage': {'content': 'Direct peer link ready', 'createdAt': DateTime.now().toIso8601String()},
           'otherUser': {'id': node.id, 'username': node.name}
         });
       }
       return offlineList;
     }
 
-    // Загрузка сообщений из SQLite (оставляем)
+    // История сообщений из SQLite
     if (endpoint.contains('/messages') && method == 'GET') {
       final String chatId = endpoint.split('/')[2];
       final localMsgs = await db.getMessages(chatId);
       return localMsgs.map((m) => m.toJson()).toList();
     }
 
-    // Загрузка профиля (Identity Recovery)
+    // Профиль (Identity Recovery)
     if (endpoint == '/users/me' && method == 'GET') {
-      final ghostId = await Vault.read( 'user_id');
-      final ghostName = await Vault.read( 'user_name') ?? "Ghost";
+      final ghostId = await Vault.read('user_id');
+      final ghostName = await Vault.read('user_name') ?? "Ghost";
       return {'id': ghostId ?? "LOCAL_NODE", 'username': ghostName, 'isGhost': true};
-    }
-
-    // Проброс через Mesh Bridge (если есть коннект)
-    if (mesh.isP2pConnected) {
-      return _sendViaMesh(method, endpoint, body);
     }
 
     return [];
@@ -306,36 +296,86 @@ class ApiService {
   }
   Future<void> syncOutbox() async {
     final db = LocalDatabaseService();
-    final pending = await db.getPendingFromOutbox();
+    final pendingMessages = await db.getPendingFromOutbox();
 
-    if (pending.isEmpty) return;
+    if (pendingMessages.isEmpty) return;
 
-    print("🔄 [Sync] Found ${pending.length} messages in outbox. Starting upload...");
+    print("🔄 [Bridge] Found ${pendingMessages.length} pending signals. Synchronizing...");
 
-    for (var msg in pending) {
+    for (var raw in pendingMessages) {
       try {
-        // Пытаемся отправить сообщение через стандартный POST запрос
-        await _sendDirectHttp(
-            'POST',
-            '/chats/${msg['chatRoomId']}/messages',
-            {
-              'content': msg['content'],
-              'isEncrypted': msg['isEncrypted'] == 1,
-              'clientTempId': msg['id'], // Используем оригинальный ID для дедупликации
-              'recipientId': msg['chatRoomId'].toString().split('___').last, // Пример получения ID получателя
-            }
-        );
+        final String chatId = raw['chatRoomId'];
 
-        // Если сервер принял — удаляем из очереди
-        await db.removeFromOutbox(msg['id']);
+        // Шлем на сервер через стандартный метод
+        await _sendDirectHttp('POST', '/chats/$chatId/messages', {
+          'content': raw['content'],
+          'isEncrypted': raw['isEncrypted'] == 1,
+          'clientTempId': raw['id'], // Используем ID из оффлайна для дедупликации на сервере
+        });
+
+        // Если сервер принял - удаляем из очереди
+        await db.removeFromOutbox(raw['id']);
+        print("✅ [Bridge] Signal ${raw['id'].substring(0,8)} relayed to Cloud.");
 
       } catch (e) {
-        print("❌ [Sync] Failed to deliver ${msg['id']}. Waiting for better signal...");
-        // Если произошла ошибка сети, прерываем цикл, чтобы не тратить заряд
-        break;
+        print("⚠️ [Bridge] Relay failed for ${raw['id']}: $e");
+        break; // Останавливаем, если сеть снова пропала
       }
     }
-    print("✅ [Sync] Outbox synchronization finished.");
+  }
+
+  Future<void> syncGhostIdentity() async {
+    final String? token = await Vault.read('auth_token');
+    if (token != 'GHOST_MODE_ACTIVE') return; // Мы уже в онлайне
+
+    _log("🧬 [Sync] Attempting to legalize Ghost Identity on Server...");
+
+    final ghostId = await Vault.read('user_id');
+    final ghostName = await Vault.read('user_name');
+
+    // Шлем специальный запрос на "прописку" призрака
+    final res = await _sendDirectHttp('POST', '/auth/ghost-sync', {
+      'id': ghostId,
+      'username': ghostName,
+      // Тут можно передать публичный ключ для E2EE
+    });
+
+    if (res != null && res['token'] != null) {
+      // Сервер выдал нам настоящий JWT!
+      await Vault.write('auth_token', res['token']);
+      _memoizedToken = res['token'];
+      _log("✅ [Sync] Ghost identity is now official. JWT obtained.");
+    }
+  }
+
+  void _log(String msg) {
+    print("📡 [API-Service] $msg");
+  }
+
+  Future<void> legalizeIdentity() async {
+    final pass = await Vault.read('landing_pass');
+    final ghostId = await Vault.read('user_id');
+    final email = await Vault.read('user_email');
+
+    if (pass == null || ghostId == null) return;
+
+    _log("🧬 [Legalization] Sending Landing Pass for $ghostId...");
+
+    try {
+      final res = await _sendDirectHttp('POST', '/auth/legalize', {
+        'ghostId': ghostId,
+        'email': email,
+        'pass': pass,
+      });
+
+      if (res != null && res['status'] == 'verified') {
+        _log("✅ Identity Legalized. Token upgraded.");
+        await Vault.write('auth_token', res['token']);
+        await Vault.write('auth_mode', 'citizen'); // Мы больше не призраки
+      }
+    } catch (e) {
+      _log("⚠️ Legalization failed: $e");
+    }
   }
 
 
@@ -475,8 +515,39 @@ class ApiService {
   }
 
   /// СПИСОК ЧАТОВ
+  /// СПИСОК ЧАТОВ (С защитой от исчезновения Маяка)
+  /// СПИСОК ЧАТОВ (С защитой от исчезновения)
   Future<List<dynamic>> getChats() async {
-    return await _makeRequest(method: 'GET', endpoint: '/chats');
+    // 1. Создаем "Маяк" как константу
+    final beacon = {
+      'id': 'THE_BEACON_GLOBAL',
+      'name': 'THE BEACON (Global SOS)',
+      'type': 'GLOBAL', // Убедись, что это совпадает с типом во вкладке
+      'isEphemeral': false,
+      'lastMessage': {'content': 'Mesh Active. Frequency secured.', 'createdAt': DateTime.now().toIso8601String()},
+      'otherUser': null
+    };
+
+    List<dynamic> chats = [];
+
+    try {
+      // 2. Пытаемся получить данные (через облако или кэш/меш)
+      final response = await _makeRequest(method: 'GET', endpoint: '/chats');
+
+      if (response is List) {
+        chats = response;
+      }
+    } catch (e) {
+      _log("📡 Isolated: Using local Beacon only.");
+    }
+
+    // 3. 🔥 ГАРАНТИЯ: Если в списке нет Маяка - вставляем его ПЕРВЫМ
+    // Это сработает даже если сервер вернул 404, 500 или пустой []
+    if (!chats.any((c) => c['id'] == 'THE_BEACON_GLOBAL')) {
+      chats.insert(0, beacon);
+    }
+
+    return chats;
   }
 
   /// ИСТОРИЯ СООБЩЕНИЙ

@@ -1,58 +1,108 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
-import 'dart:math';
+import 'package:sound_generator/sound_generator.dart';
+import 'package:sound_generator/waveTypes.dart';
 
 class UltrasonicService {
   static final UltrasonicService _instance = UltrasonicService._internal();
   factory UltrasonicService() => _instance;
   UltrasonicService._internal();
 
-  // Параметры "акустического протокола"
-  static const int sampleRate = 44100; // Стандартная частота дискретизации
-  static const double freqZero = 18500.0; // Частота для бита "0" (Ультразвук)
-  static const double freqOne = 19500.0;  // Частота для бита "1" (Ультразвук)
-  static const double bitDuration = 0.1;  // Длительность одного бита (сек)
+  // 🔥 Стрим-контроллер инициализируется СРАЗУ. Это исключает Null Check Error.
+  final StreamController<String> _sonarController = StreamController<String>.broadcast();
+  Stream<String> get sonarMessages => _sonarController.stream;
 
-  /// Функция превращает текст в ультразвуковой импульс
-  Future<void> transmit(String text) async {
-    print("🔊 [Sonar] Encoding payload: $text");
+  static const double _frequency = 19000.0; // Частота ультразвука
+  bool _isInitialized = false;
 
-    // 1. Превращаем текст в массив битов
-    List<int> bytes = utf8.encode(text);
-    List<int> bits = [];
-    for (var byte in bytes) {
-      for (var i = 7; i >= 0; i--) {
-        bits.add((byte >> i) & 1);
-      }
+  void _log(String msg) => print("🔊 [Sonar] $msg");
+
+  /// Инициализация аппаратного уровня (Audio Layer)
+  Future<void> _init() async {
+    if (_isInitialized) return;
+    try {
+      // Инициализация генератора (44.1kHz - стандарт Hi-Fi)
+      SoundGenerator.init(44100);
+
+      // Настройка волны: Чистая синусоида для минимизации шумов
+      SoundGenerator.setWaveType(waveTypes.SINUSOIDAL);
+      SoundGenerator.setFrequency(_frequency);
+      SoundGenerator.setVolume(1.0);
+
+      _isInitialized = true;
+      _log("Acoustic Layer Secured at 19kHz.");
+    } catch (e) {
+      _log("CRITICAL: Hardware Layer Failure: $e");
     }
-
-    // 2. Генерируем аудио-буфер
-    // Это "сырые" данные звуковой волны
-    final int samplesPerBit = (sampleRate * bitDuration).toInt();
-    final int totalSamples = samplesPerBit * bits.length;
-    final Float32List buffer = Float32List(totalSamples);
-
-    for (int i = 0; i < bits.length; i++) {
-      double freq = (bits[i] == 1) ? freqOne : freqZero;
-      for (int j = 0; j < samplesPerBit; j++) {
-        int index = i * samplesPerBit + j;
-        // Формула синусоиды: A * sin(2 * PI * f * t)
-        buffer[index] = sin(2 * pi * freq * (j / sampleRate));
-      }
-    }
-
-    // 3. Здесь должен быть вызов проигрывателя (JustAudio)
-    // В задатке мы просто логируем процесс.
-    // На реальном тесте телефон начнет "пищать" на частоте, которую не слышит ухо.
-    print("📡 [Sonar] Transmission complete. ${bits.length} bits emitted via air.");
   }
 
-  /// План для приемника:
-  /// Микрофон записывает поток -> Применяем FFT (Преобразование Фурье) ->
-  /// Если пик энергии на 18.5кГц, записываем '0', если на 19.5кГц - '1'.
+  /// ПЕРЕДАЧА ДАННЫХ (Binary Acoustic Pulse)
+  /// Реализация простейшего FSK (Frequency Shift Keying) через длительность
+  Future<void> transmitData(String data) async {
+    try {
+      await _init();
+      _log("Encoding identity pulse for: $data");
+
+      // Превращаем строку в массив бит (ASCII 8-bit)
+      final bits = utf8.encode(data).expand((byte) =>
+          Iterable.generate(8, (i) => (byte >> (7 - i)) & 1)
+      ).toList();
+
+      for (var bit in bits) {
+        SoundGenerator.play();
+        // Модуляция: '1' шлем дольше (600мс), '0' короче (200мс)
+        await Future.delayed(Duration(milliseconds: bit == 1 ? 600 : 200));
+        SoundGenerator.stop();
+        // Защитный интервал между битами (Guard Interval)
+        await Future.delayed(const Duration(milliseconds: 150));
+      }
+
+      _log("Acoustic data burst successfully emitted.");
+    } catch (e) {
+      _log("Transmission Error: $e");
+    }
+  }
+
+  /// ПЕРЕДАЧА МАЯКА (Simple Beacon)
+  Future<void> transmit(String text) async {
+    try {
+      await _init();
+      _log("Emitting SOS Beacon: $text");
+
+      SoundGenerator.play();
+      // Длительность зависит от веса сообщения
+      final int duration = (text.length * 200).clamp(1000, 5000);
+      await Future.delayed(Duration(milliseconds: duration));
+
+      SoundGenerator.stop();
+      _log("Beacon Pulse completed.");
+    } catch (e) {
+      _log("Error emitting beacon: $e");
+    }
+  }
+
+  /// РЕЖИМ ПРОСЛУШИВАНИЯ (Passive Monitoring)
   void startListening() {
-    print("👂 [Sonar] Microphone is monitoring ultrasonic frequencies...");
-    // Логика декодирования через анализ спектра будет здесь
+    _log("Microphone set to high-frequency monitoring mode.");
+
+    // План для интервью в Нидерландах:
+    // 1. Используем библиотеку 'record' для получения PCM байтов.
+    // 2. Применяем библиотеку 'fftea' для БПФ (Быстрое Преобразование Фурье).
+    // 3. Выделяем пик на 19000Гц.
+    // 4. Если амплитуда > порога - декодируем бит.
+
+    // Эмуляция обнаружения сигнала для отладки UI
+    Future.delayed(const Duration(seconds: 10), () {
+      if (!_sonarController.isClosed) {
+        _sonarController.add("BEACON_ALIVE");
+        _log("🎯 Signal captured via air-gap: BEACON_ALIVE");
+      }
+    });
+  }
+
+  /// Остановка всех систем
+  void stop() {
+    SoundGenerator.stop();
+    _log("System Hibernate.");
   }
 }

@@ -26,20 +26,49 @@ class LocalDatabaseService {
       path,
       version: 2,
       onConfigure: (db) async {
-        // Используем rawQuery вместо execute для PRAGMA - это фиксит баг "Sqlite code 0"
         try {
           await db.rawQuery('PRAGMA journal_mode = WAL');
           await db.rawQuery('PRAGMA synchronous = NORMAL');
+          print("⚡ [DB] Kernel: WAL Mode & Performance Protocols active.");
         } catch (e) {
-          print("⚠️ [DB] WAL Mode not supported on this device. Falling back.");
+          print("⚠️ [DB] Kernel configuration failed: $e");
+        }
+      },
+      onOpen: (db) async {
+        print("🚀 [DB] Global Handshake: Sanitizing offline IDs and Stats...");
+        try {
+          // 1. САМОЛЕЧЕНИЕ: Таблица статистики
+          await db.execute('''
+            CREATE TABLE IF NOT EXISTS system_stats(
+              key TEXT PRIMARY KEY,
+              value INTEGER
+            )
+          ''');
+          await db.rawInsert('INSERT OR IGNORE INTO system_stats(key, value) VALUES("karma", 0)');
+
+          // 2. ВЕЧНЫЙ МАЯК: Гарантируем наличие глобальной частоты
+          await db.insert('chat_rooms', {
+            'id': 'THE_BEACON_GLOBAL',
+            'name': 'THE BEACON (Global SOS)',
+            'type': 'GLOBAL',
+            'lastMessage': 'Protocol Active. Listening for pulses...',
+            'lastActivity': DateTime.now().toIso8601String()
+          }, conflictAlgorithm: ConflictAlgorithm.ignore);
+
+          // 3. ТАКТИЧЕСКИЙ РЕМАППИНГ: GLOBAL -> THE_BEACON_GLOBAL
+          await db.execute("UPDATE messages SET chatRoomId = 'THE_BEACON_GLOBAL' WHERE chatRoomId = 'GLOBAL'");
+          await db.execute("UPDATE outbox SET chatRoomId = 'THE_BEACON_GLOBAL' WHERE chatRoomId = 'GLOBAL'");
+
+          print("✅ [DB] THE_BEACON_GLOBAL synchronized. Legacy tags migrated.");
+        } catch (e) {
+          print("⚠️ [DB] Post-open sanity check failed: $e");
         }
       },
       onCreate: (db, version) async {
-        print("🛠️ [DB] Initialization: Protocol v$version started...");
+        print("🛠️ [DB] Construction: Building protocol v$version schema...");
 
-        // Мы используем транзакцию, чтобы гарантировать: либо создадутся все таблицы, либо ни одной.
         await db.transaction((txn) async {
-          // 1. Таблица сообщений
+          // Таблица сообщений
           await txn.execute('''
             CREATE TABLE messages(
               id TEXT PRIMARY KEY,
@@ -54,11 +83,10 @@ class LocalDatabaseService {
             )
           ''');
 
-          // Создаем ИНДЕКС на chatRoomId.
-          // Это "золотой стандарт" для интервью: ускоряет выборку истории в разы.
           await txn.execute('CREATE INDEX idx_messages_chatroom ON messages(chatRoomId)');
+          await txn.execute('CREATE INDEX idx_messages_temp_id ON messages(clientTempId)');
 
-          // 2. Таблица очереди (Store-and-Forward Outbox)
+          // Очередь Outbox (Viral Relay)
           await txn.execute('''
             CREATE TABLE outbox(
               id TEXT PRIMARY KEY,
@@ -69,7 +97,7 @@ class LocalDatabaseService {
             )
           ''');
 
-          // 3. Таблица рекламы (Gossip Ad-Pool)
+          // Реклама (Gossip Ad-Pool)
           await txn.execute('''
             CREATE TABLE ads(
               id TEXT PRIMARY KEY,
@@ -82,48 +110,27 @@ class LocalDatabaseService {
             )
           ''');
 
-          // 4. Таблица лицензий (Offline Premium Verification)
-          await txn.execute('''
-            CREATE TABLE licenses(
-              id TEXT PRIMARY KEY,
-              signedToken TEXT, 
-              status TEXT,
-              expiresAt TEXT
-            )
-          ''');
+          // Лицензии и Чат-комнаты
+          await txn.execute('CREATE TABLE licenses(id TEXT PRIMARY KEY, signedToken TEXT, status TEXT, expiresAt TEXT)');
+          await txn.execute('CREATE TABLE chat_rooms(id TEXT PRIMARY KEY, name TEXT, type TEXT, lastMessage TEXT, lastActivity TEXT)');
 
-          // 5. Таблица чат-комнат (Для быстрого вывода списка чатов оффлайн)
-          await txn.execute('''
-            CREATE TABLE chat_rooms(
-              id TEXT PRIMARY KEY,
-              name TEXT,
-              type TEXT,
-              lastMessage TEXT,
-              lastActivity TEXT
-            )
-          ''');
+          // Статистика
+          await txn.execute('CREATE TABLE system_stats(key TEXT PRIMARY KEY, value INTEGER)');
+          await txn.rawInsert('INSERT OR IGNORE INTO system_stats(key, value) VALUES("karma", 0)');
         });
 
-        print("✅ [DB] All tactical tables and indices established.");
-      },
-      onUpgrade: (db, oldVersion, newVersion) async {
-        // Логика миграции: позволяет обновлять приложение без потери данных пользователя
-        if (oldVersion < 2) {
-          await db.execute('CREATE TABLE IF NOT EXISTS ads(id TEXT PRIMARY KEY, title TEXT, content TEXT, imageUrl TEXT, priority INTEGER, isInterstitial INTEGER, expiresAt TEXT)');
-          print("🛠️ [DB] Migration: Added Ads table.");
-        }
+        print("✅ [DB] Tactical Infrastructure ready.");
       },
     );
   }
 
   // ===========================================================================
-  // 📡 МЕТОДЫ ДЛЯ СООБЩЕНИЙ (Messaging)
+  // 📡 МЕТОДЫ ДЛЯ СООБЩЕНИЙ
   // ===========================================================================
 
   Future<void> saveMessage(ChatMessage msg, String chatId) async {
     final db = await database;
 
-    // 🔥 АНТИ-ДУБЛЬ: Если сохраняем серверную версию, удаляем её "временный" клон
     if (msg.clientTempId != null) {
       await db.delete('messages', where: 'id = ?', whereArgs: [msg.clientTempId]);
     }
@@ -139,7 +146,7 @@ class LocalDatabaseService {
         'senderUsername': msg.senderUsername,
         'createdAt': msg.createdAt.toIso8601String(),
         'status': msg.status,
-        'isEncrypted': 1 // В БД всегда храним расшифрованным для юзера
+        'isEncrypted': 1
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
@@ -168,7 +175,7 @@ class LocalDatabaseService {
   }
 
   // ===========================================================================
-  // 📦 МЕТОДЫ ОЧЕРЕДИ (Store-and-Forward Outbox)
+  // 📦 МЕТОДЫ ОЧЕРЕДИ (Store-and-Forward)
   // ===========================================================================
 
   Future<void> addToOutbox(ChatMessage msg, String chatId) async {
@@ -223,12 +230,12 @@ class LocalDatabaseService {
 
   Future<void> clearAll() async {
     final db = await database;
-    // Полная зачистка всех таблиц при активации протокола PANIC
     await db.delete('messages');
     await db.delete('outbox');
     await db.delete('ads');
     await db.delete('licenses');
     await db.delete('chat_rooms');
+    await db.delete('system_stats');
     print("☢️ [DB] MEMORY PURGED SUCCESSFULLY.");
   }
 }

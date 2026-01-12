@@ -1,15 +1,18 @@
 import 'package:get_it/get_it.dart';
-import 'encryption_service.dart';
-import 'mesh_service.dart';
 import 'api_service.dart';
+import 'encryption_service.dart';
+import 'local_db_service.dart';
+import 'mesh_service.dart';
+import 'ultrasonic_service.dart'; // 🔥 Убедись, что импорт есть
 
-final locator = GetIt.instance;
+final GetIt locator = GetIt.instance;
 
 void setupLocator() {
-  // Регистрируем сервис шифрования (обязательно!)
-  locator.registerLazySingleton(() => EncryptionService());
-
-  // Регистрируем остальные сервисы как синглтоны
-  locator.registerLazySingleton(() => MeshService());
   locator.registerLazySingleton(() => ApiService());
+  locator.registerLazySingleton(() => EncryptionService());
+  locator.registerLazySingleton(() => LocalDatabaseService());
+  locator.registerLazySingleton(() => MeshService());
+
+  // 🔥 ДОБАВЬ ЭТУ СТРОКУ:
+  locator.registerLazySingleton(() => UltrasonicService());
 }

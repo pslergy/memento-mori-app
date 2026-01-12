@@ -191,6 +191,9 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
       print("⚠️ [Registration] Uplink failed: $e. Initiating Ghost Protocol...");
 
       final ghostData = await encryption.generateGhostIdentity(username);
+      final landingPass = await encryption.generateLandingPass(_emailGhost.value, ghostData['userId']!);
+      await Vault.write('landing_pass', landingPass);
+      await Vault.write('user_email', _emailGhost.value);
 
       // ЗАПИСЬ В VAULT (Защита от null-safety через ??)
       await Vault.write('auth_token', 'GHOST_MODE_ACTIVE');

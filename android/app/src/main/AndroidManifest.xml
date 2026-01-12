@@ -27,8 +27,7 @@
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">
 
-        <!-- 1. ОСНОВНАЯ ACTIVITY (Теперь она — Калькулятор по умолчанию) -->
-        <!-- Мы включаем её и даем LAUNCHER, чтобы Flutter мог запустить дебаг -->
+        <!-- Основная Activity (Калькулятор) -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -39,49 +38,25 @@
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode">
-
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-
             <meta-data android:name="io.flutter.embedding.android.NormalTheme" android:resource="@style/NormalTheme" />
         </activity>
 
-        <!-- 🎭 АЛИАС ДЛЯ ЗАМЕТОК (Для смены иконки) -->
-        <activity-alias
-            android:name=".MainActivityNotes"
-            android:targetActivity=".MainActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:icon="@mipmap/ic_launcher"
-            android:label="Notes">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
+        <!-- Твой кастомный фоновый сервис для Mesh -->
+        <service
+            android:name=".MeshBackgroundService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
 
-        <!-- 🎭 АЛИАС ДЛЯ КАЛЬКУЛЯТОРА (Для возврата) -->
-        <!-- Мы добавляем его, чтобы наш код смены иконок мог "выключить" MainActivity и "включить" этот алиас в релизе -->
-        <activity-alias
-            android:name=".MainActivityCalculator"
-            android:targetActivity=".MainActivity"
-            android:enabled="false"
-            android:exported="true"
-            android:icon="@mipmap/ic_launcher"
-            android:label="Calculator">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity-alias>
-
-        <meta-data android:name="flutterEmbedding" android:value="2" />
-
+        <!-- Если ты используешь плагин flutter_foreground_task, он должен быть отдельным тегом -->
         <service
             android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
             android:foregroundServiceType="connectedDevice|location"
             android:exported="false" />
+
+        <meta-data android:name="flutterEmbedding" android:value="2" />
     </application>
 </manifest>

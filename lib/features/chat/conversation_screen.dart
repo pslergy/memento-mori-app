@@ -16,6 +16,7 @@ import '../../core/encryption_service.dart';
 import '../../core/local_db_service.dart';
 import '../../core/locator.dart';
 import '../../core/mesh_service.dart';
+import '../../core/models/signal_node.dart';
 import '../../core/native_mesh_service.dart';
 import '../../ghost_input/ghost_controller.dart';
 import '../../ghost_input/ghost_keyboard.dart';
@@ -207,7 +208,6 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
       // --- ☢️ ШАГ 2: СИНХРОНИЗАЦИЯ С ОБЛАКОМ (Если есть BRIDGE) ---
       if (!_isLocalMode && NetworkMonitor().currentRole == MeshRole.BRIDGE) {
-        // Подписываемся на реал-тайм частоту
         WebSocketService().send({'type': 'joinChat', 'chatId': _chatId});
 
         try {
@@ -253,8 +253,10 @@ class _ConversationScreenState extends State<ConversationScreen> {
           }
         } catch (e) {
           // Обработка 403 Forbidden (если сессия на сервере протухла)
-          if (e.toString().contains("403") && !_isRetrying) {
-            print("🛡️ [Security] Re-establishing link...");
+          if (e.toString().contains("404")) {
+            print("🛡️ [Chat] Room not on server yet. Staying in Local-First mode.");
+            // Просто выключаем лоадер, данные из SQLite уже загружены в Шаге 1
+            if (mounted) setState(() => _isLoadingHistory = false);
             _isRetrying = true;
             if (widget.friendId.isNotEmpty && widget.friendId != "GLOBAL") {
               final newChat = await _apiService.findOrCreateChat(widget.friendId);
@@ -299,18 +301,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
       if (!mounted) return;
 
       if (data['type'] == 'newMessage') {
-        // Проверяем, относится ли сообщение к текущему чату
         if (_chatId != null && data['message']['chatRoomId'] == _chatId) {
           var msgMap = data['message'];
           final String serverId = msgMap['id'].toString();
           final String incomingTempId = (msgMap['clientTempId'] ?? msgMap['client_temp_id'] ?? "").toString();
 
-          // 1. ЗАЩИТА ОТ ДУБЛИКАТОВ
           if (_processedIds.contains(serverId) || (incomingTempId.isNotEmpty && _processedIds.contains(incomingTempId))) {
             return;
           }
 
-          // 2. ПОИСК И ОБНОВЛЕНИЕ ОПТИМИСТИЧНОГО СООБЩЕНИЯ
           final int existingIndex = _messages.indexWhere((m) {
             return m.id == serverId || (incomingTempId.isNotEmpty && m.id == incomingTempId) ||
                 (m.senderId == _currentUserId && m.content == msgMap['content']);
@@ -326,7 +325,6 @@ class _ConversationScreenState extends State<ConversationScreen> {
             return;
           }
 
-          // 3. РЕАЛЬНО НОВОЕ СООБЩЕНИЕ ОТ СОБЕСЕДНИКА
           _processedIds.add(serverId);
 
           if (msgMap['isEncrypted'] == true) {
@@ -346,54 +344,64 @@ class _ConversationScreenState extends State<ConversationScreen> {
             _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
           });
           _scrollToBottom();
-
           if (newMessage.senderId != _currentUserId) _sendMessagesReadEvent();
         }
       }
-
-      // Обработка статусов (READ/TYPING) остается прежней...
     });
 
     // --- 👻 КАНАЛ MESH (ОФФЛАЙН / P2P) ---
     _meshSubscription = MeshService().messageStream.listen((offlineData) async {
       if (!mounted) return;
 
+      // 1. ИЗВЛЕЧЕНИЕ ТАКТИЧЕСКИХ ДАННЫХ
       final String incomingSenderId = offlineData['senderId'] ?? "";
+      final String senderIp = offlineData['senderIp'] ?? "";
       final String incomingChatId = offlineData['chatId'] ?? "";
 
-      // 🔥 ТАКТИЧЕСКАЯ АМНИСТИЯ ДЛЯ ТЕСТА
-      // Принимаем пакет, если:
-      // 1. Это Глобальный чат.
-      // 2. ID совпал.
-      // 3. Мы в оффлайне и это единственный активный линк (даже если ID MAC vs UUID разошлись)
-      bool isMatch = incomingChatId == "THE_BEACON_GLOBAL" ||
-          incomingChatId == _chatId ||
-          incomingSenderId == widget.friendId ||
-          (_meshService.isP2pConnected && widget.friendId != "GLOBAL");
+      // 🛑 ШАГ 1: ЗАЩИТА ОТ ВНУТРЕННЕГО ЭХО
+      // Если ID мой И это локальный сигнал (без IP) - игнорируем.
+      // Если IP есть - значит это моя вторая трубка шлет сигнал извне. ПУСКАЕМ!
+      if (incomingSenderId == _currentUserId && (senderIp.isEmpty || senderIp == "127.0.0.1")) {
+        print("🔁 [UI] Internal loopback suppressed.");
+        return;
+      }
 
-      if (isMatch) {
+      // 🔥 ШАГ 2: ВЫЧИСЛЕНИЕ ЛОГИКИ МАТЧИНГА (isGlobal / isDirect)
+      // Проверяем, относится ли пакет к нашему "Маяку"
+      bool isGlobal = (widget.friendId == "GLOBAL") &&
+          (incomingChatId == "GLOBAL" || incomingChatId == "THE_BEACON_GLOBAL");
+
+      // Проверяем, личное ли это сообщение от текущего друга
+      bool isDirect = (incomingSenderId == widget.friendId) ||
+          (incomingChatId == _chatId && _chatId != null);
+
+      // Амнистия: если мы соединены по P2P, принимаем всё, что прилетает в этот экран
+      bool isMeshForceAccept = _meshService.isP2pConnected && widget.friendId != "GLOBAL";
+
+      if (isGlobal || isDirect || isMeshForceAccept) {
+        // Уникальный ID для дедупликации (защита от Burst-дублей)
         final String meshMsgId = "mesh_${offlineData['timestamp']}_$incomingSenderId";
         if (_processedIds.contains(meshMsgId)) return;
         _processedIds.add(meshMsgId);
 
-        print("🎯 [UI] Mesh pulse ACCEPTED from $incomingSenderId (Force Match)");
+        print("🎯 [UI] ACCEPTED pulse from $incomingSenderId via ${senderIp.isEmpty ? 'P2P' : senderIp}");
 
-        String content = offlineData['content'];
+        String content = offlineData['content'] ?? "";
 
-        // 🔥 УМНАЯ РАСШИФРОВКА: Пробуем все доступные ключи
-        // Если ID комнаты в пакете не совпал с нашим, пробуем ключ из ПАКЕТА
+        // 🔥 ШАГ 3: УМНАЯ РАСШИФРОВКА С ФОЛБЕКОМ
         try {
-          final String derivationId = incomingChatId.isNotEmpty ? incomingChatId : "THE_BEACON_GLOBAL";
-          final key = await encryption.getChatKey(derivationId);
+          // Пытаемся расшифровать ключом текущей комнаты (или Маяка)
+          String keyId = (widget.friendId == "GLOBAL") ? "THE_BEACON_GLOBAL" : (_chatId ?? "THE_BEACON_GLOBAL");
+          final key = await encryption.getChatKey(keyId);
           content = await encryption.decrypt(content, key);
-        } catch (e) {
-          // Если не вышло - пробуем ключ нашей текущей комнаты
-          try {
-            final keyFallback = await encryption.getChatKey(_chatId ?? "GLOBAL");
-            content = await encryption.decrypt(content, keyFallback);
-          } catch (_) {
-            content = "[Decryption Error]";
+
+          // Если расшифровка не удалась (текст остался прежним), пробуем ключ из самого пакета
+          if (content == offlineData['content'] && incomingChatId.isNotEmpty) {
+            final fallbackKey = await encryption.getChatKey(incomingChatId == "GLOBAL" ? "THE_BEACON_GLOBAL" : incomingChatId);
+            content = await encryption.decrypt(content, fallbackKey);
           }
+        } catch (e) {
+          content = "[Decryption Failure]";
         }
 
         final msg = ChatMessage(
@@ -405,16 +413,19 @@ class _ConversationScreenState extends State<ConversationScreen> {
           status: "MESH_LINK",
         );
 
-        // Сохраняем под локальным ID, чтобы UI его увидел в текущем списке
-        await db.saveMessage(msg, _chatId ?? "THE_BEACON_GLOBAL");
+        // 🔥 ШАГ 4: СИНХРОНИЗАЦИЯ БАЗЫ
+        // Сохраняем в БД под тем ID, который сейчас открыт на экране, чтобы ListView его увидел
+        final String activeChatId = (widget.friendId == "GLOBAL") ? "THE_BEACON_GLOBAL" : (_chatId ?? "THE_BEACON_GLOBAL");
+        await db.saveMessage(msg, activeChatId);
 
         setState(() {
           _messages.add(msg);
+          // Сортируем, чтобы оффлайн-пакеты встали на свои места во времени
           _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
         });
         _scrollToBottom();
       } else {
-        print("🚫 [UI] Ignored: Sender $incomingSenderId not matching local ${widget.friendId}");
+        print("🚫 [UI] Ignored: Sender $incomingSenderId doesn't match current channel ${widget.friendId}");
       }
     });
   }
@@ -432,92 +443,77 @@ class _ConversationScreenState extends State<ConversationScreen> {
     if (text.isEmpty || _isSending) return;
 
     setState(() => _isSending = true);
-
     final db = LocalDatabaseService();
     final encryption = locator<EncryptionService>();
     final meshService = locator<MeshService>();
 
-    if (meshService.lastKnownPeerIp.isEmpty) {
-      _log("⚠️ No peer IP captured yet. Wait for incoming signal.");
-      setState(() => _isSending = false);
-      return;
-    }
-
-    // 🔥 ГЛОБАЛЬНЫЙ ID: Должен быть идентичен на всех нодах для Beacon
-    final String targetChatId = widget.friendId == "GLOBAL"
-        ? "THE_BEACON_GLOBAL"
-        : (_chatId ?? "GLOBAL");
-
+    // 1. Подготовка ID и Сообщения
+    final String targetChatId = (widget.friendId == "GLOBAL" || widget.chatRoomId == "THE_BEACON_GLOBAL")
+        ? "THE_BEACON_GLOBAL" : (_chatId ?? "GLOBAL");
     final String tempId = "temp_${DateTime.now().millisecondsSinceEpoch}";
 
-    _processedIds.add(tempId);
-
     final myMessage = ChatMessage(
-        id: tempId,
-        clientTempId: tempId,
-        content: text,
-        senderId: _currentUserId ?? "ME",
-        senderUsername: "Nomad",
-        createdAt: DateTime.now(),
-        status: "SENDING"
+        id: tempId, content: text, senderId: _currentUserId ?? "ME",
+        createdAt: DateTime.now(), status: "SENDING"
     );
 
-    HapticFeedback.lightImpact();
     _ghostController.clear();
-
     setState(() { _messages.add(myMessage); });
     await db.saveMessage(myMessage, targetChatId);
 
-    final bool isOffline = NetworkMonitor().currentRole == MeshRole.GHOST || _isLocalMode;
+    // 2. ОПРЕДЕЛЯЕМ ПУТИ ПЕРЕДАЧИ
+    final bool canUseCloud = NetworkMonitor().currentRole == MeshRole.BRIDGE;
+    final bool canUseMesh = meshService.isP2pConnected;
 
-    if (isOffline) {
-      // 👻 РЕЖИМ MESH
-      try {
-        final key = await encryption.getChatKey(targetChatId);
-        final encrypted = await encryption.encrypt(text, key);
+    // 🔥 ГИБРИДНЫЙ ВЫСТРЕЛ
+    try {
+      final key = await encryption.getChatKey(targetChatId);
+      final encrypted = await encryption.encrypt(text, key);
 
-        final offlinePacket = jsonEncode({
-          'type': 'OFFLINE_MSG',
-          'chatId': targetChatId,
-          'content': encrypted,
-          'isEncrypted': true,
-          'senderId': _currentUserId ?? 'Anon',
-          'senderUsername': 'Nomad',
-          'timestamp': DateTime.now().millisecondsSinceEpoch,
-        });
+      // Готовим оффлайн пакет
+      final offlinePacket = jsonEncode({
+        'type': 'OFFLINE_MSG',
+        'chatId': targetChatId,
+        'content': encrypted,
+        'isEncrypted': true,
+        'senderId': _currentUserId,
+        'timestamp': DateTime.now().millisecondsSinceEpoch,
+        'clientTempId': tempId,
+      });
 
-        // 🔥 ФОРСИРОВАННАЯ ОТПРАВКА: Шлем 3 раза, чтобы Tecno точно "услышал"
-        // Используем актуальный IP соседа из meshService
-        final targetIp = meshService.lastKnownPeerIp;
-
-        for (int i = 0; i < 3; i++) {
-          await NativeMeshService.sendTcp(offlinePacket, host: targetIp);
-          await Future.delayed(const Duration(milliseconds: 200));
-        }
-
-        setState(() { myMessage.status = "MESH_LINK"; });
-        print("📡 [Mesh] Bursts sent to $targetIp");
-      } catch (e) {
-        print("❌ [Mesh] Burst failure: $e");
-      } finally {
-        if (mounted) setState(() => _isSending = false);
-      }
-    } else {
-      // 🌐 РЕЖИМ CLOUD
-      try {
+      // --- А. Шлем в Облако (если есть инет) ---
+      if (canUseCloud) {
         await WebSocketService().send({
-          "type": "message",
-          "chatId": _chatId,
-          "content": text,
-          "clientTempId": tempId
+          "type": "message", "chatId": targetChatId,
+          "content": text, "clientTempId": tempId
         });
-      } catch (e) {
-        print("❌ [Cloud] Send error: $e");
-      } finally {
-        Future.delayed(const Duration(milliseconds: 500), () {
-          if (mounted) setState(() => _isSending = false);
-        });
+        myMessage.status = "SENT";
       }
+
+      // --- Б. Шлем в Mesh (всегда, если есть коннект, даже если мы онлайн!) ---
+      if (canUseMesh) {
+        String targetIp = meshService.lastKnownPeerIp;
+        if (targetIp.isEmpty && !meshService.isHost) targetIp = "192.168.49.1";
+
+        if (targetIp.isNotEmpty) {
+          for (int i = 0; i < 3; i++) {
+            await NativeMeshService.sendTcp(offlinePacket, host: targetIp);
+            await Future.delayed(const Duration(milliseconds: 100));
+          }
+          if (!canUseCloud) myMessage.status = "MESH_LINK";
+        }
+      }
+
+      // Если совсем нет путей - в инкубатор
+      if (!canUseCloud && !canUseMesh) {
+        await db.addToOutbox(myMessage, targetChatId);
+        myMessage.status = "PENDING_RELAY";
+      }
+
+    } catch (e) {
+      print("❌ Send Error: $e");
+    } finally {
+      if (mounted) setState(() => _isSending = false);
     }
     _scrollToBottom();
   }
