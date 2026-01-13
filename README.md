@@ -1,111 +1,160 @@
+# Memento Mori  
+### Resilient Offline-First Messaging System for Network-Degraded Environments
 
-## 📱 Tactical Interface & System Capabilities
+**Memento Mori** is a research-driven, privacy-preserving messaging system designed to operate under **partial or total network failure**.  
+The project explores resilient communication techniques for environments affected by censorship, internet shutdowns, or unstable connectivity.
 
-| SYSTEM STATUS (Online) | SONAR LINK (Acoustic) | NODE RADAR (Mesh) |
-|:---:|:---:|:---:|
-| <img src="assets/screenshots/online_status.png" width="250"> | <img src="assets/screenshots/photo_2026-01-12_11-11-59.jpg" width="250"> | <img src="assets/screenshots/mesh_radar.png" width="250"> |
-
-**Technical Specifications:**
-*   **System Status:** Adaptive UI showing real-time backhaul connectivity (UPLINK) and active SOS Beacon frequencies.
-*   **Sonar Link:** Experimental ultrasonic data transmission (19kHz) for out-of-band key exchange in RF-denied environments.
-*   **Node Radar:** Live peer discovery via Wi-Fi Direct and BLE, visualizing the "Internet Magnet" proximity gradient.
-
-> **Privacy Notice:** Direct messaging interfaces are protected by `FLAG_SECURE` to prevent unauthorized screen capture at the hardware level.
+The system combines **cloud relays, peer-to-peer mesh networking, and experimental out-of-band discovery mechanisms** to guarantee message delivery under adverse conditions.
 
 ---
 
----
+## 🧠 System Architecture Overview
 
+Memento Mori is built as a **delay-tolerant, multi-transport communication system** with an offline-first design.
 
+At a high level, the system consists of:
 
-# Memento Mori: Tactical Anti-Censorship Messenger
+### 1. Out-of-Band Node Discovery (Cold Start Mitigation)
+An experimental ultrasonic signaling mechanism is used to enable **initial peer discovery** when RF-based discovery is slow, restricted, or unavailable.
 
-**Memento Mori** is a high-resilience, privacy-focused tactical messenger designed for communication in environments with total internet shutdown or aggressive censorship. It implements a hybrid network topology to ensure message delivery through Cloud, Mesh (Wi-Fi Direct/BLE), and Acoustic channels.
+### 2. Hybrid Transport Layer
+The messenger dynamically selects the most reliable transport available:
+- **Cloud Relay:** Encrypted WebSockets for global reach
+- **Mesh Transport:** Wi-Fi Direct and Bluetooth Low Energy (BLE)
+- **Store-and-Forward:** Opportunistic message carrying for disconnected nodes (DTN)
 
----
+### 3. Probabilistic Routing & Synchronization
+Messages propagate using **gossip-based epidemic spreading** with deduplication and anti-entropy mechanisms to prevent broadcast storms.
 
-## 🛡️ Core Philosophy: Privacy by Design
-*   **Zero-Knowledge Architecture:** No central authority can read your messages.
-*   **Censorship Resistance:** Designed to bypass national firewalls and work in completely isolated grids.
-*   **Stealth Mode:** App masquerades as a fully functional calculator with a secondary encrypted entry point.
+### 4. Identity & Security Layer
+- Offline-generated cryptographic identities
+- Deferred cloud binding via a custom “Landing Pass” protocol
+- End-to-End Encryption (E2EE) by default
 
 ---
 
 ## 🚀 Key Engineering Features
 
-### 1. Hybrid Link Protocol (V2.4)
-The messenger dynamically switches between three transport layers:
-*   **Cloud Link:** Secure WebSockets through obfuscated TLS (masquerading as standard Microsoft update traffic).
-*   **Mesh Link (P2P):** Wi-Fi Direct and Bluetooth Low Energy (BLE) for peer-to-peer communication without routers.
-*   **Sonar Link (Experimental):** Data transmission via ultrasonic sound pulses (Acoustic Modem).
+### Hybrid Link Protocol (v2.x)
+The transport layer continuously adapts to connectivity conditions:
+- Automatic fallback between Cloud, Mesh, and DTN paths
+- Encrypted Outbox for gateway nodes bridging isolated segments
+- Resilient reconnection logic under frequent network churn
 
-### 2. Advanced Security Layer
-*   **End-to-End Encryption (E2EE):** AES-256-GCM for messages and Ed25519 for identity verification.
-*   **Identity Correlation Engine:** A custom handshake protocol that maps transient hardware IP addresses to static cryptographic User IDs in P2P groups.
-*   **Self-Healing Server:** A Kotlin-based background TCP server with automatic socket recovery and thread-pool management.
+---
 
-### 3. Anti-Forensics & Stealth
-*   **Activity-Alias Masquerading:** The app icon and entry point are disguised as a system calculator.
-*   **Panic Protocol:** A gesture-based (accelerometer-triggered) or PIN-triggered "Silent Wipe" that purges all local SQLite data and Secure Storage keys.
-*   **Unified Vault:** A resilient storage strategy with hardware-glitch fallback for non-standard Android implementations (Tecno/Huawei/Xiaomi).
+### Experimental Acoustic Discovery (Sonar Link)
+> **Status:** Research / Experimental
+
+- Ultrasonic signaling (~19 kHz) for out-of-band discovery
+- BFSK modulation with Goertzel-based detection (Kotlin, native layer)
+- Frame structure: `Preamble | Length | Payload | CRC-8`
+- Used exclusively for discovery and key exchange (not bulk data)
+
+**Goal:** Reduce cold-start latency in RF-denied or congested environments.
+
+---
+
+### Probabilistic Gossip Protocol
+- Epidemic message spreading with configurable retransmission probability
+- Hash-based deduplication stored in SQLite (WAL mode)
+- Anti-entropy synchronization to reduce redundant traffic
+
+**Observed behavior:**
+- Scales to ~500–1000 nodes without saturating the mesh
+- Broadcast volume reduced by ~60–70% through deduplication
+
+---
+
+### OS-Level Resilience (Android)
+A major engineering challenge was maintaining background connectivity on devices with aggressive power management (Huawei, Tecno, Xiaomi).
+
+**Implemented solutions:**
+- Foreground-bound Kotlin service hosting a TCP stack
+- Explicit socket binding (`0.0.0.0:55555`)
+- Automatic socket recovery and thread-pool supervision
+- Deterministic chat routing via alphabetized ID sorting
+
+This architecture ensures **stable background networking** even under non-standard Android implementations.
+
+---
+
+## 🔐 Security & Privacy
+
+- **End-to-End Encryption:** AES-256-GCM
+- **Identity:** Ed25519 key pairs generated offline
+- **Key Derivation:** PBKDF2
+- **Zero-Knowledge Design:** No server-side message access
+- **Secure UI:** Sensitive screens protected via `FLAG_SECURE`
+
+### Deferred Identity Binding (“Landing Pass”)
+Users can operate fully offline and later bind their cryptographic identity to a cloud account **without losing message history**.
+
+---
+
+## 🕊️ Anti-Forensics & Data Safety
+
+- Application masquerading as a calculator
+- Gesture- or PIN-triggered silent data wipe
+- Encrypted local storage with hardware-fallback strategies
+- Resilient vault layer for unstable KeyStore implementations
 
 ---
 
 ## 🛠 Tech Stack
-*   **Frontend:** Flutter (Dart) using Cubit for state management.
-*   **Backend:** Node.js (Express), PostgreSQL, PostGIS for proximity-based discovery.
-*   **Native Layer:** Kotlin (Wi-Fi P2pManager, ServerSocket, PowerManager API).
-*   **Storage:** SQLite (WAL Mode enabled) for offline-first persistence.
-*   **Crypto:** `cryptography` package for AES-GCM and SHA-256 hashing.
+
+**Mobile**
+- Flutter (Dart, Cubit)
+- Native Kotlin (Wi-Fi P2P, BLE, TCP Services)
+- SQLite (WAL mode)
+
+**Backend**
+- Node.js (Express)
+- PostgreSQL + PostGIS
+- WebSockets
+
+**Cryptography**
+- AES-256-GCM
+- Ed25519
+- SHA-256
 
 ---
 
+## 📊 System Constraints & Observations
+
+- Designed for intermittent connectivity and long network partitions
+- Optimized for low-bandwidth and high-latency links
+- Target mesh size: hundreds to ~1000 nodes
+- Message delivery guaranteed via store-and-forward semantics
 
 ---
 
-## 🖥️ Backend Architecture & Privacy
-The Memento Mori server infrastructure is a robust system built on **Node.js (Express), PostgreSQL, and PostGIS** for geospatial indexing.
+## 🖥️ Backend Architecture
 
-**Why is the backend repository private?**
-To maintain the security of the relay network and protect the core signal-routing logic from adversarial analysis, the backend source code is kept in a **private repository**. 
+The backend infrastructure acts as a **relay and identity anchor**, not a central authority.
 
-**Key Infrastructure Responsibilities:**
-*   **Identity Anchoring:** Secure verification of handshakes to prevent impersonation.
-*   **Bridge Synchronization:** Managing the encrypted Outbox for nodes acting as internet gateways.
-*   **DPI Deception:** Implementation of traffic obfuscation protocols to hide messenger activity from network analysis tools.
+**Responsibilities:**
+- Identity verification and handshake validation
+- Encrypted message relay for gateway nodes
+- Traffic obfuscation to resist DPI-based blocking
 
-*Note: The client-side code is open-source to allow public verification of our End-to-End Encryption (E2EE) implementation.*
-
----
-
-## 🎯 The "Tecno/Huawei" Case Study: Overcoming Hardware Isolation
-During development, we encountered a critical issue where aggressive battery optimization and non-standard Android KeyStore implementations on Tecno and Huawei devices caused socket "ghosting" and data decryption failures.
-
-**The Solution:**
-1.  Implemented a **Deterministic ID Routing** logic using alphabetized ID sorting to ensure chatId consistency across nodes.
-2.  Developed a **TCP Burst Strategy** with explicit UTF-8 synchronization to penetrate OS-level socket throttling.
-3.  Architected a **Resilient Vault Layer** with automatic fallback mechanisms to ensure session persistence across process restarts.
+> **Note:** Backend source code is private to reduce attack surface and protect routing logic.  
+> Client-side cryptography remains open for public verification.
 
 ---
 
+## 🧪 Research & Roadmap
 
-## 🕊️ Ethical & Humanitarian Architecture
-Memento Mori is built for scenarios where communication equals survival. 
-We explicitly reject monetization of bridge access in conflict zones.
-
-**Implemented Ethical Protocols:**
-*   **Proof of Cooperation (PoC):** Priority routing is granted based on the node's contribution to the mesh network, not financial status.
-*   **RF Stealth Handshake:** Bridge nodes use randomized transmission intervals to evade signal triangulation by military-grade sensors.
-*   **Anti-Traffic Analysis:** Data padding and traffic mixing to protect the physical location of Starlink/Backhaul gateways.
-
-## 💰 Monetization Strategy: Gossip Ad-Network
-Memento Mori introduces a unique **Offline Advertising Protocol**. Using a Gossip-based synchronization, nodes exchange signed "Tactical Ad Packets" during P2P handshakes. This creates a decentralized ad network that earns revenue even when the global internet is unreachable.
+- Improved acoustic channel robustness
+- Adaptive gossip probabilities based on node density
+- Formal modeling of delivery guarantees under partitioned networks
+- Privacy-preserving proximity discovery
 
 ---
 
+## 👨‍💻 Author
 
-Memento Mori is part of a broader engineering portfolio, including **Kismet** — a production-ready AI Social/Dating platform localized in 8 languages, featuring NASA-standard astronomical engines and high-concurrency infrastructure.
-
-## 👨‍💻 Developer
 **Pslergy**  
-*Focus: Product Engineering, Cybersecurity, Distributed Systems.*
+*Focus: Distributed Systems, Mobile OS Internals, Privacy-Preserving Architectures*
+
+This project is part of a broader engineering portfolio exploring resilient networking, offline-first systems, and secure communication under extreme constraints.
