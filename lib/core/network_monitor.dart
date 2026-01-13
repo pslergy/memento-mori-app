@@ -52,8 +52,16 @@ class NetworkMonitor {
 
       if (response.statusCode == 200) {
         if (currentRole != MeshRole.BRIDGE) {
+          print("🌐 [NET-TRANSITION] OFFLINE -> ONLINE (BRIDGE MODE ACTIVE)");
           currentRole = MeshRole.BRIDGE;
           _roleController.add(currentRole);
+
+          // Проверяем Mesh-линк при выходе в онлайн
+          final mesh = locator<MeshService>();
+          if (mesh.isP2pConnected) {
+            print("🔗 [PERSISTENCE-CHECK] P2P Link maintained during Cloud uplink.");
+          }
+
           unawaited(locator<ApiService>().syncOutbox());
         }
       } else {

@@ -46,38 +46,43 @@ class MeshBackgroundService : Service() {
     }
 
     private fun startTcpServer() {
-        serviceJob?.cancel() // Убиваем старый цикл, если он был
-        serviceJob = serviceScope.launch {
+        // 1. Убиваем старую задачу, если она жива
+        serviceJob?.cancel()
+
+        serviceJob = serviceScope.launch(Dispatchers.IO) {
             while (isActive) {
                 var ss: ServerSocket? = null
                 try {
-                    // Биндимся на 0.0.0.0, чтобы слушать ВСЕ интерфейсы (4G + WiFi P2P)
+                    // 2. Явно пытаемся закрыть старый серверный сокет, если он остался в памяти
+                    serverSocket?.close()
+
                     ss = ServerSocket()
-                    ss.reuseAddress = true
+                    ss.reuseAddress = true // Позволяет занимать порт сразу после закрытия
+
+                    // Пытаемся привязаться к порту
                     ss.bind(InetSocketAddress("0.0.0.0", MESH_PORT))
                     serverSocket = ss
 
-                    Log.d("P2P_BG", "🛡️ Background Server Secured: Listening on $MESH_PORT")
+                    Log.d("P2P_BG", "🛡️ SERVER REBORN on port $MESH_PORT")
 
                     while (isActive) {
-                        // Ожидаем подключения
                         val client = try {
                             ss.accept()
                         } catch (e: Exception) {
                             null
-                        } ?: break // Выход из цикла, если сокет закрыт извне
+                        } ?: break
 
                         val remoteIp = client.inetAddress.hostAddress
-                        Log.d("P2P_BG", "🔥 Signal detected from $remoteIp")
-
-                        // Обработка клиента в отдельной корутине
-                        serviceScope.launch {
+                        serviceScope.launch(Dispatchers.IO) {
                             handleClientSecurely(client, remoteIp)
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e("P2P_BG", "Server Error: ${e.message}")
-                    delay(3000) // Пауза перед автоматическим рестартом
+                    Log.e("P2P_BG", "🚨 Bind failed (Port $MESH_PORT): ${e.message}")
+
+                    // 🔥 КРИТИЧЕСКИЙ ФИКС: Пауза перед рестартом.
+                    // Без неё цикл крутится со скоростью процессора, забивая логи и вешая телефон.
+                    delay(5000)
                 } finally {
                     try { ss?.close() } catch (e: Exception) {}
                 }

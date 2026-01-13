@@ -3,14 +3,18 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:flutter/services.dart';
+import 'package:animate_do/animate_do.dart'; // Для анимаций
 
-// Системные сервисы
 import 'package:memento_mori_app/core/locator.dart';
 import 'package:memento_mori_app/core/mesh_service.dart';
 import 'package:memento_mori_app/core/native_mesh_service.dart';
 import 'package:memento_mori_app/core/models/signal_node.dart';
 import 'package:memento_mori_app/core/network_monitor.dart';
 import 'package:memento_mori_app/core/ultrasonic_service.dart';
+import 'package:memento_mori_app/core/api_service.dart';
+
+import 'package:memento_mori_app/ghost_input/ghost_controller.dart';
+import 'package:memento_mori_app/ghost_input/ghost_keyboard.dart';
 
 class MeshHybridScreen extends StatefulWidget {
   const MeshHybridScreen({super.key});
@@ -19,24 +23,27 @@ class MeshHybridScreen extends StatefulWidget {
   State<MeshHybridScreen> createState() => _MeshHybridScreenState();
 }
 
-class _MeshHybridScreenState extends State<MeshHybridScreen> {
+class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerProviderStateMixin {
   final MeshService _meshService = locator<MeshService>();
-  final TextEditingController _msgController = TextEditingController();
+  final UltrasonicService _sonarService = locator<UltrasonicService>();
   final ScrollController _logScrollController = ScrollController();
+  final GhostController _ghostController = GhostController();
 
-  // Локальный список логов для отображения в терминале
+  late AnimationController _radarController;
+
+  bool _isKeyboardVisible = false;
   final List<String> _terminalLogs = [];
   StreamSubscription? _logSubscription;
+  StreamSubscription? _sonarSubscription;
+
   bool _isScanning = false;
+  bool _isAcousticTransmitting = false;
 
   @override
   void initState() {
     super.initState();
+    _radarController = AnimationController(vsync: this, duration: const Duration(seconds: 3))..repeat();
 
-    // 1. Привязываем UI к MeshService
-    _meshService.addListener(_onMeshUpdate);
-
-    // 2. Подписка на системные логи терминала
     _logSubscription = _meshService.statusStream.listen((log) {
       if (mounted) {
         setState(() => _terminalLogs.add(log));
@@ -44,280 +51,259 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> {
       }
     });
 
-    // 3. 🔥 ИСПРАВЛЕННЫЙ СЛУШАТЕЛЬ СОНАРА
-    locator<UltrasonicService>().sonarMessages.listen((msg) {
-      _meshService.addLog("👂 [Sonar] Detected signal: $msg");
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                const Icon(Icons.waves, color: Colors.white),
-                const SizedBox(width: 12),
-                Text("Acoustic Pulse: $msg",
-                    style: const TextStyle(fontFamily: 'monospace', fontWeight: FontWeight.bold)),
-              ],
-            ),
-            backgroundColor: const Color(0xFFFF00FF), // Та самая Маджента
-            duration: const Duration(seconds: 3),
-            behavior: SnackBarBehavior.floating, // Делаем его "парящим" для стиля
-          ),
-        );
-      }
+    _sonarSubscription = _sonarService.sonarMessages.listen((msg) {
+      _meshService.addLog("🎯 [SONAR]盟友信号 Captured: $msg");
+      HapticFeedback.vibrate();
     });
 
-    // 4. Запускаем прослушку акустического эфира
-    locator<UltrasonicService>().startListening();
-
-    // 5. Запускаем фоновый Mesh-сервер Kotlin
-    NativeMeshService.startBackgroundMesh();
+    _sonarService.startListening();
   }
 
   @override
   void dispose() {
-    _meshService.removeListener(_onMeshUpdate);
+    _radarController.dispose();
     _logSubscription?.cancel();
-    _msgController.dispose();
-    _logScrollController.dispose();
+    _sonarSubscription?.cancel();
+    _ghostController.dispose();
     super.dispose();
   }
-
-  void _onMeshUpdate() => setState(() {});
 
   void _scrollToBottom() {
     Future.delayed(const Duration(milliseconds: 100), () {
       if (_logScrollController.hasClients) {
-        _logScrollController.animateTo(
-          _logScrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-        );
+        _logScrollController.animateTo(_logScrollController.position.maxScrollExtent, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
       }
     });
   }
 
-  // --- ОБРАБОТЧИКИ СОБЫТИЙ ---
-
-  void _handleScan() async {
+  // 🔥 ОДНА КНОПКА ДЛЯ ВСЕГО (UX Mastery)
+  void _startGlobalDiscovery() async {
     setState(() => _isScanning = true);
     HapticFeedback.mediumImpact();
+
+    _meshService.addLog("📡 Re-initializing all sensors...");
+
+    // 1. Сброс и старт Wi-Fi Mesh
+    await NativeMeshService.forceReset();
+    await Future.delayed(const Duration(seconds: 1));
     await _meshService.startDiscovery(SignalType.mesh);
-    await Future.delayed(const Duration(seconds: 15));
-    if (mounted) setState(() => _isScanning = false);
+
+    // 2. Старт Bluetooth
+    await _meshService.startDiscovery(SignalType.bluetooth);
+
+    // Таймер авто-выключения сканера через 30 сек
+    Future.delayed(const Duration(seconds: 30), () {
+      if (mounted) setState(() => _isScanning = false);
+    });
   }
 
-  void _handleSonar() async {
-    HapticFeedback.vibrate();
-    _meshService.addLog("🔊 SONAR: Emitting acoustic identity pulse...");
-    await locator<UltrasonicService>().transmit("BEACON_ACTIVE");
-  }
+  void _handleFlare() async {
+    if (_isAcousticTransmitting) return;
+    setState(() => _isAcousticTransmitting = true);
 
-  void _handleBroadcast() async {
-    final text = _msgController.text.trim();
-    if (text.isEmpty) return;
+    final myId = locator<ApiService>().currentUserId;
+    _meshService.addLog("🔊 Emitting acoustic flare for auto-link...");
 
-    HapticFeedback.lightImpact();
-    await _meshService.sendAuto(
-      content: text,
-      receiverName: "Broadcast Node",
-      chatId: "THE_BEACON_GLOBAL",
-    );
-    _msgController.clear();
-    FocusScope.of(context).unfocus();
+    await _sonarService.transmitFrame("LNK:$myId");
+
+    if (mounted) setState(() => _isAcousticTransmitting = false);
   }
 
   @override
   Widget build(BuildContext context) {
-    final bool isLinked = _meshService.isP2pConnected;
-    final nodes = _meshService.nearbyNodes;
+    final mesh = context.watch<MeshService>();
+    final isLinked = mesh.isP2pConnected;
 
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: _buildAppBar(),
-      body: Column(
+      body: SafeArea(
+        child: Column(
+          children: [
+            _buildTopHUD(isLinked),
+            Expanded(
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  if (_isScanning) _buildRadarAnimation(),
+                  _buildMainContent(mesh),
+                ],
+              ),
+            ),
+            _buildBottomControls(),
+            if (_isKeyboardVisible)
+              GhostKeyboard(controller: _ghostController, onSend: () {
+                _meshService.sendAuto(content: _ghostController.value, receiverName: "Broadcast", chatId: "THE_BEACON_GLOBAL");
+                _ghostController.clear();
+                setState(() => _isKeyboardVisible = false);
+              }),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTopHUD(bool isLinked) {
+    final role = NetworkMonitor().currentRole;
+    bool isOnline = role == MeshRole.BRIDGE;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+      decoration: BoxDecoration(
+          color: const Color(0xFF0D0D0D),
+          border: Border(bottom: BorderSide(color: isOnline ? Colors.greenAccent : (isLinked ? Colors.cyanAccent : Colors.redAccent), width: 0.5))
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          _buildConnectivityBar(isLinked),
-          _buildTacticalControlPanel(), // НОВАЯ ПАНЕЛЬ С ТУМБЛЕРОМ
-          _buildRadarSection(nodes),
-          Expanded(child: _buildTerminalView()),
-          _buildInputSection(),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(isOnline ? "SECURED UPLINK" : (isLinked ? "MESH ACTIVE" : "SILENT MODE"),
+                  style: GoogleFonts.orbitron(color: isOnline ? Colors.greenAccent : (isLinked ? Colors.cyanAccent : Colors.redAccent), fontSize: 14, fontWeight: FontWeight.bold)),
+              Text(isOnline ? "Encrypted cloud bridge established" : "Local grid synchronization active",
+                  style: TextStyle(color: Colors.white24, fontSize: 8)),
+            ],
+          ),
+          IconButton(
+            icon: const Icon(Icons.settings_outlined, color: Colors.white24),
+            onPressed: () => _showSystemSettings(),
+          )
         ],
       ),
     );
   }
 
-  // --- UI БЛОКИ ---
+  Widget _buildRadarAnimation() {
+    return AnimatedBuilder(
+      animation: _radarController,
+      builder: (context, child) {
+        return Container(
+          width: 300 * _radarController.value,
+          height: 300 * _radarController.value,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.cyanAccent.withOpacity(1 - _radarController.value), width: 2),
+          ),
+        );
+      },
+    );
+  }
 
-  PreferredSizeWidget _buildAppBar() {
-    return AppBar(
-      backgroundColor: const Color(0xFF121212),
-      elevation: 0,
-      title: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text("MEMENTO MESH",
-              style: GoogleFonts.orbitron(color: Colors.cyanAccent, fontSize: 18, letterSpacing: 2)),
-          const Text("HYBRID LINK PROTOCOL V2.5",
-              style: TextStyle(color: Colors.white24, fontSize: 9, fontFamily: 'monospace')),
-        ],
-      ),
-      actions: [
-        IconButton(
-          icon: const Icon(Icons.waves, color: Colors.pinkAccent),
-          tooltip: "Sonar Pulse",
-          onPressed: _handleSonar,
+  Widget _buildMainContent(MeshService mesh) {
+    return Column(
+      children: [
+        const SizedBox(height: 20),
+        // Горизонтальный список союзников
+        SizedBox(
+          height: 120,
+          child: mesh.nearbyNodes.isEmpty
+              ? Center(child: Text("NO ALLIES IN RANGE", style: GoogleFonts.russoOne(color: Colors.white10, fontSize: 12)))
+              : ListView.builder(
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+            scrollDirection: Axis.horizontal,
+            itemCount: mesh.nearbyNodes.length,
+            itemBuilder: (context, i) => _AllyCard(node: mesh.nearbyNodes[i]),
+          ),
         ),
-        _isScanning
-            ? const Padding(padding: EdgeInsets.all(16), child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.cyanAccent)))
-            : IconButton(
-          icon: const Icon(Icons.radar, color: Colors.cyanAccent),
-          onPressed: _handleScan,
-        ),
+        const Spacer(),
+        // Центральная тактическая кнопка
+        _buildActionCenter(),
+        const Spacer(),
+        _buildMiniTerminal(),
       ],
     );
   }
 
-  Widget _buildConnectivityBar(bool isLinked) {
-    final role = NetworkMonitor().currentRole;
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 16),
-      color: isLinked ? Colors.cyanAccent.withOpacity(0.1) : Colors.redAccent.withOpacity(0.1),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Row(
-            children: [
-              Icon(Icons.circle, size: 8, color: isLinked ? Colors.cyanAccent : Colors.redAccent),
-              const SizedBox(width: 8),
-              Text(isLinked ? "LINK ESTABLISHED" : "LINK SEVERED",
-                  style: GoogleFonts.robotoMono(color: isLinked ? Colors.cyanAccent : Colors.redAccent, fontSize: 10, fontWeight: FontWeight.bold)),
-            ],
+  Widget _buildActionCenter() {
+    return Column(
+      children: [
+        GestureDetector(
+          onTap: _isScanning ? null : _startGlobalDiscovery,
+          child: Container(
+            width: 80, height: 80,
+            decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: _isScanning ? Colors.white10 : Colors.cyanAccent.withOpacity(0.1),
+                border: Border.all(color: _isScanning ? Colors.white24 : Colors.cyanAccent, width: 2),
+                boxShadow: [if (!_isScanning) BoxShadow(color: Colors.cyanAccent.withOpacity(0.2), blurRadius: 20)]
+            ),
+            child: Icon(_isScanning ? Icons.sync : Icons.radar, color: Colors.cyanAccent, size: 30),
           ),
-          Text("ROLE: ${role.name.toUpperCase()}",
-              style: GoogleFonts.robotoMono(color: Colors.white38, fontSize: 10)),
-        ],
-      ),
+        ),
+        const SizedBox(height: 15),
+        Text(_isScanning ? "SCANNING SECTOR..." : "TAP TO SCAN",
+            style: GoogleFonts.russoOne(color: Colors.cyanAccent, fontSize: 10, letterSpacing: 2)),
+      ],
     );
   }
 
-  // НОВАЯ ПАНЕЛЬ УПРАВЛЕНИЯ
-  Widget _buildTacticalControlPanel() {
+  Widget _buildMiniTerminal() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1A1A1A),
-        border: Border(bottom: BorderSide(color: Colors.white.withOpacity(0.05))),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          // Тумблер Stealth Mode
-          Row(
-            children: [
-              Icon(Icons.security,
-                  color: _meshService.isPowerSaving ? Colors.greenAccent : Colors.white24, size: 18),
-              const SizedBox(width: 8),
-              Text("STEALTH MODE",
-                  style: GoogleFonts.robotoMono(color: Colors.white70, fontSize: 11)),
-              Transform.scale(
-                scale: 0.7,
-                child: Switch(
-                  value: _meshService.isPowerSaving,
-                  onChanged: (v) {
-                    HapticFeedback.lightImpact();
-                    _meshService.togglePowerSaving(v);
-                  },
-                  activeColor: Colors.greenAccent,
-                ),
-              ),
-            ],
-          ),
-          // Индикатор Кармы
-          Row(
-            children: [
-              const Icon(Icons.star, color: Colors.orangeAccent, size: 14), // Star -> star
-              const SizedBox(width: 4),
-              Text("KARMA: 124", // В реальности брать из статистики БД
-                  style: GoogleFonts.robotoMono(color: Colors.orangeAccent, fontSize: 10, fontWeight: FontWeight.bold)),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildRadarSection(List<SignalNode> nodes) {
-    return Container(
-      height: 110,
-      decoration: BoxDecoration(
-        color: Colors.black,
-        border: Border(bottom: BorderSide(color: Colors.white.withOpacity(0.05))),
-      ),
-      child: nodes.isEmpty
-          ? Center(child: Text("NO NODES DETECTED", style: GoogleFonts.robotoMono(color: Colors.white10, fontSize: 12)))
-          : ListView.builder(
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        scrollDirection: Axis.horizontal,
-        itemCount: nodes.length,
-        itemBuilder: (context, index) => _NodeCard(node: nodes[index]),
-      ),
-    );
-  }
-
-  Widget _buildTerminalView() {
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.all(12),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: const Color(0xFF0D0D0D),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.white.withOpacity(0.05)),
-      ),
+      height: 100,
+      margin: const EdgeInsets.all(20),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(color: Colors.black, borderRadius: BorderRadius.circular(10), border: Border.all(color: Colors.white.withOpacity(0.05))),
       child: ListView.builder(
         controller: _logScrollController,
         itemCount: _terminalLogs.length,
-        itemBuilder: (context, index) {
-          return Padding(
-            padding: const EdgeInsets.only(bottom: 4),
-            child: Text(
-              "> ${_terminalLogs[index]}",
-              style: GoogleFonts.robotoMono(
-                  color: _terminalLogs[index].contains("ERROR") ? Colors.redAccent : Colors.cyanAccent.withOpacity(0.7),
-                  fontSize: 11
-              ),
-            ),
-          );
-        },
+        itemBuilder: (context, i) => Text("> ${_terminalLogs[i]}", style: GoogleFonts.robotoMono(color: Colors.greenAccent.withOpacity(0.5), fontSize: 9)),
       ),
     );
   }
 
-  Widget _buildInputSection() {
+  Widget _buildBottomControls() {
     return Container(
-      padding: EdgeInsets.only(bottom: MediaQuery.of(context).padding.bottom + 12, left: 16, right: 16, top: 12),
-      decoration: const BoxDecoration(
-        color: Color(0xFF121212),
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
+      padding: const EdgeInsets.all(20),
+      decoration: const BoxDecoration(color: Color(0xFF0A0A0A)),
       child: Row(
         children: [
+          // Кнопка Сонара
+          _ProtocolButton(
+            icon: Icons.record_voice_over,
+            label: "FLARE",
+            color: Colors.purpleAccent,
+            onTap: _handleFlare,
+            isActive: _isAcousticTransmitting,
+          ),
+          const SizedBox(width: 15),
+          // Поле ввода сигнала
           Expanded(
-            child: TextField(
-              controller: _msgController,
-              style: GoogleFonts.robotoMono(color: Colors.white, fontSize: 14),
-              decoration: InputDecoration(
-                hintText: "EMIT SIGNAL...",
-                hintStyle: GoogleFonts.robotoMono(color: Colors.white10, fontSize: 14),
-                border: InputBorder.none,
+            child: GestureDetector(
+              onTap: () => setState(() => _isKeyboardVisible = !_isKeyboardVisible),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+                decoration: BoxDecoration(color: const Color(0xFF1A1A1A), borderRadius: BorderRadius.circular(30)),
+                child: AnimatedBuilder(
+                  animation: _ghostController,
+                  builder: (context, _) => Text(
+                    _ghostController.value.isEmpty ? "Emit signal..." : _ghostController.value,
+                    style: TextStyle(color: _ghostController.value.isEmpty ? Colors.white10 : Colors.white),
+                  ),
+                ),
               ),
             ),
           ),
-          IconButton(
-            icon: const Icon(Icons.send_rounded, color: Colors.cyanAccent),
-            onPressed: _handleBroadcast,
+        ],
+      ),
+    );
+  }
+
+  void _showSystemSettings() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF0D0D0D),
+      builder: (context) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: const Icon(Icons.power_settings_new, color: Colors.redAccent),
+            title: const Text("HALT ALL TRANSMISSIONS"),
+            onTap: () { _meshService.stopAll(); Navigator.pop(context); },
+          ),
+          ListTile(
+            leading: const Icon(Icons.wifi_off, color: Colors.orangeAccent),
+            title: const Text("RESET P2P STACK"),
+            onTap: () { NativeMeshService.forceReset(); Navigator.pop(context); },
           ),
         ],
       ),
@@ -325,45 +311,69 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> {
   }
 }
 
-class _NodeCard extends StatelessWidget {
+class _AllyCard extends StatelessWidget {
   final SignalNode node;
-  const _NodeCard({required this.node});
+  const _AllyCard({required this.node});
 
   @override
   Widget build(BuildContext context) {
-    final isBT = node.type == SignalType.bluetooth;
-
-    // 🔥 ЛОГИКА "МАГНИТА": Если нода видит интернет, подсвечиваем её золотым
-    final bool isMagnet = node.bridgeDistance < 5;
-    final color = isMagnet ? Colors.orangeAccent : (isBT ? Colors.blueAccent : Colors.cyanAccent);
-
-    return GestureDetector(
-      onTap: () {
-        HapticFeedback.heavyImpact();
-        NativeMeshService.connect(node.id);
-      },
+    bool isBT = node.type == SignalType.bluetooth;
+    return FadeInRight(
       child: Container(
         width: 100,
-        margin: const EdgeInsets.symmetric(horizontal: 6, vertical: 12),
+        margin: const EdgeInsets.only(right: 15),
+        padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
-          color: color.withOpacity(0.05),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: color.withOpacity(isMagnet ? 0.8 : 0.3), width: isMagnet ? 2 : 1),
-          boxShadow: isMagnet ? [BoxShadow(color: color.withOpacity(0.2), blurRadius: 8)] : null,
+            color: const Color(0xFF111111),
+            borderRadius: BorderRadius.circular(15),
+            border: Border.all(color: Colors.white.withOpacity(0.05))
         ),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(isMagnet ? Icons.hub : (isBT ? Icons.bluetooth_searching : Icons.wifi_tethering),
-                color: color, size: 24),
+            Icon(isBT ? Icons.bluetooth : Icons.wifi_tethering, color: isBT ? Colors.blueAccent : Colors.cyanAccent, size: 24),
             const SizedBox(height: 8),
-            Text(node.name,
-                style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: isMagnet ? FontWeight.bold : FontWeight.normal),
-                overflow: TextOverflow.ellipsis),
-            Text(isMagnet ? "BRIDGE LINK" : "ISOLATED",
-                style: TextStyle(color: color.withOpacity(0.7), fontSize: 7, fontFamily: 'monospace')),
+            Text(node.name, style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis),
+            const SizedBox(height: 4),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.white10, minimumSize: const Size(60, 20), padding: EdgeInsets.zero),
+              onPressed: () => NativeMeshService.connect(node.id),
+              child: const Text("LINK", style: TextStyle(fontSize: 8, color: Colors.white)),
+            )
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _ProtocolButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color color;
+  final VoidCallback onTap;
+  final bool isActive;
+
+  const _ProtocolButton({required this.icon, required this.label, required this.color, required this.onTap, this.isActive = false});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+                color: isActive ? color : color.withOpacity(0.1),
+                shape: BoxShape.circle,
+                border: Border.all(color: color.withOpacity(0.5))
+            ),
+            child: Icon(icon, color: isActive ? Colors.black : color, size: 20),
+          ),
+          const SizedBox(height: 4),
+          Text(label, style: GoogleFonts.russoOne(color: color, fontSize: 8)),
+        ],
       ),
     );
   }

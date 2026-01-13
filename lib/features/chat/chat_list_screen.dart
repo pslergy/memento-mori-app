@@ -1,14 +1,17 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:animate_do/animate_do.dart';
+
 import 'package:memento_mori_app/core/api_service.dart';
 import 'package:memento_mori_app/core/network_monitor.dart';
-import 'package:memento_mori_app/core/google_service.dart';
+import 'package:memento_mori_app/core/locator.dart';
+import 'package:memento_mori_app/core/mesh_service.dart';
+import 'package:memento_mori_app/core/ultrasonic_service.dart';
 import 'package:memento_mori_app/features/chat/conversation_screen.dart';
-import 'package:memento_mori_app/features/chat/select_friends_screen.dart';
-import 'package:memento_mori_app/features/chat/find_friends_screen.dart';
 import 'package:memento_mori_app/features/profile/profile_screen.dart';
 import 'package:memento_mori_app/features/chat/mesh_hybrid_screen.dart';
-import 'package:memento_mori_app/features/auth/auth_gate_screen.dart';
 import '../../core/websocket_service.dart';
 
 class ChatListScreen extends StatefulWidget {
@@ -35,7 +38,6 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
     _loadChats();
     _listenToSocket();
 
-    // Слушаем изменения сети для авто-обновления
     NetworkMonitor().onRoleChanged.listen((role) {
       if (mounted) _loadChats();
     });
@@ -61,13 +63,7 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
         });
       }
     } catch (e) {
-      print("🚨 [UI] Failed to load chats: $e");
-      if (mounted) {
-        setState(() {
-          _allChats = []; // Очищаем список при критической ошибке
-          _isLoading = false;
-        });
-      }
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -79,14 +75,31 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
     });
   }
 
-  // --- ФИЛЬТРАЦИЯ ЧАТОВ (Исправленная версия) ---
   List<dynamic> get _directChats => _allChats.where((c) => c != null && c['type'] == 'DIRECT').toList();
   List<dynamic> get _groupChats => _allChats.where((c) => c != null && c['type'] == 'GROUP').toList();
 
-  // Безопасный поиск Маяка без ошибок типов
   dynamic get _beaconChat {
-    final matches = _allChats.where((c) => c != null && c['id'] == 'THE_BEACON_GLOBAL');
+    final matches = _allChats.where((c) => c != null && (c['id'] == 'THE_BEACON_GLOBAL' || c['type'] == 'GLOBAL'));
     return matches.isEmpty ? null : matches.first;
+  }
+
+  // --- 🔥 ЛОГИКА СОНАРА (AUTO-LINK) ---
+  void _emitHandshakeSignal() async {
+    HapticFeedback.heavyImpact();
+    final String myId = _apiService.currentUserId;
+    final String shortId = myId.length > 6 ? myId.substring(myId.length - 6) : myId;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text("🔊 EMITTING HANDSHAKE PULSE: Nomad #$shortId",
+            style: GoogleFonts.russoOne(fontSize: 10, color: Colors.purpleAccent)),
+        backgroundColor: Colors.black,
+        duration: const Duration(seconds: 3),
+      ),
+    );
+
+    // Сонар шлет команду на автоподключение
+    await locator<UltrasonicService>().transmitFrame("LNK:$myId");
   }
 
   @override
@@ -94,19 +107,16 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        title: const Text('COMMUNICATIONS', style: TextStyle(letterSpacing: 2, fontWeight: FontWeight.bold)),
+        title: Text('GRID_COMMS', style: GoogleFonts.orbitron(letterSpacing: 2, fontWeight: FontWeight.bold, fontSize: 16)),
         backgroundColor: Colors.black,
         elevation: 0,
-        bottom: TabBar(
-          controller: _tabController,
-          indicatorColor: Colors.redAccent,
-          tabs: const [
-            Tab(text: "GLOBAL"),
-            Tab(text: "SQUADS"),
-            Tab(text: "DIRECT"),
-          ],
-        ),
         actions: [
+          // Кнопка Сонара (Handshake)
+          IconButton(
+            icon: Pulse(child: const Icon(Icons.spatial_audio_off, color: Colors.purpleAccent), infinite: true),
+            onPressed: _emitHandshakeSignal,
+            tooltip: "Emit Handshake Pulse",
+          ),
           IconButton(
             icon: const Icon(Icons.radar, color: Colors.cyanAccent),
             onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const MeshHybridScreen())),
@@ -116,56 +126,101 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
             onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const ProfileScreen())),
           ),
         ],
+        bottom: TabBar(
+          controller: _tabController,
+          indicatorColor: Colors.redAccent,
+          labelStyle: GoogleFonts.russoOne(fontSize: 10, letterSpacing: 1),
+          tabs: const [
+            Tab(text: "SIGNAL"),
+            Tab(text: "SQUADS"),
+            Tab(text: "NODES"),
+          ],
+        ),
       ),
       body: Column(
         children: [
-          _buildNetworkStatusBanner(),
+          _buildTacticalHUD(), // 🔥 Вместо старого баннера
           Expanded(
             child: TabBarView(
               controller: _tabController,
               children: [
-                _buildGlobalTab(), // ОБНОВЛЕННАЯ ВКЛАДКА
-                _buildChatList(_groupChats, "No squads joined."),
-                _buildChatList(_directChats, "No private chats."),
+                _buildGlobalTab(),
+                _buildChatList(_groupChats, "No squads detected in this sector."),
+                _buildChatList(_directChats, "No private links established."),
               ],
             ),
           ),
         ],
       ),
-      floatingActionButton: _buildFab(),
     );
   }
 
-  // --- ВКЛАДКА GLOBAL (С ВЕЧНЫМ МАЯКОМ) ---
+  // --- 🔥 ТАКТИЧЕСКИЙ HUD (HEADS-UP DISPLAY) ---
+  Widget _buildTacticalHUD() {
+    final mesh = locator<MeshService>();
+    return StreamBuilder<MeshRole>(
+      stream: NetworkMonitor().onRoleChanged,
+      initialData: NetworkMonitor().currentRole,
+      builder: (context, snapshot) {
+        final bool isOnline = snapshot.data == MeshRole.BRIDGE;
+        final bool isMesh = mesh.isP2pConnected;
+
+        Color themeColor = isOnline ? Colors.greenAccent : (isMesh ? Colors.cyanAccent : Colors.orangeAccent);
+        String statusText = isOnline ? "UPLINK: SECURED" : (isMesh ? "GRID: ACTIVE (P2P)" : "MODE: STEALTH (AIR-GAP)");
+
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          decoration: BoxDecoration(
+            color: themeColor.withOpacity(0.05),
+            border: Border(bottom: BorderSide(color: themeColor.withOpacity(0.3), width: 0.5)),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              _PulseDot(color: themeColor),
+              const SizedBox(width: 10),
+              Text(statusText, style: GoogleFonts.robotoMono(color: themeColor, fontSize: 10, fontWeight: FontWeight.bold)),
+              if (isMesh) ...[
+                const SizedBox(width: 15),
+                Text("|  RELAYS: ${mesh.nearbyNodes.length}", style: TextStyle(color: themeColor.withOpacity(0.5), fontSize: 9)),
+              ]
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildGlobalTab() {
     if (_isLoading) return const Center(child: CircularProgressIndicator(color: Colors.redAccent));
 
     return RefreshIndicator(
       onRefresh: _loadChats,
+      backgroundColor: Colors.grey[900],
+      color: Colors.redAccent,
       child: ListView(
+        padding: const EdgeInsets.symmetric(vertical: 8),
         children: [
-          // 1. ПРИНУДИТЕЛЬНЫЙ МАЯК (Светится всегда)
           if (_beaconChat != null) _buildBeaconTile(_beaconChat),
 
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Text("TRENDING FREQUENCIES", style: TextStyle(color: Colors.white24, fontSize: 10, letterSpacing: 1)),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
+            child: Row(
+              children: [
+                const Icon(Icons.waves, color: Colors.white24, size: 12),
+                const SizedBox(width: 8),
+                Text("NEIGHBORHOOD FREQUENCIES", style: GoogleFonts.russoOne(color: Colors.white24, fontSize: 9, letterSpacing: 1)),
+              ],
+            ),
           ),
 
-          // 2. ОСТАЛЬНЫЕ ПУБЛИЧНЫЕ ЧАТЫ (Если есть инет)
           FutureBuilder<List<dynamic>>(
             future: _apiService.getTrendingBranches(),
             builder: (context, snapshot) {
               final branches = snapshot.data ?? [];
-              if (branches.isEmpty) {
-                return const Padding(
-                  padding: EdgeInsets.all(20.0),
-                  child: Center(child: Text("Scanning for nearby signals...", style: TextStyle(color: Colors.grey, fontSize: 12))),
-                );
-              }
-              return Column(
-                children: branches.where((b) => b['id'] != 'THE_BEACON_GLOBAL').map((b) => _buildBranchTile(b)).toList(),
-              );
+              if (branches.isEmpty) return const SizedBox.shrink();
+              return Column(children: branches.where((b) => b['id'] != 'THE_BEACON_GLOBAL').map((b) => _buildBranchTile(b)).toList());
             },
           ),
         ],
@@ -173,125 +228,104 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
     );
   }
 
-  // Виджет самого МАЯКА (Красный, тактический)
   Widget _buildBeaconTile(dynamic chat) {
-    return Container(
-      margin: const EdgeInsets.all(8),
-      decoration: BoxDecoration(
-        color: Colors.redAccent.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.redAccent.withOpacity(0.3)),
+    return FadeInLeft(
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(colors: [Colors.redAccent.withOpacity(0.15), Colors.transparent]),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.redAccent.withOpacity(0.3)),
+        ),
+        child: ListTile(
+          leading: Pulse(child: const Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 28), infinite: true),
+          title: Text("THE BEACON", style: GoogleFonts.russoOne(color: Colors.white, fontSize: 16, letterSpacing: 1)),
+          subtitle: const Text("GLOBAL EMERGENCY CHANNEL // BROADCASTING", style: TextStyle(color: Colors.redAccent, fontSize: 8, fontWeight: FontWeight.bold)),
+          trailing: const Icon(Icons.chevron_right, color: Colors.white24),
+          onTap: () => _openChat('GLOBAL', 'THE BEACON', 'THE_BEACON_GLOBAL'),
+        ),
       ),
-      child: ListTile(
-        leading: const Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 28),
-        title: Text(chat['name'] ?? 'THE BEACON',
-            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, letterSpacing: 1)),
-        subtitle: const Text("EMERGENCY BROADCAST | MESH ACTIVE",
-            style: TextStyle(color: Colors.redAccent, fontSize: 9, fontWeight: FontWeight.bold)),
-        trailing: const Icon(Icons.chevron_right, color: Colors.white24),
-        onTap: () {
-          Navigator.of(context).push(MaterialPageRoute(
-            builder: (_) => const ConversationScreen(
-              friendId: 'GLOBAL',
-              friendName: 'THE BEACON',
-              chatRoomId: 'THE_BEACON_GLOBAL',
-            ),
-          ));
-        },
-      ),
+    );
+  }
+
+  Widget _buildChatList(List<dynamic> chats, String emptyMsg) {
+    if (_isLoading) return const Center(child: CircularProgressIndicator(color: Colors.white));
+    if (chats.isEmpty) return Center(child: Text(emptyMsg, style: GoogleFonts.robotoMono(color: Colors.white10, fontSize: 12)));
+
+    return ListView.separated(
+      padding: const EdgeInsets.all(8),
+      itemCount: chats.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 4),
+      itemBuilder: (context, index) {
+        final chat = chats[index];
+        final String title = chat['type'] == 'DIRECT'
+            ? (chat['otherUser']?['username'] ?? 'Anonymous')
+            : (chat['name'] ?? 'Squad Alpha');
+
+        final String sub = chat['type'] == 'DIRECT' ? "Direct Link established" : "Mesh Squad Active";
+
+        return ListTile(
+          tileColor: const Color(0xFF0A0A0A),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          leading: CircleAvatar(
+            // 🔥 ИСПРАВЛЕНО ЗДЕСЬ:
+            backgroundColor: Colors.white.withOpacity(0.05),
+            child: Icon(chat['type'] == 'GROUP' ? Icons.groups_3_outlined : Icons.person_outline, color: Colors.white38),
+          ),
+          title: Text(title, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
+          subtitle: Text(sub, style: GoogleFonts.robotoMono(color: Colors.white24, fontSize: 9)),
+          onTap: () => _openChat(chat['type'] == 'DIRECT' ? chat['otherUser']['id'] : '', title, chat['id']),
+        );
+      },
     );
   }
 
   Widget _buildBranchTile(dynamic branch) {
-    final int msgCount = branch['_count']?['messages'] ?? 0;
     return ListTile(
-      leading: _buildActivityBars(msgCount),
-      title: Text(branch['name'] ?? 'Unknown Frequency', style: const TextStyle(color: Colors.white)),
-      subtitle: Text("Relay strength: $msgCount packets", style: const TextStyle(color: Colors.grey, fontSize: 10)),
-      onTap: () {
-        Navigator.of(context).push(MaterialPageRoute(
-          builder: (_) => ConversationScreen(
-            friendId: '',
-            friendName: branch['name'],
-            chatRoomId: branch['id'],
-          ),
-        ));
-      },
+      leading: const Icon(Icons.radar, color: Colors.white10, size: 20),
+      title: Text(branch['name'] ?? 'Public Freq', style: const TextStyle(color: Colors.white70, fontSize: 14)),
+      subtitle: const Text("Relaying nearby signals", style: TextStyle(color: Colors.white10, fontSize: 10)),
+      onTap: () => _openChat('', branch['name'], branch['id']),
     );
   }
 
-  Widget _buildActivityBars(int count) {
-    int bars = (count / 5).clamp(1, 5).toInt();
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: List.generate(5, (i) => Container(
-        width: 2, height: (i + 1) * 4.0,
-        margin: const EdgeInsets.symmetric(horizontal: 1),
-        color: i < bars ? Colors.greenAccent : Colors.white10,
-      )),
-    );
+  void _openChat(String friendId, String name, String? roomId) {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => ConversationScreen(friendId: friendId, friendName: name, chatRoomId: roomId),
+    ));
   }
+}
 
-  // --- СТАНДАРТНЫЙ СПИСОК (SQUADS / DIRECT) ---
-  Widget _buildChatList(List<dynamic> chats, String emptyMsg) {
-    if (_isLoading) return const Center(child: CircularProgressIndicator(color: Colors.white));
-    if (chats.isEmpty) return Center(child: Text(emptyMsg, style: const TextStyle(color: Colors.white38)));
+class _PulseDot extends StatefulWidget {
+  final Color color;
+  const _PulseDot({required this.color});
 
-    return ListView.builder(
-      itemCount: chats.length,
-      itemBuilder: (context, index) {
-        final chat = chats[index];
-        final String title = chat['type'] == 'DIRECT'
-            ? (chat['otherUser']?['username'] ?? 'Unknown')
-            : (chat['name'] ?? 'Unnamed Squad');
+  @override
+  State<_PulseDot> createState() => _PulseDotState();
+}
 
-        return ListTile(
-          leading: CircleAvatar(
-            backgroundColor: Colors.grey[900],
-            child: Icon(chat['type'] == 'GROUP' ? Icons.groups : Icons.person, color: Colors.white),
-          ),
-          title: Text(title, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-          subtitle: const Text("Link secured", style: TextStyle(color: Colors.grey, fontSize: 11)),
-          onTap: () {
-            Navigator.of(context).push(MaterialPageRoute(
-              builder: (_) => ConversationScreen(
-                friendId: chat['type'] == 'DIRECT' ? chat['otherUser']['id'] : '',
-                friendName: title,
-                chatRoomId: chat['id'],
-              ),
-            ));
-          },
-        );
-      },
-    );
+class _PulseDotState extends State<_PulseDot> with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat(reverse: true);
   }
+  @override
+  void dispose() { _controller.dispose(); super.dispose(); }
 
-  Widget _buildNetworkStatusBanner() {
-    return StreamBuilder<MeshRole>(
-      stream: NetworkMonitor().onRoleChanged,
-      initialData: NetworkMonitor().currentRole,
-      builder: (context, snapshot) {
-        final isBridge = snapshot.data == MeshRole.BRIDGE;
-        return Container(
-          width: double.infinity,
-          padding: const EdgeInsets.symmetric(vertical: 4),
-          color: isBridge ? Colors.green[900]!.withOpacity(0.3) : Colors.red[900]!.withOpacity(0.3),
-          child: Text(
-            isBridge ? "📡 UPLINK: STABLE" : "🚫 MODE: GHOST (AIR-GAP)",
-            textAlign: TextAlign.center,
-            style: TextStyle(color: isBridge ? Colors.greenAccent : Colors.redAccent, fontSize: 9, fontWeight: FontWeight.bold, fontFamily: 'monospace'),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget? _buildFab() {
-    if (_tabController.index == 0) return null;
-    return FloatingActionButton(
-      backgroundColor: Colors.redAccent,
-      child: Icon(_tabController.index == 1 ? Icons.group_add : Icons.person_add, color: Colors.white),
-      onPressed: () {}, // Реализуй по необходимости
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) => Container(
+        width: 8, height: 8,
+        decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: widget.color,
+            boxShadow: [BoxShadow(color: widget.color, blurRadius: 4 + _controller.value * 6, spreadRadius: _controller.value * 2)]
+        ),
+      ),
     );
   }
 }

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
@@ -18,6 +19,7 @@ import '../features/chat/conversation_screen.dart';
 import 'api_service.dart';
 import 'background_service.dart';
 import 'encryption_service.dart';
+import 'gossip_manager.dart';
 import 'local_db_service.dart';
 import 'locator.dart';
 import 'mesh_protocol.dart';
@@ -32,10 +34,11 @@ class MeshService with ChangeNotifier {
   static final MeshService _instance = MeshService._internal();
   factory MeshService() => _instance;
   MeshService._internal();
+  GossipManager get _gossipManager => locator<GossipManager>();
 
   final BluetoothMeshService _btService = BluetoothMeshService();
   final ApiService _apiService = ApiService();
-
+  ApiService get apiService => _apiService;
   // Состояние обнаруженных узлов (Радар)
   final Map<String, SignalNode> _nearbyNodes = {};
   final Map<String, int> _lastSeenTimestamps = {};
@@ -47,7 +50,8 @@ class MeshService with ChangeNotifier {
 
   // Потоки данных
 
-
+  final StreamController<String> _linkRequestController = StreamController.broadcast();
+  Stream<String> get linkRequestStream => _linkRequestController.stream;
 
   final StreamController<List<SignalNode>> _discoveryController = StreamController.broadcast();
   Stream<List<SignalNode>> get discoveryStream => _discoveryController.stream;
@@ -67,6 +71,11 @@ class MeshService with ChangeNotifier {
   bool autoBT = true;
   bool _isMeshEnabled = true; // Главный тумблер всей системы связи
   bool _isPowerSaving = true;
+
+  // Состояние "Магнита"
+  int _myDistanceToBridge = 99; // 0 = инет есть, 1 = вижу инет, 99 = изоляция
+  bool _isSearchingUplink = false;
+  bool get isSearchingUplink => _isSearchingUplink;
 
   bool get isMeshEnabled => _isMeshEnabled;
   bool get isPowerSaving => _isPowerSaving;
@@ -193,8 +202,27 @@ class MeshService with ChangeNotifier {
     }
   }
 
+  void broadcastEmergencyHeartbeat() async {
+    final deathDateStr = await Vault.read('user_deathDate');
+    final deathDate = DateTime.parse(deathDateStr!);
+    final remaining = deathDate.difference(DateTime.now()).inDays;
+
+    // Если осталось менее 1000 дней — Сонар кричит "Low Essence"
+    if (remaining < 1000) {
+      locator<UltrasonicService>().transmitFrame("LOW_ESSENCE:${remaining}");
+      _log("🔊 Critical Heartbeat emitted via Sonar.");
+    }
+  }
+
+  void handleIncomingLinkRequest(String senderId) {
+    _log("🤝 Incoming link request from Nomad #$senderId");
+    // Посылаем ID отправителя в UI-стрим
+    _linkRequestController.add(senderId);
+  }
+
   // --- УМНАЯ ОТПРАВКА (Cloud <-> Mesh) ---
 
+  /// Умная тактическая отправка (Cloud + Mesh + Sonar)
   Future<void> sendAuto({
     required String content,
     String? chatId,
@@ -203,86 +231,144 @@ class MeshService with ChangeNotifier {
     final currentRole = NetworkMonitor().currentRole;
     final encryption = locator<EncryptionService>();
     final api = locator<ApiService>();
+    final sonar = locator<UltrasonicService>();
 
-    // 🔥 ГЛОБАЛЬНЫЙ ID: Если ID не передан, используем единую частоту Маяка
-    final String targetId = (chatId == "GLOBAL" || chatId == null)
+    // 1. УНИФИКАЦИЯ ID: Гарантируем работу через системный Маяк
+    final String targetId = (chatId == "GLOBAL" || chatId == "THE_BEACON_GLOBAL" || chatId == null)
         ? "THE_BEACON_GLOBAL"
         : chatId;
 
-    // 1. ПОДГОТОВКА: Шифруем контент ключом конкретного чата
+    _log("🚀 Initiating parallel uplink for room: $targetId");
+
+    // 2. КРИПТОГРАФИЯ: Готовим зашифрованный пакет
     final key = await encryption.getChatKey(targetId);
     final encryptedContent = await encryption.encrypt(content, key);
+    final String tempId = "temp_${DateTime.now().millisecondsSinceEpoch}";
 
-    // Генерируем временный ID для дедупликации
-    final String tempId = "mesh_${DateTime.now().millisecondsSinceEpoch}";
+    // Формируем стандартный Mesh-пакет (Virus-ready)
+    final offlinePacket = jsonEncode({
+      'type': 'OFFLINE_MSG',
+      'chatId': targetId,
+      'content': encryptedContent,
+      'isEncrypted': true,
+      'senderId': api.currentUserId.isNotEmpty ? api.currentUserId : "GHOST_NODE",
+      'senderUsername': "Nomad",
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+      'clientTempId': tempId,
+    });
 
+    // ==========================================
+    // 🌐 КАНАЛ 1: CLOUD (Если есть BRIDGE)
+    // ==========================================
     if (currentRole == MeshRole.BRIDGE) {
-      // ==========================================
-      // 🌐 КАНАЛ ОБЛАКА (Online)
-      // ==========================================
-      WebSocketService().send({
-        "type": "message",
-        "chatId": targetId,
-        "content": content, // WebSocketService сам зашифрует внутри
-        "clientTempId": tempId,
-      });
-      _log("🚀 Packet routed via Cloud Relay.");
+      try {
+        await WebSocketService().ensureConnected();
+        await WebSocketService().send({
+          "type": "message",
+          "chatId": targetId,
+          "content": content, // Внутренний метод WebSocket сам зашифрует
+          "clientTempId": tempId,
+        });
+        _log("☁️ Uplink: Signal relayed to Cloud.");
+      } catch (e) {
+        _log("⚠️ Cloud Relay failed, relying on Mesh.");
+      }
+    }
 
-    } else {
-      // ==========================================
-      // 👻 КАНАЛ MESH (Offline)
-      // ==========================================
-      _log("📡 Broadcasting encrypted pulse to Mesh frequencies...");
+    // ==========================================
+    // 👻 КАНАЛ 2: MESH (Wi-Fi Direct Bursts)
+    // ==========================================
+    if (_isP2pConnected) {
+      String targetIp = _lastKnownPeerIp;
 
-      // Формируем оффлайн-пакет
-      final offlinePacket = jsonEncode({
-        'type': 'OFFLINE_MSG',
-        'chatId': targetId,
-        'content': encryptedContent,
-        'isEncrypted': true,
-        'senderId': api.currentUserId.isNotEmpty ? api.currentUserId : "GHOST_NODE",
-        'senderUsername': "Nomad",
-        'timestamp': DateTime.now().millisecondsSinceEpoch,
-        'clientTempId': tempId, // Передаем ID для защиты от дублей на приеме
-      });
-
-      // --- 1. ОТПРАВКА ПО WI-FI DIRECT (TCP Bursts) ---
-      if (_isP2pConnected) {
-        String targetIp;
-        if (!_isHost) {
-          targetIp = "192.168.49.1"; // Клиент шлет Хосту
-        } else {
-          // Хост шлет на захваченный IP клиента
-          targetIp = _lastKnownPeerIp;
-        }
-
-        if (targetIp.isEmpty || targetIp == "127.0.0.1") {
-          _log("⚠️ Target IP invalid. Waiting for Peer Pulse...");
-          return;
-        }
-
-        _log("🚀 Sending via WiFi to $targetIp");
-        for (int i = 0; i < 3; i++) {
-          await NativeMeshService.sendTcp(offlinePacket, host: targetIp);
-          await Future.delayed(const Duration(milliseconds: 200));
-        }
+      // Если мы клиент, мы всегда знаем где Хост
+      if (targetIp.isEmpty && !_isHost) {
+        targetIp = "192.168.49.1";
       }
 
-      // --- 2. ОТПРАВКА ПО BLUETOOTH (BLE Push) ---
-      // Ищем все обнаруженные Bluetooth-ноды и пытаемся "впрыснуть" данные
-      final bluetoothNodes = _nearbyNodes.values.where((n) => n.type == SignalType.bluetooth).toList();
-
-      for (var node in bluetoothNodes) {
-        try {
-          _log("🦷 Pulsing data to BT Node: ${node.name}");
-          // Пытаемся передать через GATT характеристики
-          await _btService.sendMessage(BluetoothDevice.fromId(node.id), offlinePacket);
-          _log("✅ Pulse successful for ${node.name}");
-        } catch (e) {
-          _log("❌ BT Link failed for ${node.name}");
+      if (targetIp.isNotEmpty && targetIp != "127.0.0.1") {
+        _log("📡 Mesh: Emitting TCP bursts to $targetIp");
+        // Шлем 3 раза для пробития помех (Tactical Burst)
+        for (int i = 0; i < 3; i++) {
+          NativeMeshService.sendTcp(offlinePacket, host: targetIp);
+          await Future.delayed(const Duration(milliseconds: 150));
         }
       }
     }
+
+    // ==========================================
+    // 🦷 КАНАЛ 3: BLUETOOTH (BLE Push)
+    // ==========================================
+    final bluetoothNodes = _nearbyNodes.values.where((n) => n.type == SignalType.bluetooth).toList();
+    for (var node in bluetoothNodes) {
+      try {
+        _btService.sendMessage(BluetoothDevice.fromId(node.id), offlinePacket);
+        _log("🦷 BLE: Pulse injected into ${node.name}");
+      } catch (_) {}
+    }
+
+    // ==========================================
+    // 🔊 КАНАЛ 4: SONAR (Акустический модем)
+    // ==========================================
+    // Мы активируем Сонар автоматически для SOS или коротких команд
+    bool isEmergency = content.toUpperCase().contains("SOS") || targetId == "THE_BEACON_GLOBAL";
+
+    if (isEmergency || content.length < 32) {
+      _log("🔊 Sonar: Escalating to Acoustic Link...");
+      // Используем наш новый протокол фреймов (L2)
+      unawaited(sonar.transmitFrame(content));
+    }
+
+    // 3. ИНКУБАЦИЯ: Сохраняем в Outbox для будущих встреч с BRIDGE
+    if (currentRole == MeshRole.GHOST) {
+      final db = LocalDatabaseService();
+      final myMsg = ChatMessage(
+          id: tempId, content: content, senderId: api.currentUserId,
+          createdAt: DateTime.now(), status: "PENDING_RELAY"
+      );
+      await db.addToOutbox(myMsg, targetId);
+      _log("🦠 Virus: Signal incubated for viral relay.");
+    }
+  }
+
+
+
+
+
+
+  /// Метод активного поиска интернета через узлы
+  Future<void> seekInternetUplink() async {
+    if (_isSearchingUplink) return;
+    _isSearchingUplink = true;
+    notifyListeners();
+
+    _log("📡 [Uplink-Seeker] Probing neighbors for internet access...");
+
+    // 1. Сначала проверяем себя (вдруг инет уже есть)
+    await NetworkMonitor().checkNow();
+    if (NetworkMonitor().currentRole == MeshRole.BRIDGE) {
+      _log("✅ Internet found on this device.");
+      _isSearchingUplink = false;
+      notifyListeners();
+      return;
+    }
+
+    // 2. Рассылаем запрос "Кто видит мост?"
+    final probe = jsonEncode({
+      'type': 'MAGNET_QUERY',
+      'senderId': _apiService.currentUserId,
+    });
+
+    for (var node in _nearbyNodes.values) {
+      NativeMeshService.sendTcp(probe, host: node.metadata);
+    }
+
+    // 3. Таймаут поиска (30 секунд)
+    Timer(const Duration(seconds: 30), () {
+      _isSearchingUplink = false;
+      notifyListeners();
+      _log("⌛ Uplink probe cycle completed.");
+    });
   }
 
   // --- СЕТЕВАЯ ЛОГИКА ---
@@ -404,17 +490,25 @@ class MeshService with ChangeNotifier {
   String get lastKnownPeerIp => _lastKnownPeerIp;
 
   // 🔥 ИСПРАВЛЕННЫЙ МЕТОД ОБРАБОТКИ ПАКЕТОВ
-  /// Центральный хаб обработки входящих Mesh-пакетов
-  /// Центральный хаб обработки входящих Mesh-пакетов
+
+
+  /// Реализует дедупликацию, захват маршрута и вирусную ретрансляцию.
+  /// Центральный диспетчер входящих Mesh-сигналов.
+  /// Логика: Распаковка -> Дедупликация -> Peer Lock -> Маршрутизация.
   void processIncomingPacket(dynamic rawData) async {
     _log("🧬 [Mesh-Kernel] New pulse incoming. Analyzing...");
+
     final db = LocalDatabaseService();
+
+    // 🔥 РЕШЕНИЕ ЦИКЛИЧЕСКОЙ ЗАВИСИМОСТИ:
+    // Достаем менеджер прямо в методе. К этому моменту все синглтоны уже созданы.
+    final gossip = locator<GossipManager>();
 
     try {
       String jsonString = "";
       String? senderIp;
 
-      // 1. РАСПАКОВКА И ЗАХВАТ IP (Критично для Tecno/Huawei)
+      // --- 1. РАСПАКОВКА И ЗАХВАТ IP (Критично для Tecno/Huawei) ---
       if (rawData is Map) {
         jsonString = rawData['message']?.toString() ?? "";
         senderIp = rawData['senderIp']?.toString();
@@ -422,58 +516,83 @@ class MeshService with ChangeNotifier {
         jsonString = rawData.toString();
       }
 
-      if (jsonString.isEmpty) return;
+      if (jsonString.isEmpty) {
+        _log("⚠️ [Mesh] Empty payload received. Aborting.");
+        return;
+      }
 
+      // --- 2. ПАРСИНГ JSON ---
       final Map<String, dynamic> data = jsonDecode(jsonString);
+
+      // --- 3. GOSSIP ДЕДУПЛИКАЦИЯ (Anti-Entropy Layer) ---
+      // Сначала вычисляем хеш, потом лезем в БД.
+      final String packetHash = data['h'] ?? "pulse_${data['timestamp']}_${data['senderId']}";
+
+      if (await db.isPacketSeen(packetHash)) {
+        _log("♻️ [Gossip] Duplicate pulse ($packetHash). Dropping to save battery.");
+        return;
+      }
+
+      // --- 4. МАРШРУТИЗАЦИЯ ОБРАТНОГО ПУТИ (Peer Lock) ---
+      // Фиксируем IP отправителя. Если он прислал нам пакет, значит по этому IP
+      // мы можем достать его через сокет прямо сейчас.
+      if (senderIp != null && senderIp.isNotEmpty && senderIp != "127.0.0.1") {
+        if (_lastKnownPeerIp != senderIp) {
+          _lastKnownPeerIp = senderIp;
+          _log("📍 [Mesh] Peer Locked -> $_lastKnownPeerIp");
+          notifyListeners();
+        }
+      }
+
       final String packetType = data['type'] ?? 'UNKNOWN';
       final String senderId = data['senderId'] ?? 'Unknown';
       final String incomingChatId = data['chatId'] ?? "";
 
-      // 🔥 ГЛАВНЫЙ ФИКС ДЛЯ ХУАВЕЯ:
-      // Как только прилетел ЛЮБОЙ пакет, мы запоминаем IP отправителя
-      // и разрешаем на него отвечать.
-      if (senderIp != null && senderIp.isNotEmpty && senderIp != "127.0.0.1") {
-        if (_lastKnownPeerIp != senderIp) {
-          _lastKnownPeerIp = senderIp;
-          _log("📍 [Mesh] Peer Locked: $_lastKnownPeerIp");
-          notifyListeners(); // Важно! Чтобы UI увидел, что IP появился
-        }
-      }
-
-      // 3. ТАКТИЧЕСКИЙ РОУТИНГ ПАКЕТОВ
+      // --- 5. ТАКТИЧЕСКИЙ РОУТИНГ ---
       switch (packetType) {
 
+        case 'MAGNET_QUERY':
+          _log("❓ Node $senderId looking for uplink. Sending magnet status...");
+          broadcastMagnetStatus();
+          break;
+
+        case 'MAGNET_PULSE':
+          final int peerDist = data['dist'] ?? 99;
+          if (_nearbyNodes.containsKey(senderId)) {
+            _nearbyNodes[senderId]!.bridgeDistance = peerDist;
+            if (peerDist < 5) {
+              _log("🧲 Internet Gateway detected: Node $senderId.");
+              HapticFeedback.heavyImpact(); // Вибрация для демо: "Рыба на крючке"
+            }
+            notifyListeners();
+          }
+          break;
+
         case 'PING':
-          _log("👋 Handshake pulse from $senderId");
-          // Если мы не хост, можем ответить синхронизацией рекламы
+          _log("👋 Handshake from $senderId");
           if (!_isHost && senderIp != null) syncGossip(senderIp);
           break;
 
         case 'OFFLINE_MSG':
           _log("📥 Message pulse detected for room: $incomingChatId");
 
-          // 🔥 ФИКС: ЛОЯЛЬНАЯ ПРОВЕРКА (Пропускаем и GLOBAL, и THE_BEACON_GLOBAL)
           final String myId = _apiService.currentUserId;
           bool isForMe = data['recipientId'] == myId;
           bool isGlobal = incomingChatId == "GLOBAL" || incomingChatId == "THE_BEACON_GLOBAL";
 
-          // Мы ВСЕГДА пробрасываем пакет в UI-контроллер,
-          // а экран ConversationScreen сам решит, показывать его или нет.
+          // Если это нам или в глобал — шлем в UI стрим
           if (isForMe || isGlobal || incomingChatId.isNotEmpty) {
-            _log("🚀 [Mesh] Relaying packet to UI stream.");
-            // Добавляем IP отправителя в Map, чтобы UI мог его использовать
-            data['senderIp'] = senderIp;
+            _log("🚀 [Mesh] Valid signal. Relaying to UI.");
+            data['senderIp'] = senderIp; // Прикрепляем IP для быстрого ответа
             _messageController.add(data);
           }
 
-          // 🦠 ВИРУСНАЯ ЛОГИКА (Relay):
-          // Даже если сообщение не нам, мы сохраняем его в Outbox и будем ретранслировать.
-          // Это делает мессенджер "живучим".
-          _infectDevice(data);
+          // 🦠 GOSSIP RELAY: Инкубируем пакет для дальнейшего распространения
+          await gossip.processEnvelope(data);
           break;
 
         case 'GOSSIP_SYNC':
-          _log("🔄 Gossip Protocol: Syncing tactical ads.");
+          _log("🔄 Gossip Sync: Merging tactical ad-pool.");
           final List? adsRaw = data['payload']?['ads'];
           if (adsRaw != null) {
             for (var adJson in adsRaw) {
@@ -485,30 +604,57 @@ class MeshService with ChangeNotifier {
           break;
 
         case 'REQ':
-        // Если мы в сети (BRIDGE) — проксируем запрос в интернет
           if (NetworkMonitor().currentRole == MeshRole.BRIDGE) {
             _log("🌉 [Bridge] Proxying REQ for $senderId to Cloud.");
-            _handleProxyRequest(MeshPacket.fromJson(jsonString));
+            handleProxyWithFairUse(MeshPacket.fromJson(jsonString));
           } else {
-            // Если инета нет — сохраняем чужой запрос, чтобы передать его позже
-            _log("💾 [Relay] No internet. Caching REQ to infected outbox.");
-            _infectDevice(data);
+            _log("💾 [Relay] No internet. Caching REQ for Gossip.");
+            await gossip.processEnvelope(data);
           }
           break;
 
         case 'RES':
-        // Если пришел ответ от прокси — шлем его в UI
-          _log("🎯 [UI] Proxy response arrived. Relaying.");
+          _log("🎯 [Ghost] Proxy response arrived. Injecting.");
           _messageController.add(data);
           break;
 
         default:
-          _log("❓ Unknown frequency: $packetType");
+          _log("❓ Unknown frequency: $packetType. Monitoring...");
       }
     } catch (e) {
-      _log("❌ [Mesh-Critical] Pulse processing failed: $e");
+      _log("❌ [Mesh-Critical] Crash during pulse processing: $e");
     }
   }
+
+  /// Рассылка статуса близости к интернету
+  void broadcastMagnetStatus() async {
+    final currentRole = NetworkMonitor().currentRole;
+    _myDistanceToBridge = (currentRole == MeshRole.BRIDGE) ? 0 : 99;
+
+    // Если мы не мост, но видим мост среди соседей
+    if (_myDistanceToBridge != 0) {
+      int minDist = 98;
+      for (var node in _nearbyNodes.values) {
+        if (node.bridgeDistance < minDist) minDist = node.bridgeDistance;
+      }
+      _myDistanceToBridge = minDist + 1;
+    }
+
+    final pulse = jsonEncode({
+      'type': 'MAGNET_PULSE',
+      'senderId': _apiService.currentUserId,
+      'dist': _myDistanceToBridge,
+    });
+
+    for (var node in _nearbyNodes.values) {
+      if (node.type == SignalType.mesh) {
+        NativeMeshService.sendTcp(pulse, host: node.metadata);
+      }
+    }
+  }
+
+
+
 
   /// Метод "Заражения" (Viral Infection Protocol)
   /// Сохраняет пакет в Outbox для дальнейшей ретрансляции при обнаружении BRIDGE-ноды
@@ -816,10 +962,7 @@ class MeshService with ChangeNotifier {
     return true;
   }
 
-  void _log(String msg) {
-    print("[Mesh] $msg");
-    _statusController.add(msg);
-  }
+
   void _addLog(String msg) => _log(msg);
 
   String _lastConnectedHost = "192.168.49.1";
@@ -827,23 +970,37 @@ class MeshService with ChangeNotifier {
   bool _isHost = false;
   String _lastKnownPeerIp = "192.168.49.1";
 
-  void onNetworkConnected(bool isHost, String hostAddress) async {
+  void onNetworkConnected(bool isHost, String hostAddress) {
     _isP2pConnected = true;
     _isHost = isHost;
 
-    // 🔥 ГЛАВНЫЙ ФИКС: Всегда запускаем фоновый Mesh-сервер,
-    // даже если мы в онлайне (BRIDGE). Это сделает нас "видимыми" для Призраков.
-    await NativeMeshService.startBackgroundMesh();
+    final String role = isHost ? "COMMAND_NODE (Host)" : "TACTICAL_NODE (Client)";
+    _log("🛡️ [MESH-LINK] CONNECTED | ROLE: $role | Peer IP: $hostAddress");
 
-    if (_isHost) {
-      _lastKnownPeerIp = "";
-      _log("🛡️ ROLE: HOST (Gateway mode). Socket bound to all interfaces.");
-    } else {
-      _lastKnownPeerIp = hostAddress.isEmpty ? "192.168.49.1" : hostAddress;
-      _log("📡 ROLE: CLIENT. Targeting Host: $_lastKnownPeerIp");
-      _sendInitialHandshake();
+    // Проверка сохранности при переключении
+    if (!_isMeshEnabled) {
+      _log("⚠️ [SECURITY-ALERT] Mesh was disabled but link is active!");
     }
+
     notifyListeners();
+  }
+
+  void logSonarEvent(String msg, {bool isError = false}) {
+    final timestamp = DateTime.now().toIso8601String().split('T').last.substring(0, 8);
+    final prefix = isError ? "❌ [SONAR-ERR]" : "🔊 [SONAR]";
+    final fullLog = "$timestamp $prefix $msg";
+
+    print(fullLog);
+    _statusController.add(fullLog); // Отправляем в терминал на экране
+    notifyListeners();
+  }
+
+  // Универсальный логгер с выводом в терминал UI
+  void _log(String msg) {
+    final timestamp = DateTime.now().toIso8601String().split('T').last.substring(0, 8);
+    final fullMsg = "[$timestamp] $msg";
+    print(fullMsg);
+    _statusController.add(fullMsg); // Пробрасываем в терминал на экране
   }
 
   void _sendInitialHandshake() async {
@@ -1001,6 +1158,6 @@ void _triggerSlowScan() {
 }
   void _startSonar() {
     final sonar = UltrasonicService();
-    sonar.transmit("BEACON_ACTIVE"); // Телефон "пропищит" свой статус в эфир
-    _addLog("🔊 SONAR: Acoustic pulse emitted.");
-  }}
+    sonar.transmitBeacon(); // 🔊 ультразвуковой маяк
+    _addLog("🔊 SONAR: Ultrasonic beacon emitted.");
+  } }

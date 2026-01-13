@@ -29,7 +29,6 @@ class WifiP2pHelper(
     private var receiver: BroadcastReceiver? = null
     private val intentFilter = IntentFilter()
 
-    // Пул потоков для эффективного управления ресурсами на Tecno/Huawei
     private val networkExecutor = Executors.newFixedThreadPool(4).asCoroutineDispatcher()
     private val scope = CoroutineScope(networkExecutor + SupervisorJob())
 
@@ -42,11 +41,13 @@ class WifiP2pHelper(
         intentFilter.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
         intentFilter.addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION)
 
+        // 🔥 ФИКС ДЛЯ HUAWEI: Максимальный приоритет для перехвата P2P событий в фоне
+        intentFilter.priority = 999
+
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Memento:MeshWakeLock")
     }
 
-    // Анонимизация MAC-адресов (Identity Privacy)
     private fun anonymize(address: String): String {
         return try {
             val salt = "memento_mori_stealth_v2"
@@ -100,7 +101,7 @@ class WifiP2pHelper(
                             manager?.requestConnectionInfo(channel) { info ->
                                 if (info != null && info.groupFormed && info.groupOwnerAddress != null) {
                                     val isHost = info.isGroupOwner
-                                    val hostAddress = info.groupOwnerAddress.hostAddress // Это 192.168.49.1
+                                    val hostAddress = info.groupOwnerAddress.hostAddress
                                     if (wakeLock?.isHeld == false) wakeLock?.acquire(10 * 60 * 1000L)
 
                                     runOnMain {
@@ -109,7 +110,6 @@ class WifiP2pHelper(
                                             "hostAddress" to hostAddress
                                         ))
                                     }
-                                    // СЕРВЕР ТЕПЕРЬ ЗАПУСКАЕТСЯ В MESH-BACKGROUND-SERVICE
                                 }
                             }
                         } else {
@@ -132,38 +132,55 @@ class WifiP2pHelper(
     @SuppressLint("MissingPermission")
     fun startDiscovery() { if (ensureP2pInitialized()) manager?.discoverPeers(channel, null) }
 
-    fun stopDiscovery() { manager?.stopPeerDiscovery(channel, null) }
+    fun stopDiscovery() { if (ensureP2pInitialized()) manager?.stopPeerDiscovery(channel, null) }
 
     @SuppressLint("MissingPermission")
     fun connect(hashedAddress: String) {
         val realMac = addressMap[hashedAddress] ?: return
         val config = WifiP2pConfig().apply {
             deviceAddress = realMac
-            groupOwnerIntent = 15 // Принудительно пытаемся стать владельцем группы
+            groupOwnerIntent = 15 // Форсируем роль владельца для стабильности моста
         }
         manager?.connect(channel, config, null)
     }
-
-    // --- ТАКТИЧЕСКИЙ ТРАНСПОРТ (TCP CLIENT) ---
 
     fun sendTcp(host: String, port: Int, message: String) {
         scope.launch {
             try {
                 Socket().use { socket ->
-                    socket.tcpNoDelay = true // Отключаем алгоритм Нагла для мгновенного пробития
+                    socket.tcpNoDelay = true
+                    socket.soTimeout = 5000
                     socket.connect(InetSocketAddress(host, port), 5000)
-
-                    val outputStream = socket.getOutputStream()
+                    val out = socket.getOutputStream()
                     val bytes = (message + "\n").toByteArray(StandardCharsets.UTF_8)
-
-                    outputStream.write(bytes)
-                    outputStream.flush() // Принудительный толчок в сеть
-                    Log.d("P2P_NET", "🚀 Burst delivered to $host")
+                    out.write(bytes)
+                    out.flush()
+                    Log.d("P2P_NET", "🚀 Burst delivered via P2P to $host")
                 }
             } catch (e: Exception) {
                 Log.e("P2P_NET", "Send Error: ${e.message}")
             }
         }
+    }
+
+    fun forceReset(callback: () -> Unit) {
+        if (manager == null || channel == null) return
+
+        // 1. Останавливаем текущий поиск
+        manager?.stopPeerDiscovery(channel, null)
+
+        // 2. Принудительно удаляем старую группу (даже если её нет)
+        manager?.removeGroup(channel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d("P2P_NET", "☢️ P2P Group Purged Successfully")
+                callback()
+            }
+            override fun onFailure(reason: Int) {
+                // Даже если нечего удалять, мы идем дальше
+                Log.d("P2P_NET", "☢️ No P2P Group to purge (Reason: $reason)")
+                callback()
+            }
+        })
     }
 
     private fun runOnMain(block: () -> Unit) {

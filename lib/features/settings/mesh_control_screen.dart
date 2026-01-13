@@ -1,17 +1,19 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:memento_mori_app/core/mesh_service.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
+import 'package:animate_do/animate_do.dart';
 
-import '../../core/api_service.dart';
+import '../../core/mesh_service.dart';
 import '../../core/locator.dart';
 import '../../core/models/signal_node.dart';
 import '../../core/native_mesh_service.dart';
 import '../../core/ultrasonic_service.dart';
-import '../chat/conversation_screen.dart';
-import '../chat/frequency_scanner_sheet.dart';
+import '../../core/network_monitor.dart';
+
+import '../../core/api_service.dart';
+import '../theme/app_colors.dart';
 
 class MeshControlScreen extends StatefulWidget {
   const MeshControlScreen({super.key});
@@ -20,382 +22,186 @@ class MeshControlScreen extends StatefulWidget {
   State<MeshControlScreen> createState() => _MeshControlScreenState();
 }
 
-class _MeshControlScreenState extends State<MeshControlScreen> {
-  final List<String> _logs = [];
-  final ScrollController _scrollController = ScrollController();
+class _MeshControlScreenState extends State<MeshControlScreen> with SingleTickerProviderStateMixin {
+  late AnimationController _radarController;
+  bool _isAcousticTransmitting = false;
 
   @override
   void initState() {
     super.initState();
-    // Подписка на стрим логов из сервиса
-    context.read<MeshService>().statusStream.listen((log) {
-      if (mounted) {
-        setState(() {
-          _logs.insert(0, "${DateTime.now().hour}:${DateTime.now().minute}:${DateTime.now().second} > $log");
-        });
-      }
+    _radarController = AnimationController(vsync: this, duration: const Duration(seconds: 3))..repeat();
+
+    // 🔥 ФИКС ОШИБКИ: Ждем завершения кадра перед логированием
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _logAction("Terminal session started. Ready for grid operations.");
     });
-    _checkPermissions();
   }
 
-  Future<void> _checkPermissions() async {
-    await [
-      Permission.location,
-      Permission.nearbyWifiDevices,
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.bluetoothAdvertise,
-      Permission.ignoreBatteryOptimizations, // Важно для Tecno
-    ].request();
+  void _logAction(String msg) {
+    // Используем микротаск, чтобы гарантированно не попасть в фазу build
+    Future.microtask(() {
+      final mesh = locator<MeshService>();
+      mesh.addLog("[TERMINAL] $msg");
+      print("🛠️ DEBUG: $msg");
+    });
   }
 
-  void _openScanner(SignalType type) {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (context) => FrequencyScannerSheet(type: type),
-    );
+  @override
+  void dispose() {
+    _radarController.dispose();
+    super.dispose();
   }
 
-  void _connectToNode(SignalNode node) async {
-    // 1. Достаем сервисы через локатор
-    final meshService = locator<MeshService>();
+  // 🔥 ГЛОБАЛЬНЫЙ SOS С ЖЕСТКИМ ЛОГИРОВАНИЕМ
+  void _executeEmergencySOS() async {
+    _logAction("🚨 !!! SOS EXECUTION STARTED !!!");
+    HapticFeedback.vibrate();
+
+    final mesh = locator<MeshService>();
     final api = locator<ApiService>();
 
-    // 2. Получаем наш ID (Личность)
-    final myId = api.currentUserId;
+    try {
+      // 1. Пакет в Mesh
+      await mesh.sendAuto(
+        content: "CRITICAL SOS: Nomad ${api.currentUserId.substring(0,4)} position compromised.",
+        chatId: "THE_BEACON_GLOBAL",
+        receiverName: "GLOBAL",
+      );
+      _logAction("✅ Mesh/Cloud signal dispatched.");
 
-    // 🛡️ ПРОВЕРКА 1: Личность не установлена
-    if (myId.isEmpty) {
-      meshService.addLog("❌ ERROR: Identity unknown. Unlock via 3301 first.");
+      // 2. Сонар
+      await locator<UltrasonicService>().transmitFrame("SOS:${api.currentUserId}");
+      _logAction("✅ Acoustic beacon emitting...");
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text("Identification required. Please unlock via 3301."),
-              backgroundColor: Colors.redAccent,
-            )
+          const SnackBar(content: Text("EMERGENCY BROADCAST ACTIVE"), backgroundColor: AppColors.warningRed),
         );
       }
-      return;
-    }
-
-    // 📡 ПРОВЕРКА 2: Валидация целевого адреса (Защита от краша "Empty Address")
-    // Мы берем metadata (MAC-адрес), если он пуст — берем id.
-    final String targetAddress = (node.metadata != null && node.metadata!.isNotEmpty)
-        ? node.metadata!
-        : node.id;
-
-    if (targetAddress.isEmpty) {
-      meshService.addLog("❌ ERROR: Target node has no physical address.");
-      return;
-    }
-
-    // 🧠 ГЕНЕРАЦИЯ ЕДИНОГО ТАКТИЧЕСКОГО ID
-    // Сортируем ID, чтобы у обоих устройств чат назывался одинаково
-    List<String> ids = [myId, node.id];
-    ids.sort();
-    final String sharedOfflineId = "GHOST_${ids.join('_')}";
-
-    // --- ЛОГИКА ПОДКЛЮЧЕНИЯ ---
-
-    if (node.type == SignalType.bluetooth) {
-      // КЕЙС: BLUETOOTH
-      meshService.addLog("🦷 Linking via Bluetooth Pulse: ${node.name}");
-      Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => ConversationScreen(
-          friendId: node.id,
-          friendName: node.name,
-          chatRoomId: sharedOfflineId,
-        ),
-      ));
-    }
-    else if (node.type == SignalType.mesh) {
-      // КЕЙС: WI-FI DIRECT MESH
-      meshService.addLog("📡 Establishing Wi-Fi Link: $targetAddress");
-
-      try {
-        // Вызываем нативный метод с ПРОВЕРЕННЫМ адресом
-        await NativeMeshService.connect(targetAddress);
-
-        // Если команда прошла успешно, открываем терминал чата
-        if (mounted) {
-          Navigator.of(context).push(MaterialPageRoute(
-            builder: (_) => ConversationScreen(
-              friendId: node.id,
-              friendName: node.name,
-              chatRoomId: sharedOfflineId,
-            ),
-          ));
-        }
-      } catch (e) {
-        meshService.addLog("❌ Hardware Connection Error: $e");
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text("Link Refused: $e"))
-          );
-        }
-      }
+    } catch (e) {
+      _logAction("❌ SOS FAILED: $e");
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final meshService = context.watch<MeshService>();
-    final nodes = meshService.nearbyNodes;
+    final mesh = context.watch<MeshService>();
+    final nodes = mesh.nearbyNodes;
 
     return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(
-        title: Text("TACTICAL LINK", style: TextStyle(fontFamily: 'Orbitron',letterSpacing: 2, fontSize: 16)),
-        backgroundColor: const Color(0xFF0D0D0D),
-        elevation: 0,
-      ),
-      body: Column(
-        children: [
-          _buildRadarHeader(nodes.length),
+      backgroundColor: AppColors.background,
+      body: SafeArea(
+        child: Column(
+          children: [
+            _buildTopStatusHeader(mesh),
 
-          // 🔥 ТАКТИЧЕСКАЯ ПЛАШКА: ПРЕДУПРЕЖДЕНИЕ О GPS
-          if (!meshService.isGpsEnabled) _buildGpsWarningBanner(),
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                children: [
+                  const SizedBox(height: 20),
+                  _buildRadarDisplay(nodes.length),
+                  const SizedBox(height: 30),
 
-          Expanded(
-            child: nodes.isEmpty
-                ? _buildEmptyScanner()
-                : ListView.builder(
-              padding: const EdgeInsets.all(16),
-              itemCount: nodes.length,
-              itemBuilder: (context, index) => _buildNearbyNodeTile(nodes[index]),
+                  // 🔥 КНОПКА SOS (Теперь отдельный блок)
+                  _buildEmergencyButton(),
+
+                  const SizedBox(height: 30),
+
+                  _buildTacticalGrid(mesh),
+
+                  const SizedBox(height: 20),
+                  _buildAlliesList(nodes),
+                ],
+              ),
             ),
-          ),
 
-          const Divider(color: Colors.white10, height: 1),
-
-          // ПАНЕЛЬ УПРАВЛЕНИЯ
-          _buildControlPanel(meshService),
-        ],
+            _buildFooterActions(mesh),
+          ],
+        ),
       ),
     );
   }
 
-  // Виджет баннера при выключенном GPS
-  Widget _buildGpsWarningBanner() {
+  Widget _buildTopStatusHeader(MeshService mesh) {
+    final role = NetworkMonitor().currentRole;
     return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        color: Colors.redAccent.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.redAccent.withOpacity(0.5)),
+          color: AppColors.surface,
+          border: Border(bottom: BorderSide(color: AppColors.white10))
       ),
-      child: Row(
-        children: [
-          const Icon(Icons.location_off, color: Colors.redAccent, size: 24),
-          const SizedBox(width: 15),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text("GPS SENSOR OFFLINE",
-                    style: GoogleFonts.russoOne(color: Colors.redAccent, fontSize: 12)),
-                const SizedBox(height: 2),
-                const Text(
-                  "Nearby discovery is blocked by Android OS. Enable Location Services to scan.",
-                  style: TextStyle(color: Colors.white70, fontSize: 10),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildRadarHeader(int count) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
-      color: const Color(0xFF0A0A0A),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Row(
-            children: [
-              const Icon(Icons.radar, color: Colors.greenAccent, size: 18),
-              const SizedBox(width: 10),
-              Text("PASSIVE RADAR", style: GoogleFonts.russoOne(fontSize: 14, color: Colors.white70)),
-            ],
-          ),
-          Text(
-            count > 0 ? "NODES: $count" : "SCANNING...",
-            style: TextStyle(
-                color: count > 0 ? Colors.greenAccent : Colors.white24,
-                fontSize: 10,
-                fontWeight: FontWeight.bold
-            ),
-          )
+          _buildStat("CONNECTION", role == MeshRole.BRIDGE ? "CLOUD" : "MESH", AppColors.cloudGreen),
+          _buildStat("NODES", "${mesh.nearbyNodes.length} ACTIVE", AppColors.gridCyan),
+          _buildStat("STEALTH", mesh.isPowerSaving ? "ON" : "OFF", AppColors.stealthOrange),
         ],
       ),
     );
   }
 
-  Widget _buildNearbyNodeTile(SignalNode node) {
-    return Card(
-      color: const Color(0xFF111111),
-      margin: const EdgeInsets.only(bottom: 8),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: const BorderSide(color: Colors.white10)),
-      child: ListTile(
-        leading: Icon(
-          node.type == SignalType.bluetooth ? Icons.bluetooth : Icons.wifi_tethering,
-          color: Colors.greenAccent.withOpacity(0.5),
-        ),
-        title: Text(node.name, style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold)),
-        subtitle: Text(node.type.name.toUpperCase(), style: const TextStyle(color: Colors.grey, fontSize: 10)),
-        trailing: ElevatedButton(
-          style: ElevatedButton.styleFrom(backgroundColor: Colors.greenAccent, foregroundColor: Colors.black, visualDensity: VisualDensity.compact),
-          onPressed: () => _connectToNode(node),
-          child: const Text("LINK", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildEmptyScanner() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const SizedBox(width: 40, height: 40, child: CircularProgressIndicator(strokeWidth: 1, color: Colors.white10)),
-          const SizedBox(height: 20),
-          Text("MONITORING AIRWAVES...", style: GoogleFonts.robotoMono(color: Colors.white24, fontSize: 12)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildControlPanel(MeshService meshService) {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      color: const Color(0xFF0D0D0D),
-      child: Column(
-        children: [
-          _buildToggleRow(
-            label: "THE CHAIN (MESH NETWORK)",
-            value: meshService.isMeshEnabled,
-            onChanged: (v) => meshService.toggleMesh(v),
-            color: Colors.greenAccent,
-          ),
-          const SizedBox(height: 10),
-          _buildToggleRow(
-            label: "ADAPTIVE POWER (BATTERY SAVER)",
-            value: meshService.isPowerSaving,
-            onChanged: (v) => meshService.togglePowerSaving(v),
-            color: Colors.orangeAccent,
-          ),
-          const SizedBox(height: 20),
-
-          Opacity(
-            opacity: meshService.isMeshEnabled ? 1.0 : 0.3,
-            child: AbsorbPointer(
-              absorbing: !meshService.isMeshEnabled,
-              child: _buildManualButtons(meshService),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildManualButtons(MeshService meshService) {
+  Widget _buildStat(String label, String value, Color color) {
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            _buildProtocolButton(
-                icon: Icons.cloud_outlined,
-                label: "CLOUD",
-                color: Colors.greenAccent,
-                onTap: () => _openScanner(SignalType.cloud)
-            ),
-            const SizedBox(width: 12),
-            _buildProtocolButton(
-                icon: Icons.wifi_tethering,
-                label: "MESH",
-                color: Colors.cyanAccent,
-                onTap: () => _openScanner(SignalType.mesh)
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            _buildProtocolButton(
-                icon: Icons.bluetooth_searching,
-                label: "BT",
-                color: Colors.blueAccent,
-                onTap: () => _openScanner(SignalType.bluetooth)
-            ),
-            const SizedBox(width: 12),
-            // КНОПКА SONAR
-            Expanded(
-              child: InkWell(
-                onTap: () async {
-                  try {
-                    await UltrasonicService().transmit("PING_NODE");
-                    meshService.addLog("🔊 SONAR: Acoustic pulse emitted.");
-                  } catch (e) {
-                    meshService.addLog("❌ SONAR ERROR: $e");
-                  }
-                },
-                borderRadius: BorderRadius.circular(10),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  decoration: BoxDecoration(
-                    color: Colors.purpleAccent.withOpacity(0.05),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: Colors.purpleAccent.withOpacity(0.2)),
-                  ),
-                  child: Column(
-                    children: [
-                      const Icon(Icons.record_voice_over, color: Colors.purpleAccent, size: 20),
-                      const SizedBox(height: 4),
-                      Text("SONAR",
-                          style: TextStyle(fontFamily: 'Orbitron',color: Colors.purpleAccent, fontSize: 9, fontWeight: FontWeight.bold)),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        _buildHaltButton(meshService),
+        Text(label, style: GoogleFonts.russoOne(fontSize: 8, color: AppColors.textDim)),
+        Text(value, style: GoogleFonts.robotoMono(fontSize: 12, color: color, fontWeight: FontWeight.bold)),
       ],
     );
   }
 
-  Widget _buildProtocolButton({
-    required IconData icon,
-    required String label,
-    required Color color,
-    required VoidCallback onTap
-  }) {
-    return Expanded(
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(10),
+  Widget _buildRadarDisplay(int count) {
+    return Container(
+      height: 180,
+      decoration: BoxDecoration(
+          color: AppColors.surface,
+          shape: BoxShape.circle,
+          border: Border.all(color: AppColors.white05)
+      ),
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          _buildRadarAnimation(),
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.radar, color: AppColors.gridCyan, size: 30),
+              const SizedBox(height: 10),
+              Text(count > 0 ? "SCANNING: $count NODES" : "SCANNING SECTOR",
+                  style: GoogleFonts.russoOne(fontSize: 10, color: AppColors.gridCyan)),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmergencyButton() {
+    return FadeInUp(
+      child: GestureDetector(
+        onLongPress: _executeEmergencySOS,
+        onTap: () {
+          HapticFeedback.lightImpact();
+          _logAction("Interaction: Brief tap on SOS. Holding required.");
+        },
         child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 16),
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 25),
           decoration: BoxDecoration(
-            color: color.withOpacity(0.05),
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: color.withOpacity(0.2)),
+              color: AppColors.warningRed.withOpacity(0.05),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: AppColors.warningRed.withOpacity(0.5), width: 1),
+              boxShadow: [BoxShadow(color: AppColors.warningRed.withOpacity(0.1), blurRadius: 20)]
           ),
           child: Column(
             children: [
-              Icon(icon, color: color, size: 20),
-              const SizedBox(height: 4),
-              Text(label,
-                  style: TextStyle(fontFamily: 'Orbitron',color: color, fontSize: 9, fontWeight: FontWeight.bold)),
+              Pulse(infinite: true, child: const Icon(Icons.warning_amber_rounded, color: AppColors.warningRed, size: 32)),
+              const SizedBox(height: 10),
+              Text("HOLD FOR EMERGENCY SOS", style: GoogleFonts.russoOne(color: AppColors.warningRed, fontSize: 14, letterSpacing: 1)),
+              const SizedBox(height: 5),
+              Text("DISPATCHES SIGNAL TO ALL NEARBY NODES", style: TextStyle(color: AppColors.textDim, fontSize: 8)),
             ],
           ),
         ),
@@ -403,38 +209,114 @@ class _MeshControlScreenState extends State<MeshControlScreen> {
     );
   }
 
-  Widget _buildToggleRow({required String label, required bool value, required ValueChanged<bool> onChanged, required Color color}) {
+  Widget _buildTacticalGrid(MeshService mesh) {
     return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Text(label, style: GoogleFonts.russoOne(color: Colors.white70, fontSize: 10)),
-        Switch(value: value, onChanged: onChanged, activeColor: color, activeTrackColor: color.withOpacity(0.3)),
+        _buildActionTile(
+            icon: Icons.record_voice_over,
+            label: "FLARE",
+            sub: "Sonar Pulse",
+            color: AppColors.sonarPurple,
+            onTap: () async {
+              _logAction("Acoustic flare command sent.");
+              await locator<UltrasonicService>().transmitFrame("LNK:${mesh.apiService.currentUserId}");
+            }
+        ),
+        const SizedBox(width: 15),
+        _buildActionTile(
+            icon: Icons.security,
+            label: "STEALTH",
+            sub: mesh.isPowerSaving ? "Masked" : "Active",
+            color: AppColors.stealthOrange,
+            onTap: () {
+              mesh.togglePowerSaving(!mesh.isPowerSaving);
+              _logAction("Stealth state changed to: ${!mesh.isPowerSaving}");
+            }
+        ),
       ],
     );
   }
 
-  Widget _buildHaltButton(MeshService meshService) {
-    return InkWell(
-      onTap: () => meshService.stopAll(),
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(vertical: 16),
-        decoration: BoxDecoration(
-          color: Colors.redAccent.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.redAccent.withOpacity(0.3)),
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.stop_circle, color: Colors.redAccent, size: 20),
-            const SizedBox(width: 10),
-            Text("EMERGENCY HALT: KILL ALL SIGNALS",
-                style: TextStyle(fontFamily: 'Orbitron',color: Colors.redAccent, fontSize: 10, fontWeight: FontWeight.bold)),
-          ],
+  Widget _buildActionTile({required IconData icon, required String label, required String sub, required Color color, required VoidCallback onTap}) {
+    return Expanded(
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(15),
+        child: Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+              color: AppColors.surface,
+              borderRadius: BorderRadius.circular(15),
+              border: Border.all(color: AppColors.white05)
+          ),
+          child: Column(
+            children: [
+              Icon(icon, color: color, size: 24),
+              const SizedBox(height: 10),
+              Text(label, style: GoogleFonts.russoOne(color: Colors.white, fontSize: 12)),
+              Text(sub, style: TextStyle(color: color, fontSize: 8, fontWeight: FontWeight.bold)),
+            ],
+          ),
         ),
       ),
+    );
+  }
+
+  Widget _buildAlliesList(List<SignalNode> nodes) {
+    if (nodes.isEmpty) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text("DETECTION LOG", style: GoogleFonts.russoOne(color: AppColors.textDim, fontSize: 8)),
+        const SizedBox(height: 10),
+        ...nodes.map((n) => ListTile(
+          dense: true,
+          leading: Icon(Icons.hub, color: AppColors.gridCyan, size: 16),
+          title: Text(n.name, style: const TextStyle(color: Colors.white, fontSize: 12)),
+          trailing: Text("LINKED", style: TextStyle(color: AppColors.gridCyan, fontSize: 8)),
+        )),
+      ],
+    );
+  }
+
+  Widget _buildFooterActions(MeshService mesh) {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      child: OutlinedButton.icon(
+        style: OutlinedButton.styleFrom(
+            side: BorderSide(color: AppColors.warningRed.withOpacity(0.5)),
+            minimumSize: const Size(double.infinity, 50),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))
+        ),
+        icon: const Icon(Icons.power_settings_new, color: AppColors.warningRed, size: 18),
+        label: Text("HALT ALL SIGNALS", style: GoogleFonts.orbitron(color: AppColors.warningRed, fontSize: 10)),
+        onPressed: () {
+          _logAction("EMERGENCY SHUTDOWN INITIATED.");
+          mesh.stopAll();
+        },
+      ),
+    );
+  }
+
+  Widget _buildRadarAnimation() {
+    return AnimatedBuilder(
+      animation: _radarController,
+      builder: (context, child) {
+        return Stack(
+          alignment: Alignment.center,
+          children: List.generate(2, (index) {
+            double value = (_radarController.value + index / 2) % 1;
+            return Container(
+              width: 200 * value,
+              height: 200 * value,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                border: Border.all(color: AppColors.gridCyan.withOpacity(1 - value), width: 1),
+              ),
+            );
+          }),
+        );
+      },
     );
   }
 }

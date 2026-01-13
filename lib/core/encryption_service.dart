@@ -7,16 +7,31 @@ class EncryptionService {
 
   // Генерируем уникальный ключ для конкретного чата
   Future<SecretKey> getChatKey(String chatId) async {
-    // 🔥 УНИФИКАЦИЯ: Всегда используем один сид для Глобального маяка
-    final String derivationId = (chatId == "GLOBAL" || chatId == "THE_BEACON_GLOBAL")
-        ? "THE_BEACON_GLOBAL"
-        : chatId;
+    const String systemSeed = "memento_mori_v1_tactical_seed_2024";
+    String derivationId = chatId;
 
-    final systemSeed = "memento_mori_v1_tactical_seed_2024";
-    final bytes = utf8.encode(systemSeed + derivationId);
-    final hash = await Sha256().hash(bytes);
-    return SecretKey(hash.bytes);
+    if (chatId == "GLOBAL" || chatId == "THE_BEACON_GLOBAL") {
+      derivationId = "THE_BEACON_GLOBAL";
+    } else if (chatId.startsWith("GHOST_")) {
+      derivationId = "TACTICAL_MESH_LINK_V1";
+    }
+
+    // Вместо простого Sha256, мы используем итеративное хеширование.
+    // Это стандарт для защиты Master Key.
+    final pbkdf2 = Pbkdf2(
+      macAlgorithm: Hmac.sha256(),
+      iterations: 1000, // Количество итераций для "растягивания" ключа
+      bits: 256,
+    );
+
+    final secretKey = await pbkdf2.deriveKey(
+      secretKey: SecretKey(utf8.encode(systemSeed)),
+      nonce: utf8.encode(derivationId), // Используем ID чата как соль (salt)
+    );
+
+    return secretKey;
   }
+
 
   // Метод для системных ключей
   Future<SecretKey> getSystemKey() async {
@@ -27,10 +42,14 @@ class EncryptionService {
 
   // Шифрование данных
   Future<String> encrypt(String text, SecretKey key) async {
+    // В пакете 'cryptography' метод encrypt по умолчанию генерирует
+    // случайный 96-битный Nonce (IV) для каждого вызова. Это ПРАВИЛЬНО.
     final secretBox = await _algorithm.encrypt(
       utf8.encode(text),
       secretKey: key,
     );
+
+    // Результат base64 содержит [Nonce (12b) | Ciphertext | Tag (16b)]
     return base64.encode(secretBox.concatenation());
   }
 
@@ -61,29 +80,36 @@ class EncryptionService {
     required String recipientId,
     required String senderId,
   }) async {
-    final sessionKey = await getSystemKey(); // Общий ключ сети
+    final sessionKey = await getSystemKey();
+
+    // Добавляем 'padding' (случайный шум), чтобы все пакеты имели разную длину.
+    // Это сбивает с толку системы DPI (Deep Packet Inspection).
+    final int paddingLength = 16 + (DateTime.now().millisecond % 32);
+    final String padding = base64.encode(Uint8List(paddingLength));
 
     final innerData = jsonEncode({
       'msg': payload,
       'sid': senderId,
       'rid': recipientId,
       'ts': DateTime.now().millisecondsSinceEpoch,
+      'rnd': padding, // Шум
     });
 
-    // Шифруем тело
     final encryptedBody = await encrypt(innerData, sessionKey);
 
-    // Вычисляем хеш для проверки целостности через Sha256 из пакета cryptography
+    // Хеш для Gossip-дедупликации (тот самый 'h' для MeshService)
     final hashInstance = Sha256();
     final hashValue = await hashInstance.hash(utf8.encode(encryptedBody));
-    final shortHash = base64.encode(hashValue.bytes).substring(0, 8);
+    final shortHash = base64.encode(hashValue.bytes).substring(0, 12);
 
     return jsonEncode({
-      'type': 'GOSSIP_PULSE',
+      'type': 'OFFLINE_MSG', // Используем системный тип
       'data': encryptedBody,
       'h': shortHash,
+      'ttl': 5,
     });
   }
+
 
   // Расшифровка данных
   Future<String> decrypt(String cipherText, SecretKey key) async {

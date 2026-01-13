@@ -10,6 +10,7 @@ import 'package:provider/provider.dart';
 import 'package:wakelock_plus/wakelock_plus.dart'; // 🔥 Добавлено
 
 import 'core/background_service.dart';
+import 'core/gossip_manager.dart';
 import 'core/locator.dart';
 import 'core/mesh_service.dart';
 import 'core/websocket_service.dart';
@@ -38,6 +39,15 @@ void main() async {
   try {
     HttpOverrides.global = MyHttpOverrides();
     ApiService.init();
+
+    // 🔥 КРИТИЧЕСКАЯ ДОБАВКА:
+    // После инициализации всех систем, запускаем цикл активного Gossip
+    // Это заставит телефон искать соседей и подкидывать им данные из Outbox
+    final gossip = locator<GossipManager>();
+    gossip.startEpidemicCycle();
+
+    print("🦠 [System] Gossip Epidemic Cycle: ACTIVE");
+
   } catch (e, stack) {
     initialError = e;
     initialStack = stack;

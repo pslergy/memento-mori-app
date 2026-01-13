@@ -4,11 +4,14 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:memento_mori_app/core/storage_service.dart';
 
 
+import 'encryption_service.dart';
+import 'exceptions.dart';
 import 'local_db_service.dart';
 import 'locator.dart';
 import 'mesh_service.dart';
@@ -25,6 +28,7 @@ class ApiService {
   );
   static const String _torProxy = "SOCKS5 127.0.0.1:9050";
   bool _useTor = false;
+  bool _isSyncing = false;
   static String? _memoizedToken;
   static String? _cachedUserId;
   String get currentUserId => _cachedUserId ?? "";
@@ -295,34 +299,177 @@ class ApiService {
     };
   }
   Future<void> syncOutbox() async {
-    final db = LocalDatabaseService();
-    final pendingMessages = await db.getPendingFromOutbox();
 
-    if (pendingMessages.isEmpty) return;
+    if (isGhostMode) {
+      _log("👤 System in Stealth mode. Sync deferred until legalization.");
+      return;
+    }
+    // 1. Защита от дублей: если синхронизация уже идет — выходим
+    if (_isSyncing) {
+      _log("⏳ Sync already in progress. Skipping cycle.");
+      return;
+    }
 
-    print("🔄 [Bridge] Found ${pendingMessages.length} pending signals. Synchronizing...");
+    _isSyncing = true;
 
-    for (var raw in pendingMessages) {
-      try {
-        final String chatId = raw['chatRoomId'];
+    try {
+      final db = LocalDatabaseService();
+      final pending = await db.getPendingFromOutbox();
 
-        // Шлем на сервер через стандартный метод
-        await _sendDirectHttp('POST', '/chats/$chatId/messages', {
-          'content': raw['content'],
-          'isEncrypted': raw['isEncrypted'] == 1,
-          'clientTempId': raw['id'], // Используем ID из оффлайна для дедупликации на сервере
-        });
+      if (pending.isEmpty) return;
 
-        // Если сервер принял - удаляем из очереди
-        await db.removeFromOutbox(raw['id']);
-        print("✅ [Bridge] Signal ${raw['id'].substring(0,8)} relayed to Cloud.");
+      _log("🔄 [BRIDGE-PROTOCOL] Syncing ${pending.length} encrypted signals...");
 
-      } catch (e) {
-        print("⚠️ [Bridge] Relay failed for ${raw['id']}: $e");
-        break; // Останавливаем, если сеть снова пропала
+      // Кэшируем токен один раз на весь цикл синхронизации
+      final String? token = await Vault.read('auth_token');
+      if (token == null) return;
+
+      for (var msg in pending) {
+        try {
+          final String chatId = msg['chatRoomId'];
+
+          // Отправка
+          await _sendDirectHttp('POST', '/chats/$chatId/messages', {
+            'content': msg['content'],
+            'isEncrypted': msg['isEncrypted'] == 1,
+            'clientTempId': msg['id'],
+          });
+
+          // СРАЗУ удаляем после успеха
+          await db.removeFromOutbox(msg['id']);
+          _log("✅ [RELAY-SUCCESS] Signal ${msg['id']} delivered.");
+
+        } catch (e) {
+          _log("❌ [RELAY-ERROR] Message ${msg['id']} failed: $e");
+          // Если сервер вернул 409 (Conflict/Already exists), тоже удаляем из Outbox
+          if (e.toString().contains("409")) await db.removeFromOutbox(msg['id']);
+          break;
+        }
       }
+    } finally {
+      _isSyncing = false; // Разблокировка
     }
   }
+
+  Future<void> legalizeGhostIdentity(String newUsername) async {
+    final pass = await Vault.read('landing_pass');
+    final ghostId = await Vault.read('user_id');
+    final email = await Vault.read('user_email');
+
+    try {
+      final res = await _sendDirectHttp('POST', '/auth/legalize', {
+        'ghostId': ghostId,
+        'email': email,
+        'pass': pass,
+        'desiredUsername': newUsername, // Юзер может предложить новое имя
+      });
+
+      if (res != null && res['token'] != null) {
+        // Успех: Мы теперь официальный гражданин Облака
+        await Vault.write('auth_token', res['token']);
+        await Vault.write('user_name', res['username']);
+        await Vault.write('auth_mode', 'verified');
+        _memoizedToken = res['token'];
+      }
+    } catch (e) {
+      if (e.toString().contains("409")) {
+        // 🔥 КРИТИЧЕСКИЙ КЕЙС: Ник занят!
+        _log("⚠️ Legalization failed: Nickname already taken.");
+        throw NicknameTakenException(); // Выбрасываем спец-ошибку для UI
+      }
+      rethrow;
+    }
+  }
+
+  /// Глобальная регистрация в Облаке
+  Future<Map<String, dynamic>> register({
+    required String username,
+    required String email,
+    required String password,
+    required DateTime birthDate,
+  }) async {
+    final response = await _sendDirectHttp('POST', '/auth/register', {
+      'username': username,
+      'email': email,
+      'password': password,
+      'dateOfBirth': birthDate.toIso8601String(),
+      'countryCode': 'RU', // Можно определять динамически
+      'gender': 'MALE',    // Можно добавить в UI позже
+    });
+
+    if (response != null && response['token'] != null) {
+      final user = response['user'];
+      _memoizedToken = response['token'];
+      _cachedUserId = user['id'].toString();
+
+      // Сохраняем "Бронь" в Vault
+      await Vault.write('auth_token', _memoizedToken);
+      await Vault.write('user_id', _cachedUserId);
+      await Vault.write('user_name', user['username']);
+      await Vault.write('user_deathDate', user['deathDate']);
+      await Vault.write('user_birthDate', user['dateOfBirth']);
+
+      return response; // Возвращаем Map, чтобы UI достал recoveryPhrase
+    } else {
+      throw Exception("Registration failed: Invalid response from server");
+    }
+  }
+
+  // 🔥 СРАЗУ ДОБАВИМ И МЕТОД ПРОВЕРКИ НИКА, чтобы убрать вторую ошибку в UI
+  Future<bool> checkUsernameAvailable(String username) async {
+    try {
+      final res = await _sendDirectHttp('GET', '/users/check-username?username=$username', null);
+      return res['available'] ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+  Future<void> sendAonymizedSOS() async {
+    Position pos = await Geolocator.getCurrentPosition();
+
+    // Огрубляем до 1 км
+    double lat = double.parse(pos.latitude.toStringAsFixed(2));
+    double lon = double.parse(pos.longitude.toStringAsFixed(2));
+    String sectorId = "S_${lat.toString().replaceAll('.', '')}_${lon.toString().replaceAll('.', '')}";
+
+    final sosPayload = {
+      "type": "SOS_SIGNAL",
+      "sectorId": sectorId, // Сервер видит только это!
+      "timestamp": DateTime.now().millisecondsSinceEpoch,
+    };
+
+    // Шлем через наш роутер (Cloud + Mesh)
+    _makeRequest(method: 'POST', endpoint: '/emergency/signal', body: sosPayload);
+  }
+
+  Future<void> initGhostMode(String username, String email) async {
+    final encryption = locator<EncryptionService>();
+
+    // 1. Генерируем "Призрака"
+    final identity = await encryption.generateGhostIdentity(username);
+    final String ghostId = identity['userId']!;
+
+    // 2. Создаем посадочный талон (хеш, который знает только юзер и сервер в будущем)
+    final String landingPass = await encryption.generateLandingPass(email, ghostId);
+
+    // 3. Бронируем данные в Vault
+    await Vault.write('user_id', ghostId);
+    await Vault.write('user_name', username);
+    await Vault.write('user_email', email);
+    await Vault.write('landing_pass', landingPass);
+    await Vault.write('auth_token', 'GHOST_MODE_ACTIVE');
+
+    // 4. Считаем даты для Memento Mori (Memento Mori оффлайн-старт)
+    final deathDate = DateTime.now().add(const Duration(days: 365 * 75)).toIso8601String();
+    await Vault.write('user_deathDate', deathDate);
+    await Vault.write('user_birthDate', DateTime(2000, 1, 1).toIso8601String());
+
+    _memoizedToken = 'GHOST_MODE_ACTIVE';
+    _cachedUserId = ghostId;
+  }
+
+
+
 
   Future<void> syncGhostIdentity() async {
     final String? token = await Vault.read('auth_token');
@@ -352,29 +499,60 @@ class ApiService {
     print("📡 [API-Service] $msg");
   }
 
-  Future<void> legalizeIdentity() async {
-    final pass = await Vault.read('landing_pass');
+  /// ПРОТОКОЛ ЛЕГАЛИЗАЦИИ (LANDING PASS)
+  /// Переводит оффлайн-личность (GHOST) в статус верифицированного аккаунта.
+  /// Реализует атомарный переход с сохранением истории сообщений.
+  Future<void> legalizeIdentity(String desiredUsername, String password) async {
+    // 1. Извлекаем тактические данные из Vault
     final ghostId = await Vault.read('user_id');
     final email = await Vault.read('user_email');
+    final pass = await Vault.read('landing_pass');
 
-    if (pass == null || ghostId == null) return;
-
-    _log("🧬 [Legalization] Sending Landing Pass for $ghostId...");
+    _log("🧬 Initiating Identity Legalization for Nomad: $ghostId");
 
     try {
+      // 2. Отправляем "Посадочный талон" на сервер
       final res = await _sendDirectHttp('POST', '/auth/legalize', {
         'ghostId': ghostId,
         'email': email,
-        'pass': pass,
+        'pass': pass, // Крипто-хеш оффлайн сессии
+        'desiredUsername': desiredUsername,
+        'password': password,
       });
 
-      if (res != null && res['status'] == 'verified') {
-        _log("✅ Identity Legalized. Token upgraded.");
+      if (res != null && res['token'] != null) {
+        // 3. ОБНОВЛЕНИЕ ПРАВ ДОСТУПА
+        // Сохраняем официальный JWT токен вместо GHOST_MODE_ACTIVE
         await Vault.write('auth_token', res['token']);
-        await Vault.write('auth_mode', 'citizen'); // Мы больше не призраки
+
+        // Обновляем имя (если оно было изменено сервером при конфликте)
+        final String verifiedName = res['username'] ?? desiredUsername;
+        await Vault.write('user_name', verifiedName);
+
+        // Сбрасываем кэш токена в памяти сервиса
+        _memoizedToken = res['token'];
+
+        _log("✅ Identity Secured. Transitioning to Cloud Synchronized state.");
+
+        // 4. СИНХРОНИЗАЦИЯ ОЧЕРЕДИ
+        // Как только мы получили права, выгружаем все накопленные в лесу сообщения
+        unawaited(syncOutbox());
       }
     } catch (e) {
-      _log("⚠️ Legalization failed: $e");
+      // 5. ОБРАБОТКА ТАКТИЧЕСКИХ ОШИБОК
+      final String err = e.toString();
+
+      if (err.contains("409")) {
+        _log("⚠️ Conflict: Callsign already taken.");
+        throw NicknameTakenException();
+      }
+      if (err.contains("401")) {
+        _log("🚫 Auth Failed: Invalid password for existing account.");
+        throw Exception("Invalid credentials for this email.");
+      }
+
+      _log("❌ Legalization Fault: $e");
+      rethrow;
     }
   }
 
@@ -499,19 +677,29 @@ class ApiService {
     }
   }
 
-  Future<void> createOfflineIdentity(String username) async {
-    final ghostId = "GHOST_${DateTime.now().millisecondsSinceEpoch.toString().substring(8)}";
+  // В ApiService.dart
 
-    await Vault.write( 'user_id',  ghostId);
-    await Vault.write( 'user_name',  username);
-    await Vault.write( 'auth_mode',  'offline');
-    // Пишем фейковый токен, чтобы AuthGate не ругался на его отсутствие
-    await Vault.write( 'auth_token',  'offline_stealth_token');
+  Future<void> createOfflineIdentity(String username, String email) async {
+    final encryption = locator<EncryptionService>();
+
+    // 1. Генерируем ключи личности
+    final identity = await encryption.generateGhostIdentity(username);
+    final String ghostId = identity['userId']!;
+
+    // 2. Генерируем "Посадочный талон" для будущей легализации
+    final String landingPass = await encryption.generateLandingPass(email, ghostId);
+
+    // 3. Сохраняем всё в Vault (бронированное хранилище)
+    await Vault.write('user_id', ghostId);
+    await Vault.write('user_name', username);
+    await Vault.write('user_email', email);
+    await Vault.write('landing_pass', landingPass);
+    await Vault.write('auth_token', 'GHOST_MODE_ACTIVE'); // Метка для системы
 
     _cachedUserId = ghostId;
-    _memoizedToken = 'offline_stealth_token';
+    _memoizedToken = 'GHOST_MODE_ACTIVE';
 
-    print("🛡️ [Auth] Offline Identity Created: $ghostId");
+    _log("👤 Ghost identity created locally. Status: STEALTH.");
   }
 
   /// СПИСОК ЧАТОВ

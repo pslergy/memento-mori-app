@@ -23,8 +23,18 @@ class LocalDatabaseService {
     final path = join(dbPath, 'memento_mori_v2.db');
 
     return await openDatabase(
-      path,
-      version: 2,
+        path,
+        version: 3, // БАМП ВЕРСИИ!
+        onUpgrade: (db, oldVersion, newVersion) async {
+          if (oldVersion < 3) {
+            await db.execute('''
+        CREATE TABLE seen_pulses(
+          id TEXT PRIMARY KEY, 
+          seenAt INTEGER
+        )
+      ''');
+          }
+        },
       onConfigure: (db) async {
         try {
           await db.rawQuery('PRAGMA journal_mode = WAL');
@@ -35,33 +45,35 @@ class LocalDatabaseService {
         }
       },
       onOpen: (db) async {
-        print("🚀 [DB] Global Handshake: Sanitizing offline IDs and Stats...");
+        print("🚀 [DB] Global Handshake: Validating tables and IDs...");
         try {
-          // 1. САМОЛЕЧЕНИЕ: Таблица статистики
+          // 1. Создаем таблицу статистики
           await db.execute('''
             CREATE TABLE IF NOT EXISTS system_stats(
               key TEXT PRIMARY KEY,
               value INTEGER
             )
           ''');
+
+          // 2. Инициализируем карму
           await db.rawInsert('INSERT OR IGNORE INTO system_stats(key, value) VALUES("karma", 0)');
 
-          // 2. ВЕЧНЫЙ МАЯК: Гарантируем наличие глобальной частоты
+          // 3. Создаем глобальный маяк
           await db.insert('chat_rooms', {
             'id': 'THE_BEACON_GLOBAL',
-            'name': 'THE BEACON (Global SOS)',
+            'name': 'THE BEACON',
             'type': 'GLOBAL',
-            'lastMessage': 'Protocol Active. Listening for pulses...',
+            'lastMessage': 'Protocol Active',
             'lastActivity': DateTime.now().toIso8601String()
           }, conflictAlgorithm: ConflictAlgorithm.ignore);
 
-          // 3. ТАКТИЧЕСКИЙ РЕМАППИНГ: GLOBAL -> THE_BEACON_GLOBAL
+          // 4. Ремаппинг ID
           await db.execute("UPDATE messages SET chatRoomId = 'THE_BEACON_GLOBAL' WHERE chatRoomId = 'GLOBAL'");
           await db.execute("UPDATE outbox SET chatRoomId = 'THE_BEACON_GLOBAL' WHERE chatRoomId = 'GLOBAL'");
 
-          print("✅ [DB] THE_BEACON_GLOBAL synchronized. Legacy tags migrated.");
+          print("✅ [DB] Handshake complete. Grid is ready.");
         } catch (e) {
-          print("⚠️ [DB] Post-open sanity check failed: $e");
+          print("⚠️ [DB] Post-open logic failed: $e");
         }
       },
       onCreate: (db, version) async {
@@ -82,6 +94,26 @@ class LocalDatabaseService {
               isEncrypted INTEGER DEFAULT 0
             )
           ''');
+
+          await txn.execute('''
+            CREATE TABLE friends(
+              id TEXT PRIMARY KEY,
+              username TEXT,
+              publicKey TEXT,
+              isVerified INTEGER DEFAULT 0,
+              lastSeen INTEGER,
+              avatarUrl TEXT
+            )
+          ''');
+
+          // Добавь в onCreate транзакцию:
+          await txn.execute('''
+            CREATE TABLE seen_pulses(
+              id TEXT PRIMARY KEY, 
+              seenAt INTEGER
+            )
+          ''');
+          await txn.execute('CREATE INDEX idx_pulses_time ON seen_pulses(seenAt)');
 
           await txn.execute('CREATE INDEX idx_messages_chatroom ON messages(chatRoomId)');
           await txn.execute('CREATE INDEX idx_messages_temp_id ON messages(clientTempId)');
@@ -171,6 +203,55 @@ class LocalDatabaseService {
         createdAt: DateTime.parse(maps[i]['createdAt']),
         status: maps[i]['status'] ?? 'SENT',
       );
+    });
+  }
+
+  /// Проверка: видели ли мы этот пакет (защита от циклов в Mesh)
+  Future<bool> isPacketSeen(String packetId) async {
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query(
+      'seen_pulses',
+      where: 'id = ?',
+      whereArgs: [packetId],
+    );
+    if (maps.isNotEmpty) return true;
+
+    // Если не видели — записываем
+    await db.insert('seen_pulses', {
+      'id': packetId,
+      'seenAt': DateTime.now().millisecondsSinceEpoch,
+    }, conflictAlgorithm: ConflictAlgorithm.ignore);
+    return false;
+  }
+
+  /// ПАГИНАЦИЯ: Критично для Senior уровня
+  Future<List<ChatMessage>> getMessagesPaged(String chatId, int limit, int offset) async {
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query(
+      'messages',
+      where: 'chatRoomId = ?',
+      whereArgs: [chatId],
+      orderBy: 'createdAt DESC', // Сначала новые
+      limit: limit,
+      offset: offset,
+    );
+    return maps.map((m) => ChatMessage.fromJson(m)).toList().reversed.toList();
+  }
+
+  /// АВТО-ОЧИСТКА (Maintenance)
+  /// Вызывать при старте приложения
+  Future<void> runMaintenance() async {
+    final db = await database;
+    final oneWeekAgo = DateTime.now().subtract(const Duration(days: 7)).millisecondsSinceEpoch;
+
+    await db.transaction((txn) async {
+      // 1. Удаляем старые записи о виденных пакетах (чтобы таблица не росла вечно)
+      await txn.delete('seen_pulses', where: 'seenAt < ?', whereArgs: [oneWeekAgo]);
+
+      // 2. Удаляем старую рекламу
+      await txn.delete('ads', where: 'expiresAt < ?', whereArgs: [DateTime.now().toIso8601String()]);
+
+      print("🧹 [DB] Maintenance: Old pulses and expired ads purged.");
     });
   }
 
