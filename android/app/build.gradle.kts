@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.example.memento_mori_app"
-    compileSdk = 35
+    compileSdk = 34
 
     sourceSets {
         getByName("main").java.srcDirs("src/main/kotlin")
@@ -14,7 +14,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.memento_mori_app"
-        minSdk = 24
+        minSdk = flutter.minSdkVersion
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"

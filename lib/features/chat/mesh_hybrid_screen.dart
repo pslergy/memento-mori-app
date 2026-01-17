@@ -16,6 +16,8 @@ import 'package:memento_mori_app/core/api_service.dart';
 import 'package:memento_mori_app/ghost_input/ghost_controller.dart';
 import 'package:memento_mori_app/ghost_input/ghost_keyboard.dart';
 
+import '../theme/app_colors.dart';
+
 class MeshHybridScreen extends StatefulWidget {
   const MeshHybridScreen({super.key});
 
@@ -116,27 +118,26 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
 
     return Scaffold(
       backgroundColor: Colors.black,
-      body: SafeArea(
-        child: Column(
-          children: [
-            _buildTopHUD(isLinked),
-            Expanded(
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  if (_isScanning) _buildRadarAnimation(),
-                  _buildMainContent(mesh),
-                ],
+      body: SafeArea( // 🛡️ Защита от вырезов камеры
+        child: SingleChildScrollView( // 🔥 Защита от переполнения (Overflow)
+          child: Column(
+            children: [
+              _buildTopHUD(isLinked),
+              const SizedBox(height: 20),
+              // Оборачиваем радар и список в контейнер с фиксированной высотой или Flexible
+              SizedBox(
+                height: MediaQuery.of(context).size.height * 0.7, // 70% экрана под радар и список
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    if (_isScanning) _buildRadarAnimation(),
+                    _buildMainContent(mesh),
+                  ],
+                ),
               ),
-            ),
-            _buildBottomControls(),
-            if (_isKeyboardVisible)
-              GhostKeyboard(controller: _ghostController, onSend: () {
-                _meshService.sendAuto(content: _ghostController.value, receiverName: "Broadcast", chatId: "THE_BEACON_GLOBAL");
-                _ghostController.clear();
-                setState(() => _isKeyboardVisible = false);
-              }),
-          ],
+              _buildBottomControls(),
+            ],
+          ),
         ),
       ),
     );
@@ -216,23 +217,33 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
 
   Widget _buildActionCenter() {
     return Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
+        if (_isAcousticTransmitting)
+          FadeIn(child: Text("⚡ EMITTING SONAR FLARE", style: GoogleFonts.russoOne(color: AppColors.sonarPurple, fontSize: 10))),
+        const SizedBox(height: 10),
         GestureDetector(
           onTap: _isScanning ? null : _startGlobalDiscovery,
           child: Container(
-            width: 80, height: 80,
+            width: 90, height: 90,
             decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: _isScanning ? Colors.white10 : Colors.cyanAccent.withOpacity(0.1),
-                border: Border.all(color: _isScanning ? Colors.white24 : Colors.cyanAccent, width: 2),
-                boxShadow: [if (!_isScanning) BoxShadow(color: Colors.cyanAccent.withOpacity(0.2), blurRadius: 20)]
+                color: _isScanning ? AppColors.gridCyan.withOpacity(0.05) : AppColors.surface,
+                border: Border.all(color: _isScanning ? AppColors.gridCyan : AppColors.textDim, width: 2),
+                boxShadow: [
+                  if (_isScanning) BoxShadow(color: AppColors.gridCyan.withOpacity(0.2), blurRadius: 30, spreadRadius: 10)
+                ]
             ),
-            child: Icon(_isScanning ? Icons.sync : Icons.radar, color: Colors.cyanAccent, size: 30),
+            child: Icon(
+                _isScanning ? Icons.sync : Icons.radar,
+                color: _isScanning ? AppColors.gridCyan : AppColors.textDim,
+                size: 35
+            ),
           ),
         ),
         const SizedBox(height: 15),
-        Text(_isScanning ? "SCANNING SECTOR..." : "TAP TO SCAN",
-            style: GoogleFonts.russoOne(color: Colors.cyanAccent, fontSize: 10, letterSpacing: 2)),
+        Text(_isScanning ? "LISTENING FOR SIGNALS..." : "INITIALIZE SCAN",
+            style: GoogleFonts.russoOne(color: _isScanning ? AppColors.gridCyan : AppColors.textDim, fontSize: 10, letterSpacing: 2)),
       ],
     );
   }
@@ -320,25 +331,44 @@ class _AllyCard extends StatelessWidget {
     bool isBT = node.type == SignalType.bluetooth;
     return FadeInRight(
       child: Container(
-        width: 100,
+        width: 110, // Чуть увеличили ширину
         margin: const EdgeInsets.only(right: 15),
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(10),
         decoration: BoxDecoration(
-            color: const Color(0xFF111111),
+            color: AppColors.cardBackground,
             borderRadius: BorderRadius.circular(15),
-            border: Border.all(color: Colors.white.withOpacity(0.05))
+            border: Border.all(color: AppColors.white05)
         ),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min, // 🔥 Фикс: сжимаем колонку
           children: [
-            Icon(isBT ? Icons.bluetooth : Icons.wifi_tethering, color: isBT ? Colors.blueAccent : Colors.cyanAccent, size: 24),
-            const SizedBox(height: 8),
-            Text(node.name, style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis),
-            const SizedBox(height: 4),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.white10, minimumSize: const Size(60, 20), padding: EdgeInsets.zero),
-              onPressed: () => NativeMeshService.connect(node.id),
-              child: const Text("LINK", style: TextStyle(fontSize: 8, color: Colors.white)),
+            Icon(isBT ? Icons.bluetooth : Icons.wifi_tethering,
+                color: isBT ? Colors.blueAccent : AppColors.gridCyan, size: 22),
+            const SizedBox(height: 6),
+            Flexible( // 🔥 Фикс: текст теперь не давит на границы
+              child: Text(
+                node.name,
+                style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
+                overflow: TextOverflow.ellipsis,
+                maxLines: 1,
+              ),
+            ),
+            const SizedBox(height: 6),
+            SizedBox(
+              height: 24, // Жесткая высота для кнопки
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                    backgroundColor: AppColors.gridCyan.withOpacity(0.1),
+                    side: BorderSide(color: AppColors.gridCyan.withOpacity(0.5), width: 0.5),
+                    padding: EdgeInsets.zero
+                ),
+                onPressed: () {
+                  HapticFeedback.lightImpact();
+                  NativeMeshService.connect(node.id);
+                },
+                child: const Text("LINK", style: TextStyle(fontSize: 8, color: AppColors.gridCyan, fontWeight: FontWeight.bold)),
+              ),
             )
           ],
         ),

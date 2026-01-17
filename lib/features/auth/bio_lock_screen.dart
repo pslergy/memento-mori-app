@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:local_auth/local_auth.dart';
-import 'package:local_auth_android/local_auth_android.dart'; // Для красивых текстов на Android
+ // Для красивых текстов на Android
 import 'package:memento_mori_app/core/panic_service.dart';
 import 'package:memento_mori_app/main_screen.dart';
+import 'package:local_auth_android/local_auth_android.dart';
 
 class BioLockScreen extends StatefulWidget {
   final DateTime deathDate;
@@ -30,24 +31,19 @@ class _BioLockScreenState extends State<BioLockScreen> {
 
   Future<void> _authenticate() async {
     try {
-      // 1. Проверяем возможности железа
       final bool canCheckBiometrics = await auth.canCheckBiometrics;
       final bool isDeviceSupported = await auth.isDeviceSupported();
-      final List<BiometricType> availableBiometrics = await auth.getAvailableBiometrics();
 
-      // Если сканера нет или в системе не добавлено ни одного пальца
-      if (!canCheckBiometrics || !isDeviceSupported || availableBiometrics.isEmpty) {
-        print("⚠️ Биометрия недоступна или не настроена. Пропускаем.");
+      if (!canCheckBiometrics || !isDeviceSupported) {
         _onSuccess();
         return;
       }
 
-      // 2. Вызываем системное окно (ИСПРАВЛЕННЫЙ СИНТАКСИС)
       final bool didAuthenticate = await auth.authenticate(
         localizedReason: 'IDENTITY VERIFICATION',
         options: const AuthenticationOptions(
           stickyAuth: true,
-          biometricOnly: true, // Только палец, запрещаем ПИН телефона
+          biometricOnly: true,
           useErrorDialogs: true,
         ),
         authMessages: const [
@@ -65,17 +61,11 @@ class _BioLockScreenState extends State<BioLockScreen> {
         _onFailure();
       }
     } catch (e) {
-      print("❌ [Bio] Critical Error: $e");
-
-      // 🔥 ПРОТОКОЛ ПАНИКА: Если в системе Android был добавлен/удален палец
-      // Библиотека выдаст KeyPermanentlyInvalidatedException.
-      // В этом случае мы стираем данные, так как база отпечатков скомпрометирована.
-      if (e.toString().contains("KeyPermanentlyInvalidatedException") ||
-          e.toString().contains("LockedOut")) {
-        print("☢️ [SECURITY] Biometric database changed or locked. Wiping...");
-        PanicService.killSwitch(context);
+      print("❌ [Bio] Error: $e");
+      if (e.toString().contains("NotAvailable") || e.toString().contains("LockedOut")) {
+        _onSuccess(); // Фолбек для девайсов без биометрии
       } else {
-        _onFailure();
+        PanicService.killSwitch(context);
       }
     }
   }

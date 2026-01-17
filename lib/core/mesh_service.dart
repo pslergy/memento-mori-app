@@ -1,9 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
+import 'package:battery_plus/battery_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:memento_mori_app/core/storage_service.dart';
@@ -16,6 +19,7 @@ import 'package:sensors_plus/sensors_plus.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../features/chat/conversation_screen.dart';
+import 'MeshOrchestrator.dart';
 import 'api_service.dart';
 import 'background_service.dart';
 import 'encryption_service.dart';
@@ -30,6 +34,21 @@ import 'network_monitor.dart';
 import 'websocket_service.dart';
 import 'bluetooth_service.dart';
 
+
+enum MeshState {
+  idle,
+  advertising,
+  scanning,
+  connecting,
+  transferring,
+  hibernating,
+}
+
+enum MeshPacketType {
+  PROXY_REQUEST,  // Призрак просит Мост выполнить запрос
+  PROXY_RESPONSE, // Мост возвращает ответ Призраку
+}
+
 class MeshService with ChangeNotifier {
   static final MeshService _instance = MeshService._internal();
   factory MeshService() => _instance;
@@ -38,10 +57,24 @@ class MeshService with ChangeNotifier {
 
   final BluetoothMeshService _btService = BluetoothMeshService();
   final ApiService _apiService = ApiService();
+  final LocalDatabaseService _db = locator<LocalDatabaseService>();
+  final math.Random _rng = math.Random(); // Добавь эту строку
   ApiService get apiService => _apiService;
   // Состояние обнаруженных узлов (Радар)
   final Map<String, SignalNode> _nearbyNodes = {};
   final Map<String, int> _lastSeenTimestamps = {};
+
+  MeshState _state = MeshState.idle;
+  final _stateLock = Object();
+  // 🔒 Защита от параллельных сканов
+  final Object _scanLock = Object();
+
+  // 🔁 Таймер периодического сканирования
+  Timer? _scanTimer;
+
+
+  bool _isBtScanning = false;
+  LocalDatabaseService get db => _db;
 
   // Геттеры для UI
   List<SignalNode> get nearbyNodes => _nearbyNodes.values.toList();
@@ -49,6 +82,9 @@ class MeshService with ChangeNotifier {
   bool get isHost => _isHost;
 
   // Потоки данных
+
+  StreamSubscription<List<ScanResult>>? _scanSub;
+
 
   final StreamController<String> _linkRequestController = StreamController.broadcast();
   Stream<String> get linkRequestStream => _linkRequestController.stream;
@@ -61,6 +97,8 @@ class MeshService with ChangeNotifier {
 
   final StreamController<String> _statusController = StreamController<String>.broadcast();
   Stream<String> get statusStream => _statusController.stream;
+
+  StreamController<Map<String, dynamic>> get messageController => _messageController;
 
   Timer? _cleanupTimer;
   bool _isP2pConnected = false;
@@ -90,6 +128,17 @@ class MeshService with ChangeNotifier {
   bool get isGpsEnabled => _isGpsEnabled;
   bool _isTacticalQuietMode = false;
 
+
+
+  final Battery _battery = Battery();
+
+  Future<Map<String, dynamic>> getBatteryStatus() async {
+    return {
+      'level': await _battery.batteryLevel,
+      'isCharging': (await _battery.batteryState) == BatteryState.charging,
+    };
+  }
+
   // --- СИСТЕМА ОБНАРУЖЕНИЯ И ОЧИСТКИ ---
 
   Future<void> initBackgroundProtocols() async {
@@ -112,6 +161,26 @@ class MeshService with ChangeNotifier {
     _cleanupTimer = Timer.periodic(const Duration(seconds: 15), (_) => _performCleanup());
   }
 
+  Future<void> activateGroosaProtocol() async {
+    _log("🚀 ACTIVATING GROOSA: Engaging all L0/L2 layers...");
+
+    // 1. Включаем L0 (Звук)
+    await locator<UltrasonicService>().startListening();
+
+    // 2. Включаем L2 BLE (Прием + Передача)
+    // Мы запускаем скан, а внутри _scanBluetooth уже есть startAdvertising
+    _scanBluetooth();
+
+    // 3. Включаем L2 Wi-Fi (P2P Discovery)
+    await NativeMeshService.startDiscovery();
+
+    // 4. Запускаем фоновый сервис, чтобы Android не убил "Спящего Агента"
+    await NativeMeshService.startBackgroundMesh();
+
+    _log("✅ GROOSA ACTIVE: Node is now a fully functional Relay.");
+    notifyListeners();
+  }
+
   void addLog(String msg) {
     final timestamp = DateTime.now().toIso8601String().split('T').last.substring(0, 8);
     print("[Mesh Log] $msg");
@@ -122,6 +191,8 @@ class MeshService with ChangeNotifier {
     // Уведомляем UI (через Provider), что состояние обновилось
     notifyListeners();
   }
+
+
 
   void _performCleanup() {
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -163,17 +234,21 @@ class MeshService with ChangeNotifier {
   }
 
   /// Умный лимит трафика для Моста
+
+
   Future<void> handleProxyWithFairUse(MeshPacket packet) async {
-    // 1. Проверяем Карму отправителя
+    // 1. Проверяем Карму отправителя (она должна быть в пакете)
     final int peerKarma = packet.payload['karma'] ?? 0;
 
-    // 2. Если Карма низкая, ставим в очередь (delay)
-    if (peerKarma < 10) {
+    // 2. Если Карма низкая (< 5), ставим искусственную задержку
+    // Это защищает Мост от DDoS и стимулирует людей помогать другим
+    if (peerKarma < 5) {
+      _log("⏳ Low Karma node detected. Throttling request...");
       await Future.delayed(const Duration(seconds: 5));
     }
 
     // 3. Выполняем проксирование
-    _handleProxyRequest(packet);
+    _handleProxyRequest(packet); // Передаем объект дальше
   }
 
   // Центральный метод регистрации найденной ноды
@@ -223,6 +298,8 @@ class MeshService with ChangeNotifier {
   // --- УМНАЯ ОТПРАВКА (Cloud <-> Mesh) ---
 
   /// Умная тактическая отправка (Cloud + Mesh + Sonar)
+  /// Умная тактическая отправка (Cloud + Mesh + Bluetooth + Sonar)
+  /// Оптимизирована для предотвращения коллизий и перегрузки стека.
   Future<void> sendAuto({
     required String content,
     String? chatId,
@@ -238,14 +315,13 @@ class MeshService with ChangeNotifier {
         ? "THE_BEACON_GLOBAL"
         : chatId;
 
-    _log("🚀 Initiating parallel uplink for room: $targetId");
+    _log("🚀 Initiating Multi-Channel Uplink for: $targetId");
 
-    // 2. КРИПТОГРАФИЯ: Готовим зашифрованный пакет
+    // 2. КРИПТОГРАФИЯ: Готовим зашифрованный пакет (E2EE)
     final key = await encryption.getChatKey(targetId);
     final encryptedContent = await encryption.encrypt(content, key);
     final String tempId = "temp_${DateTime.now().millisecondsSinceEpoch}";
 
-    // Формируем стандартный Mesh-пакет (Virus-ready)
     final offlinePacket = jsonEncode({
       'type': 'OFFLINE_MSG',
       'chatId': targetId,
@@ -255,10 +331,11 @@ class MeshService with ChangeNotifier {
       'senderUsername': "Nomad",
       'timestamp': DateTime.now().millisecondsSinceEpoch,
       'clientTempId': tempId,
+      'ttl': 5, // Начальный TTL для Gossip-паутины
     });
 
     // ==========================================
-    // 🌐 КАНАЛ 1: CLOUD (Если есть BRIDGE)
+    // 🌐 КАНАЛ 1: CLOUD (Uplink via Bridge)
     // ==========================================
     if (currentRole == MeshRole.BRIDGE) {
       try {
@@ -269,65 +346,65 @@ class MeshService with ChangeNotifier {
           "content": content, // Внутренний метод WebSocket сам зашифрует
           "clientTempId": tempId,
         });
-        _log("☁️ Uplink: Signal relayed to Cloud.");
+        _log("☁️ Cloud: Signal delivered to Command Center.");
       } catch (e) {
-        _log("⚠️ Cloud Relay failed, relying on Mesh.");
+        _log("⚠️ Cloud: Relay failed, relying on Mesh.");
       }
     }
 
     // ==========================================
-    // 👻 КАНАЛ 2: MESH (Wi-Fi Direct Bursts)
+    // 👻 КАНАЛ 2: MESH (Wi-Fi Direct) - HIGH SPEED
     // ==========================================
-    if (_isP2pConnected) {
-      String targetIp = _lastKnownPeerIp;
-
-      // Если мы клиент, мы всегда знаем где Хост
-      if (targetIp.isEmpty && !_isHost) {
-        targetIp = "192.168.49.1";
-      }
-
-      if (targetIp.isNotEmpty && targetIp != "127.0.0.1") {
-        _log("📡 Mesh: Emitting TCP bursts to $targetIp");
-        // Шлем 3 раза для пробития помех (Tactical Burst)
-        for (int i = 0; i < 3; i++) {
-          NativeMeshService.sendTcp(offlinePacket, host: targetIp);
-          await Future.delayed(const Duration(milliseconds: 150));
-        }
-      }
+    // Мы шлем через TCP только если физический линк установлен И маршрут "прогрет"
+    if (_isP2pConnected && isRouteReady) {
+      _log("📡 Mesh: Route is stable. Emitting TCP bursts...");
+      // Используем sendTcpBurst (он внутри делает 3 попытки)
+      await sendTcpBurst(offlinePacket);
+    } else if (_isP2pConnected && !isRouteReady) {
+      _log("⏳ Mesh: Link detected but route warming up. Skipping TCP.");
     }
 
     // ==========================================
-    // 🦷 КАНАЛ 3: BLUETOOTH (BLE Push)
+    // 🦷 КАНАЛ 3: BLUETOOTH (Queue Mode)
     // ==========================================
+    // Используем твою новую ОЧЕРЕДЬ, чтобы не "взорвать" Bluetooth чип
     final bluetoothNodes = _nearbyNodes.values.where((n) => n.type == SignalType.bluetooth).toList();
-    for (var node in bluetoothNodes) {
-      try {
+
+    if (bluetoothNodes.isNotEmpty) {
+      _log("🦷 BT: Injecting packet into Serial Queue for ${bluetoothNodes.length} nodes.");
+      for (var node in bluetoothNodes) {
+        // Мы используем sendMessage, которую ты реализовал с очередью и ретраями
         _btService.sendMessage(BluetoothDevice.fromId(node.id), offlinePacket);
-        _log("🦷 BLE: Pulse injected into ${node.name}");
-      } catch (_) {}
+      }
     }
 
     // ==========================================
-    // 🔊 КАНАЛ 4: SONAR (Акустический модем)
+    // 🔊 КАНАЛ 4: SONAR (Acoustic Backup)
     // ==========================================
-    // Мы активируем Сонар автоматически для SOS или коротких команд
     bool isEmergency = content.toUpperCase().contains("SOS") || targetId == "THE_BEACON_GLOBAL";
 
-    if (isEmergency || content.length < 32) {
+    // Эскалация до Сонара только для SOS или очень коротких сообщений (до 64 символов)
+    if (isEmergency || content.length < 64) {
       _log("🔊 Sonar: Escalating to Acoustic Link...");
-      // Используем наш новый протокол фреймов (L2)
       unawaited(sonar.transmitFrame(content));
     }
 
-    // 3. ИНКУБАЦИЯ: Сохраняем в Outbox для будущих встреч с BRIDGE
+    // 3. ИНКУБАЦИЯ: Сохраняем в Outbox (Для Gossip-паутины)
+    // Если мы GHOST или линк нестабилен, сообщение должно "жить" в БД
+    final db = LocalDatabaseService();
+    final myMsg = ChatMessage(
+        id: tempId,
+        content: content,
+        senderId: api.currentUserId,
+        createdAt: DateTime.now(),
+        status: (currentRole == MeshRole.BRIDGE) ? "SENT" : "PENDING_RELAY"
+    );
+
+    await db.saveMessage(myMsg, targetId);
+
     if (currentRole == MeshRole.GHOST) {
-      final db = LocalDatabaseService();
-      final myMsg = ChatMessage(
-          id: tempId, content: content, senderId: api.currentUserId,
-          createdAt: DateTime.now(), status: "PENDING_RELAY"
-      );
       await db.addToOutbox(myMsg, targetId);
-      _log("🦠 Virus: Signal incubated for viral relay.");
+      _log("🦠 Virus: Signal incubated in Outbox.");
     }
   }
 
@@ -406,6 +483,10 @@ class MeshService with ChangeNotifier {
   Future<void> stopDiscovery() async {
     await NativeMeshService.stopDiscovery();
     await FlutterBluePlus.stopScan();
+
+    await _scanSub?.cancel();
+    _scanSub = null;
+
     _log("🛑 Scanners paused.");
   }
 
@@ -426,63 +507,155 @@ class MeshService with ChangeNotifier {
     }
   }
 
-  void _scanBluetooth() async {
-    if (!_isMeshEnabled) return;
+  // Добавь это поле в начало класса MeshService для контроля повторных попыток
+  final Map<String, DateTime> _linkCooldowns = {};
 
-    // 1. Проверка GPS
-    if (!await Geolocator.isLocationServiceEnabled()) {
-      _log("❌ Bluetooth Scan blocked: GPS is OFF");
-      return;
-    }
+  // Карта кулдаунов, чтобы не спамить одну и ту же ноду каждые 2 секунды
+
+
+  // Карта кулдаунов (MAC-адрес -> время последней попытки)
+
+
+
+
+
+
+
+  Future<void> _scanBluetooth() async {
+    if (!_isMeshEnabled || _isBtScanning) return;
+    _isBtScanning = true;
 
     try {
-      _log("🦷 Pulsing Bluetooth frequency...");
-
-      // 2. Проверка и принудительное включение адаптера
-      if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
-        _log("⚠️ BT Adapter is OFF. Forcing ON...");
-        if (Platform.isAndroid) await FlutterBluePlus.turnOn();
-        await Future.delayed(const Duration(seconds: 1));
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        _log("❌ Bluetooth Scan blocked: GPS is OFF");
+        _isBtScanning = false;
+        return;
       }
 
-      // 3. Остановка старого скана перед новым (защита от краша)
-      await FlutterBluePlus.stopScan();
+      final orchestrator = locator<TacticalMeshOrchestrator>();
+      final db = locator<LocalDatabaseService>();
+      final int pendingCount = await db.getOutboxCount();
+
+      // 1. ПОДГОТОВКА ТАКТИЧЕСКОГО МАЯКА (Advertising)
+      final String myShortId = _apiService.currentUserId.isNotEmpty
+          ? _apiService.currentUserId.substring(0, 4)
+          : "GHST";
+      final String myTacticalName = "M_${orchestrator.myHops}_${pendingCount > 0 ? '1' : '0'}_$myShortId";
+
+      _log("🦷 Pulsing Tactical Beacon: $myTacticalName");
+
+      // Сбрасываем старую рекламу перед новой
+      await _btService.stopAdvertising();
       await Future.delayed(const Duration(milliseconds: 200));
+      await _btService.startAdvertising(myTacticalName);
 
-      String myId = "Ghost";
-      try {
-        final me = await _apiService.getMe();
-        myId = me['id'].toString().substring(0, 4);
-      } catch (_) {}
+      // 2. ОЧИСТКА СЛУШАТЕЛЕЙ
+      await _scanSub?.cancel();
+      _scanSub = null;
+      await FlutterBluePlus.stopScan();
 
-      // 4. Вещание (Advertising)
-      await _btService.startAdvertising("MEMENTO_NODE_$myId");
+      // 3. ОБРАБОТКА ЭФИРА (Discovery & Hop Protocol)
+      _scanSub = FlutterBluePlus.scanResults.listen((results) async {
+        for (final r in results) {
+          // Фильтр по нашему Service UUID
+          if (!r.advertisementData.serviceUuids.contains(Guid(_btService.SERVICE_UUID))) continue;
 
-      // 5. Поиск (Scanning) с плавным стартом
-      FlutterBluePlus.startScan(
+          final String advName = r.advertisementData.localName;
+          final String mac = r.device.remoteId.str;
+
+          int peerHops = 99;
+          bool peerHasData = false;
+          String peerId = mac.substring(mac.length - 4);
+
+          // Разбор тактического имени соседа
+          if (advName.startsWith("M_")) {
+            final parts = advName.split("_");
+            if (parts.length >= 4) {
+              peerHops = int.tryParse(parts[1]) ?? 99;
+              peerHasData = parts[2] == "1";
+              peerId = parts[3];
+            }
+          }
+
+          // --- ШАГ А: ОБНОВЛЕНИЕ ГРАДИЕНТА (Zero-Connect) ---
+          // Мы узнаем о близости выхода мгновенно из пакета рекламы
+          orchestrator.processRoutingPulse(RoutingPulse(
+            nodeId: peerId,
+            hopsToInternet: peerHops,
+            batteryLevel: 1.0,
+            queuePressure: peerHasData ? 1 : 0,
+          ));
+
+          _registerNode(SignalNode(
+              id: mac,
+              name: "Nomad_$peerId",
+              type: SignalType.bluetooth,
+              metadata: mac,
+              bridgeDistance: peerHops
+          ));
+
+          // --- ШАГ Б: ПРИНЯТИЕ РЕШЕНИЯ ОБ ЭСКАЛАЦИИ ---
+          final lastAttempt = _linkCooldowns[mac];
+          final bool isInCooldown = lastAttempt != null &&
+              DateTime.now().difference(lastAttempt).inSeconds < 45;
+
+          if (isInCooldown || _btService.state == BleAdvertiseState.connecting) continue;
+
+          // Условие для перехвата данных (Я - Мост, у соседа есть данные)
+          bool shouldPull = (orchestrator.myHops == 0 && peerHasData);
+
+          // Условие для сброса данных (У меня есть данные, сосед ближе к инету)
+          bool shouldPush = (pendingCount > 0 && peerHops < orchestrator.myHops);
+
+          if (shouldPull || shouldPush) {
+            // 🔥 АТОМНЫЙ ЗАМОК: Предотвращаем GATT-шторм
+            _linkCooldowns[mac] = DateTime.now();
+
+            // 🔥 ПОЛНАЯ ТИШИНА: Выключаем всё радио перед коннектом
+            await _scanSub?.cancel();
+            _scanSub = null;
+            await FlutterBluePlus.stopScan();
+            await _btService.stopAdvertising();
+            await Future.delayed(const Duration(milliseconds: 1000));
+
+            if (shouldPull) {
+              _log("🧲 [Bridge] Magnet pull: Snatching data from $peerId");
+              // Для приема маленьких пульсов используем BLE
+              await _btService.quickLinkAndPing(r.device, orchestrator.generatePulse().toBytes());
+            } else {
+              _log("🚀 [Escalation] Cascade Offload: Moving data to $peerId via Wi-Fi Direct");
+
+              // ПЕРЕХОДИМ НА WI-FI DIRECT ДЛЯ НАДЕЖНОЙ ПЕРЕДАЧИ
+              // Твой нативный метод connect использует MAC-адрес
+              await NativeMeshService.connect(mac);
+
+              // Логика отправки пакета из Outbox находится в методе onNetworkConnected
+              // Он сработает автоматически, как только Android поднимет P2P-группу
+            }
+            break;
+          }
+        }
+      });
+
+      // 4. ЗАПУСК СКАНЕРА
+      await FlutterBluePlus.startScan(
+        withServices: [Guid(_btService.SERVICE_UUID)],
         timeout: const Duration(seconds: 15),
         androidUsesFineLocation: true,
       );
 
-      // 6. Прослушка результатов
-      _btService.scanForNodes().listen((result) {
-        String name = result.advertisementData.localName.isNotEmpty
-            ? result.advertisementData.localName
-            : "Ghost Node";
-
-        final node = SignalNode(
-            id: result.device.remoteId.str,
-            name: name,
-            type: SignalType.bluetooth,
-            metadata: result.device.remoteId.str
-        );
-        _registerNode(node);
-      }, onError: (e) => _log("❌ BT Scan Stream Error: $e"));
-
     } catch (e) {
-      _log("❌ BT Critical Failure: $e");
+      _log("❌ BT Burst Error: $e");
+    } finally {
+      // Авто-завершение цикла через 15 сек
+      Future.delayed(const Duration(seconds: 15), () async {
+        await _btService.stopAdvertising();
+        _isBtScanning = false;
+        _log("💤 [BT] Burst cycle completed.");
+      });
     }
   }
+
 
   // --- ОБРАБОТКА ПАКЕТОВ ---
 
@@ -492,16 +665,13 @@ class MeshService with ChangeNotifier {
   // 🔥 ИСПРАВЛЕННЫЙ МЕТОД ОБРАБОТКИ ПАКЕТОВ
 
 
-  /// Реализует дедупликацию, захват маршрута и вирусную ретрансляцию.
-  /// Центральный диспетчер входящих Mesh-сигналов.
+
   /// Логика: Распаковка -> Дедупликация -> Peer Lock -> Маршрутизация.
   void processIncomingPacket(dynamic rawData) async {
     _log("🧬 [Mesh-Kernel] New pulse incoming. Analyzing...");
 
     final db = LocalDatabaseService();
-
-    // 🔥 РЕШЕНИЕ ЦИКЛИЧЕСКОЙ ЗАВИСИМОСТИ:
-    // Достаем менеджер прямо в методе. К этому моменту все синглтоны уже созданы.
+    // Извлекаем менеджер Gossip через локатор для ретрансляции
     final gossip = locator<GossipManager>();
 
     try {
@@ -509,6 +679,7 @@ class MeshService with ChangeNotifier {
       String? senderIp;
 
       // --- 1. РАСПАКОВКА И ЗАХВАТ IP (Критично для Tecno/Huawei) ---
+      // Native-слой присылает Map с контентом сообщения и IP адресом отправителя.
       if (rawData is Map) {
         jsonString = rawData['message']?.toString() ?? "";
         senderIp = rawData['senderIp']?.toString();
@@ -525,74 +696,84 @@ class MeshService with ChangeNotifier {
       final Map<String, dynamic> data = jsonDecode(jsonString);
 
       // --- 3. GOSSIP ДЕДУПЛИКАЦИЯ (Anti-Entropy Layer) ---
-      // Сначала вычисляем хеш, потом лезем в БД.
+      // Генерируем или извлекаем уникальный хеш пакета.
       final String packetHash = data['h'] ?? "pulse_${data['timestamp']}_${data['senderId']}";
 
+      // Проверка через БД: если мы уже видели этот сигнал, мы его не обрабатываем и не пересылаем.
       if (await db.isPacketSeen(packetHash)) {
         _log("♻️ [Gossip] Duplicate pulse ($packetHash). Dropping to save battery.");
         return;
       }
 
       // --- 4. МАРШРУТИЗАЦИЯ ОБРАТНОГО ПУТИ (Peer Lock) ---
-      // Фиксируем IP отправителя. Если он прислал нам пакет, значит по этому IP
-      // мы можем достать его через сокет прямо сейчас.
+      // Фиксируем IP отправителя. В Wi-Fi Direct IP могут меняться,
+      // поэтому мы всегда запоминаем адрес последнего входящего пакета.
       if (senderIp != null && senderIp.isNotEmpty && senderIp != "127.0.0.1") {
         if (_lastKnownPeerIp != senderIp) {
           _lastKnownPeerIp = senderIp;
           _log("📍 [Mesh] Peer Locked -> $_lastKnownPeerIp");
-          notifyListeners();
+          notifyListeners(); // UI должен обновить статус "горячего" соединения
         }
       }
 
+      // Извлекаем тактические метаданные
       final String packetType = data['type'] ?? 'UNKNOWN';
       final String senderId = data['senderId'] ?? 'Unknown';
-      final String incomingChatId = data['chatId'] ?? "";
+      // Нормализуем ID чата для стабильной фильтрации на разных устройствах
+      final String incomingChatId = (data['chatId'] ?? "").toString().trim().toUpperCase();
 
-      // --- 5. ТАКТИЧЕСКИЙ РОУТИНГ ---
+      // --- 5. ТАКТИЧЕСКИЙ РОУТИНГ ПО ТИПАМ ПАКЕТОВ ---
       switch (packetType) {
 
         case 'MAGNET_QUERY':
-          _log("❓ Node $senderId looking for uplink. Sending magnet status...");
-          broadcastMagnetStatus();
+          _log("❓ Node $senderId is looking for internet. Answering status...");
+          broadcastMagnetStatus(); // Отвечаем нашей дистанцией до моста
           break;
 
         case 'MAGNET_PULSE':
-          final int peerDist = data['dist'] ?? 99;
-          if (_nearbyNodes.containsKey(senderId)) {
-            _nearbyNodes[senderId]!.bridgeDistance = peerDist;
-            if (peerDist < 5) {
-              _log("🧲 Internet Gateway detected: Node $senderId.");
-              HapticFeedback.heavyImpact(); // Вибрация для демо: "Рыба на крючке"
-            }
-            notifyListeners();
+          final pulse = RoutingPulse.fromJson(data); // Используем наш класс
+          locator<TacticalMeshOrchestrator>().processRoutingPulse(pulse); // Скармливаем мозгу
+
+          if (pulse.hopsToInternet < 5) {
+            HapticFeedback.heavyImpact();
           }
+          notifyListeners();
           break;
 
         case 'PING':
-          _log("👋 Handshake from $senderId");
+          _log("👋 Handshake pulse from $senderId");
+          // Если мы клиент, отвечаем синхронизацией рекламных пакетов
           if (!_isHost && senderIp != null) syncGossip(senderIp);
           break;
 
         case 'OFFLINE_MSG':
-          _log("📥 Message pulse detected for room: $incomingChatId");
+        case 'MSG_FRAG':
+          _log("📥 Signal detected for room: $incomingChatId");
 
           final String myId = _apiService.currentUserId;
-          bool isForMe = data['recipientId'] == myId;
-          bool isGlobal = incomingChatId == "GLOBAL" || incomingChatId == "THE_BEACON_GLOBAL";
 
-          // Если это нам или в глобал — шлем в UI стрим
+          // 🔥 ГИБКАЯ ФИЛЬТРАЦИЯ (Решение для Huawei/Xiaomi)
+          // Пакет считается валидным для нашего UI, если:
+          // 1. Он адресован лично нам.
+          // 2. Он в глобальном канале (содержит GLOBAL или BEACON).
+          // 3. Или у него просто есть chatId (ConversationScreen сам разберется).
+          bool isForMe = data['recipientId'] == myId;
+          bool isGlobal = incomingChatId.contains("GLOBAL") || incomingChatId.contains("BEACON");
+
           if (isForMe || isGlobal || incomingChatId.isNotEmpty) {
-            _log("🚀 [Mesh] Valid signal. Relaying to UI.");
-            data['senderIp'] = senderIp; // Прикрепляем IP для быстрого ответа
-            _messageController.add(data);
+            _log("🚀 [Mesh] Valid signal recognized. Relaying to UI stream.");
+            data['senderIp'] = senderIp; // Прокидываем IP для контекста
+            _messageController.add(data); // Отправляем в стрим для ConversationScreen
           }
 
-          // 🦠 GOSSIP RELAY: Инкубируем пакет для дальнейшего распространения
+          // 🦠 GOSSIP PROPAGATION:
+          // Даже если сообщение не нам, мы передаем его в GossipManager.
+          // Менеджер решит: склеить фрагменты (Meaning Units) или переслать пакет соседям.
           await gossip.processEnvelope(data);
           break;
 
         case 'GOSSIP_SYNC':
-          _log("🔄 Gossip Sync: Merging tactical ad-pool.");
+          _log("🔄 Gossip Sync: Merging tactical ad-pool metadata.");
           final List? adsRaw = data['payload']?['ads'];
           if (adsRaw != null) {
             for (var adJson in adsRaw) {
@@ -605,26 +786,36 @@ class MeshService with ChangeNotifier {
 
         case 'REQ':
           if (NetworkMonitor().currentRole == MeshRole.BRIDGE) {
-            _log("🌉 [Bridge] Proxying REQ for $senderId to Cloud.");
-            handleProxyWithFairUse(MeshPacket.fromJson(jsonString));
+            _log("🌉 [Bridge] Validating REQ from $senderId...");
+
+            // 🔥 СОЗДАЕМ ТИПИЗИРОВАННЫЙ ПАКЕТ
+            final reqPacket = MeshPacket.fromMap(data, ip: senderIp);
+
+            // Вызываем метод с ОДНИМ аргументом (как он и ожидает)
+            handleProxyWithFairUse(reqPacket);
           } else {
-            _log("💾 [Relay] No internet. Caching REQ for Gossip.");
-            await gossip.processEnvelope(data);
+            _log("💾 [Relay] Caching REQ to infected outbox.");
+            _infectDevice(data);
           }
           break;
 
+
+
         case 'RES':
-          _log("🎯 [Ghost] Proxy response arrived. Injecting.");
+        // Ответ от облака (через прокси-мост) пробрасываем в локальные слушатели
+          _log("🎯 [Ghost] Proxy response arrived. Injecting to UI.");
           _messageController.add(data);
           break;
 
         default:
-          _log("❓ Unknown frequency: $packetType. Monitoring...");
+          _log("❓ Unknown frequency: $packetType. Monitoring continues.");
       }
     } catch (e) {
       _log("❌ [Mesh-Critical] Crash during pulse processing: $e");
     }
   }
+
+
 
   /// Рассылка статуса близости к интернету
   void broadcastMagnetStatus() async {
@@ -782,45 +973,102 @@ class MeshService with ChangeNotifier {
     }
   }
 
+
+  Future<void> dispatchMessage(ChatMessage msg) async {
+    final orchestrator = locator<TacticalMeshOrchestrator>();
+
+    // 1. Если я мост — сразу в облако через твой ApiService
+    if (orchestrator.myHops == 0) {
+      _log("🌉 I am BRIDGE. Sending directly to Cloud.");
+      // Используем твой метод синхронизации
+      await locator<ApiService>().syncOutbox();
+      return;
+    }
+
+    // 2. Ищем лучший путь (используем таблицу из оркестратора)
+    // Для этого в оркестраторе сделай геттер для таблицы или метод поиска лучшего соседа
+    final bestNextHop = locator<TacticalMeshOrchestrator>().getBestUplink();
+
+    if (bestNextHop != null) {
+      _log("🚀 Routing packet to ${bestNextHop.nodeId}");
+
+      // ТВОЙ РЕАЛЬНЫЙ МЕТОД:
+      final packet = jsonEncode(msg.toJson());
+      // В твоем коде это NativeMeshService.sendTcp
+      await NativeMeshService.sendTcp(packet, host: bestNextHop.nodeId);
+    } else {
+      _log("📦 No uplink. Caching in local SQLite.");
+      // ТВОЙ РЕАЛЬНЫЙ МЕТОД:
+      await locator<LocalDatabaseService>().saveMessage(msg, msg.id);
+      await locator<LocalDatabaseService>().addToOutbox(msg, msg.id);
+    }
+  }
+
+  // В методе processIncomingPacket (MeshService)
+  void handleDataPacket(Map<String, dynamic> data, String fromIp) async {
+    final orchestrator = locator<TacticalMeshOrchestrator>();
+    final String packetId = data['id'] ?? data['h'];
+    final String type = data['type'];
+
+    if (type == 'REQ') {
+      // Мы — транзитный узел. Запоминаем, откуда пришел запрос, чтобы вернуть ответ.
+      orchestrator.reversePath.savePath(packetId, data['senderId']);
+
+      // Пересылаем пакет дальше по градиенту (к интернету)
+      orchestrator.dispatchMessage(ChatMessage.fromJson(data));
+    }
+
+    else if (type == 'RES') {
+      // Это ответ от сервера! Ищем, кому его вернуть в меш-сети.
+      String? originalSenderId = orchestrator.reversePath.findNextHop(packetId);
+
+      if (originalSenderId != null) {
+        _log("🎯 Found reverse path for $packetId -> $originalSenderId");
+        // Шлем ответ конкретному соседу
+        await NativeMeshService.sendTcp(jsonEncode(data), host: originalSenderId);
+      } else {
+        _log("💨 Reverse path expired or not found for $packetId");
+        // Если путь потерян — используем Limited Flooding как фолбек
+        infectNeighbors(data);
+      }
+    }
+  }
+
   // --- 🛰️ ПРОКСИ-ЛОГИКА (Для интервью) ---
 
+  /// Центральный метод проксирования запросов от "Призраков" в Интернет
   void _handleProxyRequest(MeshPacket packet) async {
     final String method = packet.payload['method'];
     final String endpoint = packet.payload['endpoint'];
     final dynamic rawBody = packet.payload['body'];
+    final String? targetIp = packet.senderIp; // 🔥 Берем IP из пакета
 
-    // 1. Создаем защищенный клиент
+    // 1. Создаем защищенный HTTP-клиент
     final ioc = HttpClient()..badCertificateCallback = (cert, host, port) => true;
     final client = IOClient(ioc);
 
     final String ghostId = packet.payload['senderId'] ?? "Unknown";
-    _log("🌉 [Bridge] Proxying request for node: ${ghostId.length > 8 ? ghostId.substring(0,8) : ghostId}");
-    _log("📍 [Bridge] Target Endpoint: $endpoint");
+    _log("🌉 [Bridge] Proxying REQ for Node: ${ghostId.substring(0, 8)} -> $endpoint");
 
     try {
-      // 2. ФОРМИРОВАНИЕ "СПОНСОРСКИХ" ЗАГОЛОВКОВ
-      // Мы берем ТОКЕН МОСТА, потому что сервер доверяет только ему.
+      // 2. ФОРМИРОВАНИЕ "СПОНСОРСКИХ" ЗАГОЛОВКОВ (DPI Deception)
       final String? myRealToken = await Vault.read('auth_token');
 
       final Map<String, String> proxyHeaders = {
         'Content-Type': 'application/json',
-        'Host': 'update.microsoft.com', // Маскировка
-        // Если у нас есть реальный токен (мы в онлайне), используем его для авторизации запроса Призрака
+        'Host': 'update.microsoft.com', // Маскировка под трафик Microsoft
         if (myRealToken != null && myRealToken != 'GHOST_MODE_ACTIVE')
           'Authorization': 'Bearer $myRealToken',
 
-        // Передаем реальный ID Призрака в спец-заголовке, чтобы сервер знал, для кого данные
-        'X-Memento-Ghost-ID': packet.payload['senderId'] ?? "Unknown",
-
-      'X-Proxy-Node': _apiService.currentUserId,
+        'X-Memento-Ghost-ID': ghostId,
+        'X-Proxy-Node': _apiService.currentUserId, // Кто помогает (для Кармы)
       };
 
-      // 3. ФОРМИРОВАНИЕ URL
+      // 3. ВЫПОЛНЕНИЕ ЗАПРОСА
       final String fullUrl = endpoint.startsWith('http')
           ? endpoint
           : (_baseUrl + (endpoint.startsWith('/api') ? endpoint.replaceFirst('/api', '') : endpoint));
 
-      // 4. ВЫПОЛНЕНИЕ ЗАПРОСА
       http.Response response;
       final encodedBody = (rawBody != null && rawBody is! String) ? jsonEncode(rawBody) : rawBody;
 
@@ -830,27 +1078,26 @@ class MeshService with ChangeNotifier {
         response = await client.get(Uri.parse(fullUrl), headers: proxyHeaders);
       }
 
-      _log("☁️ [Server] Response Status: ${response.statusCode}");
+      _log("☁️ [Server] Response: ${response.statusCode}");
 
-      // 5. УПАКОВКА И ОБРАТНАЯ ОТПРАВКА ПРИЗРАКУ
+      // 4. УПАКОВКА ОТВЕТА
       final resPacket = MeshPacket.createResponse(packet.id, response.statusCode, response.body);
       final String serializedRes = resPacket.serialize();
 
-      // 🔥 ТАКТИКА "ОБРАТНЫЙ ВСПЛЕСК" (Return Burst)
-      // Шлем ответ 3 раза, так как Huawei может "заснуть" пока ждал ответа от интернета
+      // 5. 🔥 ТАКТИКА "ОБРАТНЫЙ ВСПЛЕСК" (Return Burst)
+      // Шлем 3 раза, так как Huawei соседа мог "уснуть", пока мы ждали интернет
       if (_lastKnownPeerIp.isNotEmpty) {
         for (int i = 0; i < 3; i++) {
           await NativeMeshService.sendTcp(serializedRes, host: _lastKnownPeerIp);
           await Future.delayed(const Duration(milliseconds: 200));
         }
-        _log("✅ [Bridge] Proxy result delivered back to $_lastKnownPeerIp");
+        _log("✅ [Bridge] Result delivered back to $_lastKnownPeerIp");
       }
 
     } catch (e) {
-      _log("❌ [Bridge] Network Relay Failure: $e");
-
-      // Отправляем локальную ошибку, чтобы Huawei не висел в ожидании
-      final errPacket = MeshPacket.createResponse(packet.id, 503, jsonEncode({'error': 'Mesh Bridge Link Timeout'}));
+      _log("❌ [Bridge] Relay Failure: $e");
+      // Шлем ошибку 503, чтобы "Призрак" не ждал вечно
+      final errPacket = MeshPacket.createResponse(packet.id, 503, jsonEncode({'error': 'Mesh Bridge Timeout'}));
       if (_lastKnownPeerIp.isNotEmpty) {
         await NativeMeshService.sendTcp(errPacket.serialize(), host: _lastKnownPeerIp);
       }
@@ -969,20 +1216,36 @@ class MeshService with ChangeNotifier {
 
   bool _isHost = false;
   String _lastKnownPeerIp = "192.168.49.1";
+  bool _isRouteReady = false;
+  bool get isRouteReady => _isRouteReady;
 
-  void onNetworkConnected(bool isHost, String hostAddress) {
+  void onNetworkConnected(bool isHost, String hostAddress) async {
     _isP2pConnected = true;
     _isHost = isHost;
 
-    final String role = isHost ? "COMMAND_NODE (Host)" : "TACTICAL_NODE (Client)";
-    _log("🛡️ [MESH-LINK] CONNECTED | ROLE: $role | Peer IP: $hostAddress");
+    _log("🌐 [MESH-LINK] Connected to group. Sending payload...");
 
-    // Проверка сохранности при переключении
-    if (!_isMeshEnabled) {
-      _log("⚠️ [SECURITY-ALERT] Mesh was disabled but link is active!");
+    final db = locator<LocalDatabaseService>();
+    final pending = await db.getPendingFromOutbox();
+
+    if (pending.isNotEmpty) {
+      final msg = pending.first;
+      final packet = jsonEncode({
+        'type': 'OFFLINE_MSG',
+        'chatId': msg['chatRoomId'],
+        'content': msg['content'],
+        'senderId': _apiService.currentUserId,
+        'h': msg['id'],
+      });
+
+      // 🔥 ТЕПЕРЬ МЫ ШЛЕМ НА IP, А НЕ НА MAC!
+      // Если я клиент - шлю Хосту (192.168.49.1)
+      // Если я хост - шлю клиенту (hostAddress)
+      String targetIp = isHost ? hostAddress : "192.168.49.1";
+
+      await NativeMeshService.sendTcp(packet, host: targetIp);
+      _log("🚀 [DATA] Signal offloaded via Wi-Fi Direct to $targetIp");
     }
-
-    notifyListeners();
   }
 
   void logSonarEvent(String msg, {bool isError = false}) {
@@ -1031,6 +1294,7 @@ class MeshService with ChangeNotifier {
     // Шлем Хосту на стандартный адрес
     NativeMeshService.sendTcp(ping, host: "192.168.49.1");
   }
+
 
   void onNetworkDisconnected() {
     _isP2pConnected = false;
@@ -1145,6 +1409,7 @@ void _triggerFastScan() {
     NativeMeshService.stopDiscovery(); // Кратковременный импульс
   });
 }
+
 
 // Медленный скан (в покое) — раз в 5 минут
 void _triggerSlowScan() {

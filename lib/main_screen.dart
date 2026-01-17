@@ -22,6 +22,7 @@ import 'package:memento_mori_app/features/ads/tactical_banner.dart';
 
 import 'core/EmergencyRadarScreen.dart';
 import 'features/theme/app_colors.dart';
+import 'features/ui/sonar_overlay.dart';
 
 class MainScreen extends StatefulWidget {
   final DateTime deathDate;
@@ -59,6 +60,7 @@ class _MainScreenState extends State<MainScreen> {
     // 2. Слушатель входящих запросов на связь через Сонар
     _linkSubscription = locator<MeshService>().linkRequestStream.listen((senderId) {
       _showLinkConfirmation(senderId);
+      SonarOverlay.show(context, senderId); // 🔥 Магия появляется на экране!
     });
 
     _loadInitialData();

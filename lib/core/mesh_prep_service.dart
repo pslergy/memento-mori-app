@@ -1,27 +1,26 @@
 import 'package:permission_handler/permission_handler.dart';
-import 'package:device_info_plus/device_info_plus.dart';
 import 'dart:io';
 
 class MeshPrepService {
-  static Future<bool> readyForGlobalTest() async {
+  static Future<bool> requestTacticalPermissions() async {
     if (!Platform.isAndroid) return true;
 
-    // 1. Проверка разрешений
+    // Запрашиваем всё одним пакетом
     Map<Permission, PermissionStatus> statuses = await [
-      Permission.location,
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.bluetoothAdvertise,
-      Permission.nearbyWifiDevices,
+      Permission.location,           // Для Wi-Fi Direct и BLE
+      Permission.bluetoothScan,      // BLE поиск
+      Permission.bluetoothConnect,   // GATT соединение
+      Permission.bluetoothAdvertise, // BLE вещание
+      Permission.nearbyWifiDevices,  // Android 13+ Wi-Fi Mesh
+      Permission.microphone,         // Сонар
     ].request();
 
-    if (statuses.values.any((s) => s.isDenied)) return false;
+    // Проверяем, не отказал ли юзер в чем-то критическом
+    bool allGranted = statuses.values.every((status) => status.isGranted);
 
-    // 2. Проверка оптимизации батареи (Критично для Tecno!)
-    if (await Permission.ignoreBatteryOptimizations.isDenied) {
-      await Permission.ignoreBatteryOptimizations.request();
+    if (allGranted) {
+      print("🛡️ [Security] Universal mandate granted. System is authorized.");
     }
-
-    return true;
+    return allGranted;
   }
 }

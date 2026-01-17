@@ -127,51 +127,83 @@ class ApiService {
 
   // 🔥 ЛОГИКА ВЫЖИВАНИЯ: Если нет сети, пробуем Mesh, если нет Mesh — отдаем из SQLite
   /// Логика выживания: Фолбек для оффлайна
+  /// Логика выживания: Фолбек для оффлайна (Консолидация БД и Mesh-эфира)
   Future<dynamic> _handleOfflineFlow(String method, String endpoint, dynamic body) async {
     final db = LocalDatabaseService();
     final mesh = locator<MeshService>();
 
-    // 🔥 ИНЪЕКЦИЯ ДЛЯ ОФФЛАЙНА
-    if (endpoint == '/chats' && method == 'GET') {
-      _log("📦 [API] Hard-injecting Beacon into offline list.");
-
-      List<Map<String, dynamic>> offlineList = [
-        {
-          'id': 'THE_BEACON_GLOBAL',
-          'name': 'THE BEACON (Global SOS)',
-          'type': 'GLOBAL',
-          'lastMessage': {'content': 'Mesh Active.', 'createdAt': DateTime.now().toIso8601String()},
-          'otherUser': null
-        }
-      ];
-
-      // Добавляем соседей, которых видим по Mesh
-      for (var node in mesh.nearbyNodes) {
-        if (currentUserId.isEmpty) continue;
-        List<String> ids = [currentUserId, node.id];
-        ids.sort();
-        offlineList.add({
-          'id': "GHOST_${ids[0]}_${ids[1]}",
-          'name': node.name,
-          'type': 'DIRECT',
-          'otherUser': {'id': node.id, 'username': node.name}
-        });
-      }
-      return offlineList;
-    }
-
-    // История сообщений из SQLite
+    // 1. ИСТОРИЯ СООБЩЕНИЙ (С учетом владельца)
     if (endpoint.contains('/messages') && method == 'GET') {
       final String chatId = endpoint.split('/')[2];
+      // Метод getMessages уже должен внутри использовать currentUserId как фильтр ownerId
       final localMsgs = await db.getMessages(chatId);
       return localMsgs.map((m) => m.toJson()).toList();
     }
 
-    // Профиль (Identity Recovery)
+    // 2. СПИСОК ЧАТОВ (Гибридный: База + Эфир)
+    if (endpoint == '/chats' && method == 'GET') {
+      _log("📦 [API] Consolidating persistent and ephemeral chats...");
+
+      // А. Начинаем с Глобального Маяка (всегда первый)
+      List<Map<String, dynamic>> consolidatedList = [
+        {
+          'id': 'THE_BEACON_GLOBAL',
+          'name': 'THE BEACON (Global SOS)',
+          'type': 'GLOBAL',
+          'lastMessage': {'content': 'Mesh Active. Frequency secured.', 'createdAt': DateTime.now().toIso8601String()},
+          'otherUser': null
+        }
+      ];
+
+      // Б. Добавляем чаты из SQLite, принадлежащие ЭТОМУ пользователю
+      final database = await db.database;
+      final List<Map<String, dynamic>> localRooms = await database.query(
+          'chat_rooms',
+          where: 'ownerId = ?',
+          whereArgs: [currentUserId]
+      );
+
+      // Добавляем их в общий список, избегая дублирования с Маяком
+      for (var room in localRooms) {
+        if (room['id'] != 'THE_BEACON_GLOBAL') {
+          consolidatedList.add(Map<String, dynamic>.from(room));
+        }
+      }
+
+      // В. Добавляем живых соседей из Mesh (которых нет в базе)
+      for (var node in mesh.nearbyNodes) {
+        if (currentUserId.isEmpty) continue;
+
+        // Генерируем детерминированный ID для оффлайн-чата
+        List<String> ids = [currentUserId, node.id];
+        ids.sort();
+        final String meshChatId = "GHOST_${ids[0]}_${ids[1]}";
+
+        // Проверяем, нет ли уже такого чата в списке (чтобы не дублировать)
+        bool exists = consolidatedList.any((c) => c['id'] == meshChatId);
+        if (!exists) {
+          consolidatedList.add({
+            'id': meshChatId,
+            'name': node.name,
+            'type': 'DIRECT',
+            'lastMessage': {'content': 'Signal detected via Mesh.', 'createdAt': DateTime.now().toIso8601String()},
+            'otherUser': {'id': node.id, 'username': node.name}
+          });
+        }
+      }
+      return consolidatedList;
+    }
+
+    // 3. ПРОФИЛЬ (Identity Recovery)
     if (endpoint == '/users/me' && method == 'GET') {
       final ghostId = await Vault.read('user_id');
       final ghostName = await Vault.read('user_name') ?? "Ghost";
-      return {'id': ghostId ?? "LOCAL_NODE", 'username': ghostName, 'isGhost': true};
+      return {
+        'id': ghostId ?? "LOCAL_NODE",
+        'username': ghostName,
+        'isGhost': true,
+        'status': 'STEALTH'
+      };
     }
 
     return [];

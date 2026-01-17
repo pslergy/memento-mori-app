@@ -42,14 +42,26 @@ class ChatMessage {
   });
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
-    final senderData = json['sender'];
+    // 🔥 ТАКТИЧЕСКИЙ ФИКС: Безопасно парсим дату из любого типа
+    DateTime parsedDate;
+    var rawDate = json['createdAt'];
+
+    if (rawDate is int) {
+      parsedDate = DateTime.fromMillisecondsSinceEpoch(rawDate);
+    } else if (rawDate is String) {
+      parsedDate = DateTime.tryParse(rawDate) ?? DateTime.now();
+    } else {
+      parsedDate = DateTime.now();
+    }
+
     return ChatMessage(
+      // Принудительно в String, если база вернула числовой ID
       id: json['id']?.toString() ?? '',
-      clientTempId: json['clientTempId'] ?? json['client_temp_id'],
+      clientTempId: json['clientTempId']?.toString(),
       content: json['content'] ?? '',
-      senderId: json['senderId'] ?? senderData?['id'] ?? '',
-      senderUsername: json['senderUsername'] ?? senderData?['username'] ?? 'Nomad',
-      createdAt: DateTime.tryParse(json['createdAt'] ?? '') ?? DateTime.now(),
+      senderId: json['senderId']?.toString() ?? '',
+      senderUsername: json['senderUsername'] ?? 'Nomad',
+      createdAt: parsedDate,
       status: json['status'] ?? 'SENT',
     );
   }

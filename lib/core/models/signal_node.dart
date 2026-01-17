@@ -1,6 +1,6 @@
 import '../mesh_service.dart';
 
-enum SignalType { cloud, mesh, bluetooth }
+enum SignalType { cloud, mesh, bluetooth, wifiDirect }
 
 class SignalNode {
   final String id;

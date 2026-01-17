@@ -8,6 +8,7 @@ import 'mesh_service.dart';
 class NativeMeshService {
   // Канал для Wi-Fi Direct и системных функций
   static const MethodChannel _channel = MethodChannel('memento/wifi_direct');
+
   // Канал для Акустического Сонара (Звук)
   static const MethodChannel _sonarChannel = MethodChannel('memento/sonar');
 
@@ -92,6 +93,24 @@ class NativeMeshService {
     });
   }
 
+  static Future<Map<double, double>> runFrequencySweep() async {
+    try {
+      final Map<dynamic, dynamic> raw =
+      await _sonarChannel.invokeMethod('runFrequencySweep');
+
+      return raw.map(
+            (key, value) => MapEntry(
+          (key as num).toDouble(),
+          (value as num).toDouble(),
+        ),
+      );
+    } catch (e) {
+      print("❌ [Native] FFT sweep failed: $e");
+      rethrow;
+    }
+  }
+
+
   // --- МЕТОДЫ УПРАВЛЕНИЯ (Flutter -> Native) ---
 
   /// Запуск фонового "бессмертного" сервиса Kotlin
@@ -124,6 +143,8 @@ class NativeMeshService {
   static Future<void> stopDiscovery() async {
     try {
       await _channel.invokeMethod('stopDiscovery');
+    } on MissingPluginException {
+      print("⚠️ [Native] Method stopDiscovery not implemented on Android yet.");
     } catch (e) {
       print("❌ [Native] Stop Error: $e");
     }

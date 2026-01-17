@@ -1,65 +1,93 @@
 import 'package:flutter/foundation.dart';
-
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 class GhostController extends ChangeNotifier {
-  String _value = '';
-  int _cursorPosition = 0; // 🔥 ПОЗИЦИЯ КУРСОРA
+  final List<String> _chars = [];
+  int _cursorPosition = 0;
   bool _isUpperCase = false;
 
-  String get value => _value;
+  // ================================
+  // GETTERS
+  // ================================
+  String get value => _chars.join();
   int get cursorPosition => _cursorPosition;
   bool get isUpperCase => _isUpperCase;
 
-  String get masked => List.filled(_value.length, '•').join();
+  String get masked => '•' * _chars.length;
 
-  // Добавление в позицию курсора
+  // ================================
+  // TEXT EDITING
+  // ================================
   void add(String char) {
     String formattedChar = RegExp(r'[a-zA-Zа-яА-Я]').hasMatch(char)
         ? (_isUpperCase ? char.toUpperCase() : char.toLowerCase())
         : char;
 
-    _value = _value.substring(0, _cursorPosition) +
-        formattedChar +
-        _value.substring(_cursorPosition);
+    _chars.insert(_cursorPosition, formattedChar);
     _cursorPosition++;
     notifyListeners();
   }
 
   void backspace() {
-    if (_value.isNotEmpty && _cursorPosition > 0) {
-      _value = _value.substring(0, _cursorPosition - 1) +
-          _value.substring(_cursorPosition);
+    if (_chars.isNotEmpty && _cursorPosition > 0) {
+      _chars.removeAt(_cursorPosition - 1);
       _cursorPosition--;
       notifyListeners();
     }
   }
-  void moveLeft() { if (_cursorPosition > 0) { _cursorPosition--; notifyListeners(); } }
-  void moveRight() { if (_cursorPosition < _value.length) { _cursorPosition++; notifyListeners(); } }
 
-  // 🔥 БУФЕР ОБМЕНА (PASTE)
-  Future<void> paste() async {
-    ClipboardData? data = await Clipboard.getData('text/plain');
-    if (data?.text != null) {
-      for (var i = 0; i < data!.text!.length; i++) {
-        add(data.text![i]);
-      }
+  void addSpace() {
+    _chars.insert(_cursorPosition, ' ');
+    _cursorPosition++;
+    notifyListeners();
+  }
+
+  void clear() {
+    _chars.clear();
+    _cursorPosition = 0;
+    notifyListeners();
+  }
+
+  // ================================
+  // CURSOR CONTROL
+  // ================================
+  void moveLeft() {
+    if (_cursorPosition > 0) {
+      _cursorPosition--;
+      notifyListeners();
     }
   }
 
-  void clear() { _value = ''; _cursorPosition = 0; notifyListeners(); }
+  void moveRight() {
+    if (_cursorPosition < _chars.length) {
+      _cursorPosition++;
+      notifyListeners();
+    }
+  }
 
+  void setCursor(int position) {
+    _cursorPosition = position.clamp(0, _chars.length);
+    notifyListeners();
+  }
 
-
+  // ================================
+  // CASE TOGGLE
+  // ================================
   void toggleCase() {
     _isUpperCase = !_isUpperCase;
     notifyListeners();
   }
-  void addSpace() {
-    _value += ' ';
-    notifyListeners();
+
+  // ================================
+  // PASTE SUPPORT
+  // ================================
+  Future<void> paste() async {
+    final data = await Clipboard.getData('text/plain');
+    if (data?.text != null && data!.text!.isNotEmpty) {
+      final text = data.text!;
+      _chars.insertAll(_cursorPosition, text.split(''));
+      _cursorPosition += text.length;
+      notifyListeners();
+    }
   }
-
 }
-

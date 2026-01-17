@@ -52,6 +52,7 @@ dependencies:
   local_auth: ^2.1.6
   flutter_local_notifications: ^17.1.2
   uuid: ^4.4.0
+  battery_plus: ^6.0.1
 
 dev_dependencies:
   flutter_test:

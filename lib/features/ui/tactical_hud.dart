@@ -1,80 +1,91 @@
+import 'dart:async';
+
+import 'package:animate_do/animate_do.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/locator.dart';
 import '../../core/mesh_service.dart';
 import '../../core/network_monitor.dart';
+import '../../core/ultrasonic_service.dart';
+import '../theme/app_colors.dart';
 
-enum GridStatus { cloud, mesh, isolated }
+class TacticalHUD extends StatefulWidget {
+  @override
+  State<TacticalHUD> createState() => _TacticalHUDState();
+}
 
-class TacticalHUD extends StatelessWidget {
+class _TacticalHUDState extends State<TacticalHUD> {
+  String? _lastAcousticSignal;
+  Timer? _displayTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    // Подписываемся на Сонар прямо в HUD
+    locator<UltrasonicService>().sonarMessages.listen((msg) {
+      if (mounted) {
+        setState(() {
+          _lastAcousticSignal = msg.startsWith("LNK:") ? "HANDSHAKE DETECTED" : "DATA PACKET INCOMING";
+        });
+
+        // Скрываем надпись через 3 секунды
+        _displayTimer?.cancel();
+        _displayTimer = Timer(const Duration(seconds: 3), () {
+          if (mounted) setState(() => _lastAcousticSignal = null);
+        });
+      }
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final mesh = context.watch<MeshService>();
-    final role = NetworkMonitor().currentRole;
-
-    GridStatus status = GridStatus.isolated;
-    if (role == MeshRole.BRIDGE) status = GridStatus.cloud;
-    else if (mesh.isP2pConnected) status = GridStatus.mesh;
+    final isOnline = NetworkMonitor().currentRole == MeshRole.BRIDGE;
 
     return Container(
-      height: 40,
-      width: double.infinity,
+      height: 50,
       decoration: BoxDecoration(
-        color: _getStatusColor(status).withOpacity(0.15),
-        border: Border(bottom: BorderSide(color: _getStatusColor(status), width: 0.5)),
+        color: _lastAcousticSignal != null ? AppColors.sonarPurple.withOpacity(0.2) : AppColors.surface,
+        border: Border(bottom: BorderSide(color: _lastAcousticSignal != null ? AppColors.sonarPurple : AppColors.white10)),
       ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
+      child: Stack(
+        alignment: Alignment.center,
         children: [
-          _buildPulseDot(status),
-          const SizedBox(width: 8),
-          Text(
-            _getStatusLabel(status),
-            style: GoogleFonts.orbitron(
-                color: _getStatusColor(status),
-                fontSize: 10,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 1.2
+          // Основной статус
+          if (_lastAcousticSignal == null)
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _buildPulseDot(isOnline ? AppColors.cloudGreen : AppColors.gridCyan),
+                const SizedBox(width: 10),
+                Text(isOnline ? "UPLINK SECURED" : "MESH ACTIVE",
+                    style: GoogleFonts.orbitron(fontSize: 10, color: Colors.white, fontWeight: FontWeight.bold)),
+              ],
             ),
-          ),
-          if (status == GridStatus.mesh) ...[
-            const SizedBox(width: 10),
-            Text(
-              "| NODES: ${mesh.nearbyNodes.length}",
-              style: TextStyle(color: Colors.white38, fontSize: 9),
-            )
-          ]
+
+          // 🔥 ВИЗУАЛИЗАЦИЯ СОНАРА
+          if (_lastAcousticSignal != null)
+            FadeInDown(
+              duration: const Duration(milliseconds: 300),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Pulse(infinite: true, child: Icon(Icons.waves, color: AppColors.sonarPurple, size: 16)),
+                  const SizedBox(width: 10),
+                  Text(_lastAcousticSignal!,
+                      style: GoogleFonts.russoOne(fontSize: 10, color: AppColors.sonarPurple, letterSpacing: 1)),
+                ],
+              ),
+            ),
         ],
       ),
     );
   }
 
-  Color _getStatusColor(GridStatus s) {
-    switch(s) {
-      case GridStatus.cloud: return Colors.greenAccent;
-      case GridStatus.mesh: return Colors.cyanAccent;
-      case GridStatus.isolated: return Colors.orangeAccent;
-    }
-  }
-
-  String _getStatusLabel(GridStatus s) {
-    switch(s) {
-      case GridStatus.cloud: return "UPLINK SECURED";
-      case GridStatus.mesh: return "GRID ACTIVE (P2P)";
-      case GridStatus.isolated: return "STEALTH MODE (AIR-GAP)";
-    }
-  }
-
-  Widget _buildPulseDot(GridStatus s) {
-    return Container(
-      width: 8, height: 8,
-      decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: _getStatusColor(s),
-          boxShadow: [BoxShadow(color: _getStatusColor(s), blurRadius: 4)]
-      ),
-    );
+  Widget _buildPulseDot(Color color) {
+    return Container(width: 6, height: 6, decoration: BoxDecoration(shape: BoxShape.circle, color: color));
   }
 }

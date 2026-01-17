@@ -2,89 +2,57 @@ import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:memento_mori_app/core/local_db_service.dart';
 import 'package:memento_mori_app/l10n/app_localizations.dart';
 import 'package:memento_mori_app/core/http_override.dart';
 import 'package:memento_mori_app/core/api_service.dart';
 import 'package:memento_mori_app/splash_screen.dart';
 import 'package:provider/provider.dart';
-import 'package:wakelock_plus/wakelock_plus.dart'; // 🔥 Добавлено
+import 'package:wakelock_plus/wakelock_plus.dart';
 
+import 'core/MeshOrchestrator.dart';
 import 'core/background_service.dart';
 import 'core/gossip_manager.dart';
 import 'core/locator.dart';
+import 'core/mesh_permission_screen.dart';
 import 'core/mesh_service.dart';
+import 'core/native_mesh_service.dart';
 import 'core/websocket_service.dart';
 
+
 void main() async {
-  // 1. Инициализация привязок Flutter
   WidgetsFlutterBinding.ensureInitialized();
-
-  // 2. Инициализация GetIt
   setupLocator();
+  locator<TacticalMeshOrchestrator>().start();
 
-  // 3. Инициализация фонового сервиса
+  NativeMeshService.init();
   BackgroundService.init();
   await WebSocketService().initNotifications();
+  await WakelockPlus.enable();
 
-  // 🔥 ВКЛЮЧАЕМ WAKELOCK ДЛЯ TECNO (Не даем засыпать основному процессу)
-  try {
-    WakelockPlus.enable();
-  } catch (e) {
-    print("WakeLock Error: $e");
-  }
-
-  Object? initialError;
-  StackTrace? initialStack;
-
-  try {
-    HttpOverrides.global = MyHttpOverrides();
-    ApiService.init();
-
-    // 🔥 КРИТИЧЕСКАЯ ДОБАВКА:
-    // После инициализации всех систем, запускаем цикл активного Gossip
-    // Это заставит телефон искать соседей и подкидывать им данные из Outbox
-    final gossip = locator<GossipManager>();
-    gossip.startEpidemicCycle();
-
-    print("🦠 [System] Gossip Epidemic Cycle: ACTIVE");
-
-  } catch (e, stack) {
-    initialError = e;
-    initialStack = stack;
-  }
+  bool isFirstLaunch = await LocalDatabaseService().isFirstLaunch();
 
   runApp(
     MultiProvider(
       providers: [
         ChangeNotifierProvider.value(value: locator<MeshService>()),
       ],
-      child: initialError != null
-          ? ErrorView(error: initialError.toString(), stack: initialStack.toString())
-          : const MyApp(),
+      child: MyApp(isFirstLaunch: isFirstLaunch),
     ),
   );
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  final bool isFirstLaunch;
+  const MyApp({super.key, required this.isFirstLaunch});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Memento Mori',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark().copyWith(
-        scaffoldBackgroundColor: const Color(0xFF121212),
-        visualDensity: VisualDensity.adaptivePlatformDensity,
-      ),
-      localizationsDelegates: const [
-        AppLocalizations.delegate,
-        GlobalMaterialLocalizations.delegate,
-        GlobalWidgetsLocalizations.delegate,
-        GlobalCupertinoLocalizations.delegate,
-      ],
-      supportedLocales: const [Locale('en', ''), Locale('ru', '')],
-      home: const SplashScreen(),
+      theme: ThemeData.dark().copyWith(scaffoldBackgroundColor: const Color(0xFF121212)),
+      home: isFirstLaunch ? const MeshPermissionScreen() : const SplashScreen(),
     );
   }
 }
@@ -105,11 +73,13 @@ class ErrorView extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text("🚨 CRASH DETECTED", style: TextStyle(color: Colors.red, fontSize: 22, fontWeight: FontWeight.bold)),
+                const Text("🚨 CRITICAL CORE FAULT",
+                    style: TextStyle(color: Colors.red, fontSize: 22, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 20),
                 Text(error, style: const TextStyle(color: Colors.orange, fontWeight: FontWeight.bold)),
                 const Divider(color: Colors.white24),
-                Text(stack, style: const TextStyle(color: Colors.greenAccent, fontSize: 10, fontFamily: 'monospace')),
+                Text(stack,
+                    style: const TextStyle(color: Colors.greenAccent, fontSize: 10, fontFamily: 'monospace')),
               ],
             ),
           ),

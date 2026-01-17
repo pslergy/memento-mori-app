@@ -1,22 +1,29 @@
-// lib/core/mesh_protocol.dart
 import 'dart:convert';
 import 'package:uuid/uuid.dart';
 
-enum MeshPacketType {
-  PROXY_REQUEST,  // Призрак просит Мост выполнить запрос
-  PROXY_RESPONSE, // Мост возвращает ответ Призраку
-}
-
 class MeshPacket {
   final String id;
-  final String type; // 'REQ' or 'RES'
+  final String type; // 'REQ' (Request), 'RES' (Response)
   final Map<String, dynamic> payload;
+  final String? senderIp; // IP отправителя для обратного ответа
 
   MeshPacket({
     required this.id,
     required this.type,
     required this.payload,
+    this.senderIp,
   });
+
+  // 🔥 ТОТ САМЫЙ МЕТОД: Превращает Map из JSON в объект MeshPacket
+  factory MeshPacket.fromMap(Map<String, dynamic> map, {String? ip}) {
+    return MeshPacket(
+      id: map['id'] ?? map['h'] ?? const Uuid().v4(),
+      type: map['type'] ?? 'REQ',
+      // Берем payload, если он есть, иначе считаем всю мапу полезной нагрузкой
+      payload: Map<String, dynamic>.from(map['payload'] ?? map),
+      senderIp: ip,
+    );
+  }
 
   // Создать запрос (от Призрака к Мосту)
   static MeshPacket createRequest(String method, String endpoint, Map<String, String> headers, dynamic body) {
@@ -28,6 +35,7 @@ class MeshPacket {
         'endpoint': endpoint,
         'headers': headers,
         'body': body,
+        'karma': 0, // Карма отправителя (подтянется из профиля)
       },
     );
   }
@@ -35,7 +43,7 @@ class MeshPacket {
   // Создать ответ (от Моста к Призраку)
   static MeshPacket createResponse(String requestId, int statusCode, dynamic body) {
     return MeshPacket(
-      id: requestId, // Используем ID запроса, чтобы связать их
+      id: requestId,
       type: 'RES',
       payload: {
         'statusCode': statusCode,
@@ -50,12 +58,10 @@ class MeshPacket {
     'payload': payload,
   });
 
+  // Для обратной совместимости, если где-то используется старый метод
   factory MeshPacket.fromJson(String source) {
     final map = jsonDecode(source);
-    return MeshPacket(
-      id: map['id'],
-      type: map['type'],
-      payload: Map<String, dynamic>.from(map['payload']),
-    );
+    return MeshPacket.fromMap(map);
   }
 }
+

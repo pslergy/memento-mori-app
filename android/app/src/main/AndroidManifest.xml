@@ -23,10 +23,13 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
 
+
     <application
         android:name="${applicationName}"
         android:label="Calculator"
         android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
         android:usesCleartextTraffic="true">
 
         <!-- Основная Activity (Калькулятор) -->

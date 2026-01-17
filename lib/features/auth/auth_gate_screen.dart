@@ -1,7 +1,10 @@
-// lib/features/auth/auth_gate_screen.dart
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:animate_do/animate_do.dart';
+
+import '../theme/app_colors.dart';
 import 'login_screen.dart';
-import 'registration_screen.dart'; // Наш старый экран
+import 'registration_screen.dart';
 
 class AuthGateScreen extends StatelessWidget {
   const AuthGateScreen({super.key});
@@ -9,19 +12,76 @@ class AuthGateScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Center(
-        // TODO: Сделать красивый дизайн с лого
+      backgroundColor: AppColors.background,
+      body: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 40),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            ElevatedButton(
-              onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const LoginScreen())),
-              child: const Text('Войти'),
+            FadeInDown(
+              child: Icon(Icons.shield_outlined, size: 80, color: AppColors.gridCyan),
             ),
-            ElevatedButton(
-              onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const RegistrationScreen())),
-              child: const Text('Создать аккаунт'),
+            const SizedBox(height: 30),
+            Text("GRID ACCESS",
+                style: GoogleFonts.orbitron(fontSize: 22, color: Colors.white, letterSpacing: 5)),
+            const SizedBox(height: 10),
+            Text("Authorization required to establish uplink.",
+                textAlign: TextAlign.center,
+                style: TextStyle(color: AppColors.textDim, fontSize: 12)),
+            const SizedBox(height: 60),
+
+            // КНОПКА: ВОЙТИ
+            FadeInLeft(
+              child: _AuthButton(
+                label: "RESTORE ACCESS",
+                desc: "I already have an identity",
+                color: Colors.white,
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LoginScreen())),
+              ),
             ),
+            const SizedBox(height: 20),
+
+            // КНОПКА: СОЗДАТЬ
+            FadeInRight(
+              child: _AuthButton(
+                label: "CREATE IDENTITY",
+                desc: "Generate new Nomad profile",
+                color: AppColors.gridCyan,
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const RegistrationScreen())),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AuthButton extends StatelessWidget {
+  final String label;
+  final String desc;
+  final Color color;
+  final VoidCallback onTap;
+
+  const _AuthButton({required this.label, required this.desc, required this.color, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(15),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+            border: Border.all(color: color.withOpacity(0.3)),
+            borderRadius: BorderRadius.circular(15),
+            color: color.withOpacity(0.05)
+        ),
+        child: Column(
+          children: [
+            Text(label, style: GoogleFonts.russoOne(color: color, fontSize: 14)),
+            Text(desc, style: TextStyle(color: AppColors.textDim, fontSize: 8)),
           ],
         ),
       ),

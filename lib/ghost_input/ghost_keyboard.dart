@@ -19,28 +19,37 @@ class _GhostKeyboardState extends State<GhostKeyboard> {
   KeyboardMode _mode = KeyboardMode.letters;
   KeyboardLang _lang = KeyboardLang.en;
 
-  // --- Раскладки букв ---
-  final enRow1 = ['q','w','e','r','t','y','u','i','o','p'];
-  final enRow2 = ['a','s','d','f','g','h','j','k','l'];
-  final enRow3 = ['z','x','c','v','b','n','m'];
-
-  final ruRow1 = ['й','ц','у','к','е','н','г','ш','щ','з','х','ъ'];
-  final ruRow2 = ['ф','ы','в','а','п','р','о','л','д','ж','э'];
-  final ruRow3 = ['я','ч','с','м','и','т','ь','б','ю'];
-
-  // --- Символы ---
-  final symRow1 = ['1','2','3','4','5','6','7','8','9','0'];
-  final symRow2 = ['@','#','\$','%','&','-','+','(',')','/'];
-  final symRow3 = ['*','"','\'',':',';','!','?','_','=','\\'];
-
-  // --- Смайлы ---
-  final emojis = [
-    '😂','❤️','👍','🙌','😍','🤔','😊','🔥','😭','✨',
-    '🚀','💀','💯','🙏','🤡','👀','⚡️','📍','🛡️','🔑',
-    '🔓','💊','🚬','💣','🔫','📞','💻','⌛','📢','❌'
+  // --- Буквы ---
+  final enLetters = [
+    ['q','w','e','r','t','y','u','i','o','p'],
+    ['a','s','d','f','g','h','j','k','l'],
+    ['z','x','c','v','b','n','m']
   ];
 
-  Widget _key(String label, VoidCallback onTap, {int flex = 1, Color? color, bool isActive = false, VoidCallback? onLongPress}) {
+  final ruLetters = [
+    ['й','ц','у','к','е','н','г','ш','щ','з','х','ъ'],
+    ['ф','ы','в','а','п','р','о','л','д','ж','э'],
+    ['я','ч','с','м','и','т','ь','б','ю']
+  ];
+
+  // --- Символы и цифры ---
+  final symbols = [
+    ['1','2','3','4','5','6','7','8','9','0'],
+    ['@','#','\$','%','&','-','+','(',')','/'],
+    ['.',',','_','=',';',':','!','?','"','\'']
+  ];
+
+  // --- Смайлы ---
+  final List<List<String>> emojiPages = [
+    ['😂','❤️','👍','🙌','😍','🤔','😊','🔥','😭','✨'],
+    ['🚀','💀','💯','🙏','🤡','👀','⚡️','📍','🛡️','🔑'],
+    ['🔓','💊','🚬','💣','🔫','📞','💻','⌛','📢','❌']
+  ];
+
+  int _emojiPage = 0;
+
+  Widget _key(String label, VoidCallback onTap,
+      {int flex = 1, Color? color, bool isActive = false, VoidCallback? onLongPress}) {
     return Expanded(
       flex: flex,
       child: Padding(
@@ -49,7 +58,7 @@ class _GhostKeyboardState extends State<GhostKeyboard> {
           color: Colors.transparent,
           child: InkWell(
             onTap: () {
-              HapticFeedback.lightImpact(); // 🔥 Вибрация при нажатии
+              HapticFeedback.lightImpact();
               onTap();
             },
             onLongPress: onLongPress,
@@ -69,8 +78,7 @@ class _GhostKeyboardState extends State<GhostKeyboard> {
                   style: TextStyle(
                       color: isActive ? Colors.black : Colors.white,
                       fontSize: 17,
-                      fontWeight: FontWeight.bold
-                  ),
+                      fontWeight: FontWeight.bold),
                 ),
               ),
             ),
@@ -80,46 +88,80 @@ class _GhostKeyboardState extends State<GhostKeyboard> {
     );
   }
 
-  // --- Сборка букв с лонг-прессом на удаление ---
-  List<Widget> _buildAlphaRows() {
-    final bool isEn = _lang == KeyboardLang.en;
-    final r1 = isEn ? enRow1 : ruRow1;
-    final r2 = isEn ? enRow2 : ruRow2;
-    final r3 = isEn ? enRow3 : ruRow3;
-
+  // --- Ряды букв ---
+  List<Widget> _buildLetterRows() {
+    final letters = _lang == KeyboardLang.en ? enLetters : ruLetters;
     return [
-      Row(children: r1.map((l) => _key(widget.controller.isUpperCase ? l.toUpperCase() : l, () => widget.controller.add(l))).toList()),
+      Row(children: letters[0].map((l) => _key(widget.controller.isUpperCase ? l.toUpperCase() : l, () => widget.controller.add(l))).toList()),
       Padding(
-        padding: EdgeInsets.symmetric(horizontal: isEn ? 15 : 5),
-        child: Row(children: r2.map((l) => _key(widget.controller.isUpperCase ? l.toUpperCase() : l, () => widget.controller.add(l))).toList()),
+        padding: const EdgeInsets.symmetric(horizontal: 5),
+        child: Row(children: letters[1].map((l) => _key(widget.controller.isUpperCase ? l.toUpperCase() : l, () => widget.controller.add(l))).toList()),
       ),
       Row(children: [
-        _key('⇧', () => widget.controller.toggleCase(), isActive: widget.controller.isUpperCase),
-        ...r3.map((l) => _key(widget.controller.isUpperCase ? l.toUpperCase() : l, () => widget.controller.add(l))).toList(),
-        // 🔥 Кнопка Backspace с LongPress очисткой
-        _key('⌫',
-                () => widget.controller.backspace(),
-            onLongPress: () => widget.controller.clear(), // Очистить всё поле
+        _key('⇧', () => setState(() => widget.controller.toggleCase()), isActive: widget.controller.isUpperCase),
+        ...letters[2].map((l) => _key(widget.controller.isUpperCase ? l.toUpperCase() : l, () => widget.controller.add(l))).toList(),
+        _key('⌫', () => widget.controller.backspace(),
+            onLongPress: () {
+              // Удаляем слово
+              while(widget.controller.cursorPosition > 0 && widget.controller.value[widget.controller.cursorPosition-1] != ' ') {
+                widget.controller.backspace();
+              }
+            },
             color: const Color(0xFF444444)),
       ]),
     ];
   }
 
-  // --- Сборка символов с лонг-прессом ---
+  // --- Ряды символов ---
   List<Widget> _buildSymbolRows() {
-    return [
-      Row(children: symRow1.map((s) => _key(s, () => widget.controller.add(s))).toList()),
-      Row(children: symRow2.map((s) => _key(s, () => widget.controller.add(s))).toList()),
-      Row(children: [
-        _key('.', () => widget.controller.add('.')),
-        ...symRow3.map((s) => _key(s, () => widget.controller.add(s))).toList(),
-        // 🔥 Тут тоже лонг-пресс
-        _key('⌫',
-                () => widget.controller.backspace(),
-            onLongPress: () => widget.controller.clear(),
-            color: const Color(0xFF444444)),
-      ]),
-    ];
+    return symbols.map((row) {
+      return Row(children: row.map((s) => _key(s, () => widget.controller.add(s))).toList());
+    }).toList();
+  }
+
+  // --- Emoji Grid ---
+  Widget _buildEmojiGrid() {
+    final emojis = emojiPages[_emojiPage];
+    return Column(
+      children: [
+        SizedBox(
+          height: 140,
+          child: GridView.builder(
+            padding: const EdgeInsets.all(4),
+            physics: const NeverScrollableScrollPhysics(),
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 5,
+              mainAxisSpacing: 4,
+              crossAxisSpacing: 4,
+              childAspectRatio: 1,
+            ),
+            itemCount: emojis.length,
+            itemBuilder: (context, index) {
+              return InkWell(
+                onTap: () => widget.controller.add(emojis[index]),
+                child: Center(child: Text(emojis[index], style: const TextStyle(fontSize: 28))),
+              );
+            },
+          ),
+        ),
+        // Page selector
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: List.generate(emojiPages.length, (i) => GestureDetector(
+            onTap: () => setState(() => _emojiPage = i),
+            child: Container(
+              margin: const EdgeInsets.all(2),
+              width: 10,
+              height: 10,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: i == _emojiPage ? Colors.redAccent : Colors.grey,
+              ),
+            ),
+          )),
+        )
+      ],
+    );
   }
 
   @override
@@ -133,45 +175,37 @@ class _GhostKeyboardState extends State<GhostKeyboard> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // 1. Основные ряды (Буквы/Символы/Смайлы)
-              if (_mode == KeyboardMode.letters) ..._buildAlphaRows(),
+              // Основные ряды
+              if (_mode == KeyboardMode.letters) ..._buildLetterRows(),
               if (_mode == KeyboardMode.symbols) ..._buildSymbolRows(),
               if (_mode == KeyboardMode.emojis) _buildEmojiGrid(),
 
               const SizedBox(height: 8),
 
-              // 🔥 НОВЫЙ РЯД: УПРАВЛЕНИЕ КУРСОРОМ И ВСТАВКА
+              // Быстрая вставка символов
               Row(
-                children: [
-                  _key('⬅️', () => widget.controller.moveLeft(), color: const Color(0xFF333333)),
-                  _key('PASTE', () => widget.controller.paste(), flex: 2, color: const Color(0xFF333333)),
-                  _key('➡️', () => widget.controller.moveRight(), color: const Color(0xFF333333)),
-                ],
+                children: ['.', ',', '@', '_', '-', '/']
+                    .map((s) => _key(s, () => widget.controller.add(s), flex: 1))
+                    .toList(),
               ),
 
               const SizedBox(height: 4),
 
-              // 2. НИЖНИЙ РЯД УПРАВЛЕНИЯ
+              // Нижний ряд управления
               Row(
                 children: [
-                  // Смена языка
                   _key(_lang == KeyboardLang.en ? 'EN' : 'RU',
                           () => setState(() => _lang = _lang == KeyboardLang.en ? KeyboardLang.ru : KeyboardLang.en),
-                      color: const Color(0xFF3A3A3A), flex: 2
-                  ),
-                  // Смена режима
+                      color: const Color(0xFF3A3A3A), flex: 2),
                   _key(_mode == KeyboardMode.letters ? '?123' : 'ABC',
-                          () => setState(() => _mode = _mode == KeyboardMode.symbols ? KeyboardMode.letters : KeyboardMode.symbols),
-                      color: const Color(0xFF444444), flex: 2
-                  ),
-                  // Пробел
+                          () => setState(() {
+                        _mode = _mode == KeyboardMode.symbols ? KeyboardMode.letters : KeyboardMode.symbols;
+                      }),
+                      color: const Color(0xFF444444), flex: 2),
                   _key('SPACE', () => widget.controller.add(' '), flex: 4),
-                  // Смайлы
                   _key(_mode == KeyboardMode.emojis ? 'ABC' : '😊',
                           () => setState(() => _mode = _mode == KeyboardMode.emojis ? KeyboardMode.letters : KeyboardMode.emojis),
-                      color: const Color(0xFF444444), flex: 2
-                  ),
-                  // Отправить / ОК
+                      color: const Color(0xFF444444), flex: 2),
                   _key('OK', widget.onSend, color: Colors.redAccent, flex: 2),
                 ],
               ),
@@ -179,35 +213,6 @@ class _GhostKeyboardState extends State<GhostKeyboard> {
           ),
         );
       },
-    );
-  }
-
-  // --- Сборка буквенных рядов ---
-
-
-  // --- Сетка смайлов ---
-  Widget _buildEmojiGrid() {
-    return SizedBox(
-      height: 140,
-      child: GridView.builder(
-        padding: const EdgeInsets.all(4),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 7,
-          mainAxisSpacing: 4,
-          crossAxisSpacing: 4,
-          childAspectRatio: 1,
-        ),
-        itemCount: emojis.length,
-        itemBuilder: (context, index) {
-          return InkWell(
-            onTap: () => widget.controller.add(emojis[index]),
-            child: Container(
-              alignment: Alignment.center,
-              child: Text(emojis[index], style: const TextStyle(fontSize: 24)),
-            ),
-          );
-        },
-      ),
     );
   }
 }
