@@ -1,37 +1,124 @@
 # Contributing to Memento Mori
 
-First of all, thank you for showing interest in Memento Mori. This project aims to provide a lifeline for communication in restricted environments, and your help is vital.
+First of all, thank you for your interest in **Memento Mori**.
 
-As a Senior-led project, we maintain high standards for code quality, security, and architectural integrity.
+This project is designed as a communication lifeline for restricted, degraded, or adversarial environments. Contributions are welcome, but the bar for quality, security, and architectural discipline is intentionally high.
 
-## 🚀 How Can You Help?
-*   **Acoustic Layer:** Improving the FSK modulation for the Sonar Link.
-*   **Security Audits:** Reviewing the AES-256-GCM implementation.
-*   **Native Optimization:** Enhancing the Kotlin Foreground Service for better battery life on low-end devices.
+Memento Mori is a **senior-led, security-first project**. Please read this document carefully before contributing.
+
+---
+
+## 🚀 How You Can Contribute
+
+We are especially interested in contributions in the following areas:
+
+* **Acoustic Transport Layer (Sonar Link)**
+  Improving BFSK modulation, symbol timing, synchronization robustness, or Goertzel-based detection accuracy.
+
+* **Security Review & Hardening**
+  Auditing cryptographic flows, including AES-256-GCM usage, key lifecycle management, and offline threat models.
+
+* **Native Android Optimization**
+  Enhancing Kotlin Foreground Services, reducing wake locks, and improving battery behavior on low-end or vendor-modified devices.
+
+If you are unsure where to start, open an Issue describing your background and interests.
+
+---
 
 ## 🛠 Development Process
 
-### 1. Branching Strategy
-We use a simplified GitFlow. 
-*   `main` — Production-ready code only.
-*   `feature/feature-name` — New features.
-*   `fix/bug-name` — Bug fixes.
+### 1️⃣ Branching Strategy
 
-### 2. Pull Request (PR) Guidelines
-*   **Atomic Commits:** Keep your commits small and focused.
-*   **Security First:** Ensure no sensitive data or unencrypted logs are included.
-*   **Documentation:** Update the README or inline comments if you change core logic.
-*   **Testing:** Verify mesh connectivity on at least two physical devices (if possible).
+We use a simplified GitFlow model:
 
-### 3. Coding Standards
-*   **Flutter:** Use `flutter_lints`. Follow the BLoC/Cubit pattern for state management.
-*   **Kotlin:** Maintain the use of Coroutines and fixed thread pools for networking to prevent hardware overloads.
+* `main`
+  Production-ready, stable code only.
 
-## 🛡️ Security & Privacy
-Since this is a privacy-focused tool, please ensure all new code adheres to the **Zero-Knowledge** principle. We do not accept features that require centralized telemetry or user data collection.
+* `feature/<feature-name>`
+  New functionality or experimental subsystems.
 
-## 📫 Questions?
-If you have questions about the architecture or threat model, please open an **Issue** with the `question` label.
+* `fix/<bug-name>`
+  Bug fixes and stability improvements.
+
+Direct commits to `main` are not accepted.
 
 ---
+
+### 2️⃣ Pull Request (PR) Guidelines
+
+All Pull Requests must follow these rules:
+
+* **Atomic Commits**
+  Each commit should represent a single logical change.
+
+* **Security First**
+  No plaintext secrets, no debug backdoors, no unencrypted logs.
+
+* **Documentation Required**
+  If you modify core logic, update:
+
+  * Inline documentation, and/or
+  * README / architecture notes where appropriate.
+
+* **Real Device Testing**
+  Whenever possible, validate mesh behavior on **at least two physical devices**. Emulators are insufficient for Bluetooth, Audio, and Wi-Fi Direct layers.
+
+PRs that do not meet these criteria may be closed without review.
+
+---
+
+### 3️⃣ Coding Standards
+
+#### Flutter / Dart
+
+* Follow `flutter_lints`
+* Deterministic state handling only
+* Prefer **BLoC / Cubit / FSM-based logic**
+* Avoid background work outside orchestrator control
+
+#### Kotlin / Android
+
+* Use **Coroutines** responsibly
+* Fixed or bounded thread pools only
+* No unbounded background execution
+* Respect hardware interlocks (Bluetooth / Audio / Wi-Fi)
+
+---
+
+## 🛡️ Security & Privacy Principles
+
+Memento Mori follows a **Zero-Knowledge** design philosophy.
+
+### We do NOT accept:
+
+* Centralized telemetry
+* Hidden analytics
+* User behavior tracking
+* Cloud-dependent core features
+
+All new code must preserve:
+
+* Offline survivability
+* Plausible deniability
+* Minimal observable surface
+
+If a feature weakens these guarantees, it will be rejected.
+
+---
+
+## 📫 Questions & Discussion
+
+If you have questions about:
+
+* Architecture
+* Threat models
+* Transport layers
+* Identity & merge logic
+
+Please open an **Issue** with the label `question`.
+
+Clear, technical questions are always welcome.
+
+---
+
 *Memento Mori — In an era of total surveillance, privacy is a protocol.*
