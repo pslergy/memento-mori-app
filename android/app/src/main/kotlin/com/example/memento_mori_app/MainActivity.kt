@@ -115,6 +115,7 @@ class MainActivity : FlutterFragmentActivity() {
                     val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                     val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
 
+                    // 🛡️ РЕФЛЕКСИЯ: Проверка активности микрофона (Android 9+)
                     var micInUse = false
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                         try {
@@ -124,26 +125,18 @@ class MainActivity : FlutterFragmentActivity() {
                     }
 
                     state["micActive"] = micInUse
-                    state["isScreenOn"] = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) pm.isInteractive else pm.isScreenOn
+                    state["isScreenOn"] = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) {
+                        pm.isInteractive
+                    } else {
+                        @Suppress("DEPRECATION")
+                        pm.isScreenOn
+                    }
                     state["foregroundApp"] = getForegroundApp()
                     result.success(state)
                 }
                 "engageHardwareLock" -> {
                     engageMicMutex()
                     result.success(true)
-                }
-                "checkActualMicPermission" -> {
-                    // 🔥 ФИЗИЧЕСКАЯ ПРОВЕРКА ДЛЯ TECNO
-                    val hasPerm = ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-                    if (hasPerm) {
-                        var tempRecord: AudioRecord? = null
-                        try {
-                            val bufSize = AudioRecord.getMinBufferSize(44100, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                            tempRecord = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, 44100, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize)
-                            result.success(tempRecord.state == AudioRecord.STATE_INITIALIZED)
-                        } catch (e: Exception) { result.success(false) }
-                        finally { tempRecord?.release() }
-                    } else result.success(false)
                 }
                 else -> result.notImplemented()
             }
@@ -153,30 +146,34 @@ class MainActivity : FlutterFragmentActivity() {
         p2pMethodChannel?.setMethodCallHandler { call, result ->
             when (call.method) {
                 "startDiscovery" -> {
-                    manager.discoverPeers(wifiP2pChannel!!, object : WifiP2pManager.ActionListener {
-                        override fun onSuccess() { Log.d("P2P", "Discovery started"); result.success(true) }
-                        override fun onFailure(r: Int) { result.error("P2P_ERR", "Fail", r) }
+                    // Используем нативный менеджер напрямую для надежности
+                    manager.discoverPeers(wifiP2pChannel, object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() {
+                            Log.d("P2P", "Discovery started")
+                            result.success(true)
+                        }
+                        override fun onFailure(reason: Int) {
+                            Log.e("P2P", "Discovery failed: $reason")
+                            result.error("P2P_ERR", "Failed to start", reason)
+                        }
                     })
                 }
                 "stopDiscovery" -> {
-                    manager.stopPeerDiscovery(wifiP2pChannel!!, object : WifiP2pManager.ActionListener {
+                    manager.stopPeerDiscovery(wifiP2pChannel, object : WifiP2pManager.ActionListener {
                         override fun onSuccess() { result.success(true) }
-                        override fun onFailure(r: Int) { result.error("P2P_ERR", "Stop failed", r) }
+                        override fun onFailure(reason: Int) { result.error("P2P_ERR", "Stop failed", reason) }
                     })
                 }
-                "connect" -> {
-                    val addr = call.argument<String>("deviceAddress")
-                    // ТАКТИЧЕСКИЙ ВЫВОД НА ПЕРЕДНИЙ ПЛАН
-                    val intent = Intent(this, MainActivity::class.java).apply { addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT) }
-                    startActivity(intent)
-                    if (addr != null) { p2pHelper?.connect(addr); result.success(true) }
-                    else result.error("ERR", "No addr", null)
+
+                "forceReset" -> {
+                    p2pHelper?.forceReset { result.success(true) }
                 }
-                "forceReset" -> p2pHelper?.forceReset { result.success(true) }
                 "getHardwareCapabilities" -> {
                     val pm = packageManager
                     val caps = HashMap<String, Any?>()
-                    caps["hasAware"] = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) pm.hasSystemFeature(PackageManager.FEATURE_WIFI_AWARE) else false
+                    caps["hasAware"] = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        pm.hasSystemFeature(PackageManager.FEATURE_WIFI_AWARE)
+                    } else false
                     caps["hasDirect"] = pm.hasSystemFeature(PackageManager.FEATURE_WIFI_DIRECT)
                     caps["androidVersion"] = Build.VERSION.SDK_INT
                     result.success(caps)
@@ -192,15 +189,22 @@ class MainActivity : FlutterFragmentActivity() {
                     if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                         acousticReceiver?.start()
                         result.success(true)
-                    } else result.error("PERM_DENIED", "Mic needed", null)
+                    } else {
+                        result.error("PERM_DENIED", "Mic permission required", null)
+                    }
                 }
-                "stopListening" -> { acousticReceiver?.stop(); result.success(true) }
+                "stopListening" -> {
+                    acousticReceiver?.stop()
+                    result.success(true)
+                }
                 "runFrequencySweep" -> {
                     Thread {
                         try {
                             val spectrum = UltrasonicCalibrator.runSweep()
                             runOnUiThread { result.success(spectrum) }
-                        } catch (e: Exception) { runOnUiThread { result.error("FFT_ERROR", e.message, null) } }
+                        } catch (e: Exception) {
+                            runOnUiThread { result.error("FFT_ERROR", e.message, null) }
+                        }
                     }.start()
                 }
                 else -> result.notImplemented()
@@ -210,18 +214,26 @@ class MainActivity : FlutterFragmentActivity() {
         // --- SECURITY HANDLERS: Защита и Камуфляж ---
         securityChannel.setMethodCallHandler { call, result ->
             when (call.method) {
-                "enableSecureMode" -> { window.addFlags(WindowManager.LayoutParams.FLAG_SECURE); result.success(true) }
-                "disableSecureMode" -> { window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE); result.success(true) }
+                "enableSecureMode" -> {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    result.success(true)
+                }
+                "disableSecureMode" -> {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    result.success(true)
+                }
                 "changeIcon" -> {
                     val target = call.argument<String>("targetIcon")
-                    if (target != null) { changeAppIcon(target); result.success(true) }
-                    else result.error("ERR", "Null icon", null)
+                    if (target != null) {
+                        changeAppIcon(target)
+                        result.success(true)
+                    } else result.error("ERR", "Null icon target", null)
                 }
                 else -> result.notImplemented()
             }
         }
 
-        // --- GOOGLE API ---
+        // --- GOOGLE API: Проверка сервисов ---
         googleChannel.setMethodCallHandler { call, result ->
             if (call.method == "isAvailable") {
                 val api = GoogleApiAvailability.getInstance()

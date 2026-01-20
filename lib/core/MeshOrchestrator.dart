@@ -116,20 +116,15 @@ extension MeshNetworkStarter on TacticalMeshOrchestrator {
     _startBLE();
 
     // 4️⃣ Sonar (Acoustic Plane) — проверка разрешения
-    // 4️⃣ Sonar (Acoustic Plane)
     Future<void> sonarInit() async {
-      // Проверяем, дали ли нам права ранее
-      var status = await Permission.microphone.status;
+      if (_sonar.isTransmitting) return;
 
-      // Если прав НЕТ — мы НЕ вызываем request().
-      // Мы просто пишем в лог и выходим.
-      // Это предотвратит сворачивание приложения при авто-запуске.
-      if (!status.isGranted) {
-        _log("⚠️ Sonar Init skipped: Permission missing. User must grant it manually via UI.");
+      bool micGranted = await _requestMicrophonePermission(context);
+      if (!micGranted) {
+        _log("⚠️ Microphone permission denied. Sonar will remain off.");
         return;
       }
 
-      // Если права ЕСТЬ, запускаем
       try {
         await _startSonar();
         _log("🔊 Sonar initialized successfully");
@@ -151,24 +146,26 @@ extension MeshNetworkStarter on TacticalMeshOrchestrator {
 
   /// 🔹 Запрос разрешения на микрофон (Just-in-time)
   Future<bool> _requestMicrophonePermission(BuildContext? context) async {
-    // Если мы в фоне — возвращаем false и даже не спрашиваем систему.
-    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
-      return false;
-    }
-    // 1. Сначала просто проверяем статус
-    var status = await Permission.microphone.status;
-
-    // Если уже разрешено - сразу возвращаем true, НЕ ВЫЗЫВАЯ .request()
+    final status = await Permission.microphone.status;
     if (status.isGranted) return true;
 
-    // Если мы в фоне - даже не пытаемся просить, это вызовет краш UI
-    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
-      return false;
-    }
-
     _log("📢 Requesting microphone permission...");
+
+    // Показать системный диалог
     final result = await Permission.microphone.request();
-    return result.isGranted;
+    if (result.isGranted) return true;
+
+    // Можно показать SnackBar или диалог для объяснения
+    if (context != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            "Microphone permission is required for acoustic offline messaging.",
+          ),
+        ),
+      );
+    }
+    return false;
   }
 
   /// 🔹 BLE стартер (Control Plane)
@@ -191,26 +188,17 @@ extension MeshNetworkStarter on TacticalMeshOrchestrator {
 
 
 
-class TacticalMeshOrchestrator with WidgetsBindingObserver {
-
-  static final TacticalMeshOrchestrator _instance = TacticalMeshOrchestrator._internal();
+class TacticalMeshOrchestrator {
+  static final TacticalMeshOrchestrator _instance =
+  TacticalMeshOrchestrator._internal();
   factory TacticalMeshOrchestrator() => _instance;
-
-
-
+  TacticalMeshOrchestrator._internal();
 
   final MeshService _mesh = locator<MeshService>();
   final BluetoothMeshService _bt = locator<BluetoothMeshService>();
   final UltrasonicService _sonar = locator<UltrasonicService>();
   final GossipManager _gossip = locator<GossipManager>();
   final ReversePathRegistry reversePath = ReversePathRegistry();
-
-  bool _isAppInForeground = true;
-
-  TacticalMeshOrchestrator._internal() {
-    // 2. Подписываемся на события жизненного цикла
-    WidgetsBinding.instance.addObserver(this);
-  }
 
   final Map<String, RouteInfo> _routingTable = {};
   int _myHopsToInternet = 255;
@@ -258,29 +246,7 @@ class TacticalMeshOrchestrator with WidgetsBindingObserver {
   }
   void _log(String m) => print("🧠 [Orchestrator] $m");
 
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
 
-    _isAppInForeground = state == AppLifecycleState.resumed;
-
-    if (!_isAppInForeground) {
-      // Если свернули - СРОЧНО выключаем Сонар
-      _stopSonarForce();
-    }
-  }
-
-  // Метод экстренной остановки
-  void _stopSonarForce() {
-    if (_sonar.isTransmitting) {
-      _sonar.stop(); // Убедись, что в UltrasonicService есть метод stop()
-      _log("🔇 App backgrounded. Sonar KILLED to prevent OS lock.");
-    }
-  }
-
-  // Не забудь добавить dispose, хотя синглтон живет вечно
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-  }
   // ====================== PUBLIC ======================
   void start() {
     _listenBattery();
@@ -295,17 +261,9 @@ class TacticalMeshOrchestrator with WidgetsBindingObserver {
     _heartbeatTimer?.cancel();
 
     int nextTick = 20 + _rng.nextInt(20);
-
-    // 🔻 ИЗМЕНЕНИЕ: Try-Catch-Finally внутри таймера
     _heartbeatTimer = Timer(Duration(seconds: nextTick), () async {
-      try {
-        await _executeBurstWindow();
-      } catch (e) {
-        _log("❌ Heartbeat arrhythmia: $e");
-      } finally {
-        // Рекурсивный вызов всегда сработает, даже при ошибке
-        _startBiologicalHeartbeat();
-      }
+      await _executeBurstWindow();
+      _startBiologicalHeartbeat();
     });
   }
 
@@ -355,42 +313,24 @@ class TacticalMeshOrchestrator with WidgetsBindingObserver {
       _log("🚀 [Routing] Uplink found: ${bestNextHop.nodeId} (Hops: ${bestNextHop.hopsToInternet})");
 
       try {
-        // 1. Сначала создаем переменную packet (чтобы не было ошибки Undefined name)
+        // Превращаем сообщение в пакет для передачи
         final packet = jsonEncode({
           'type': 'OFFLINE_MSG',
-          'chatId': msg.id, // В твоем коде использовался msg.id как chatId
+          'chatId': msg.id, // или твой ChatRoomId
           'content': msg.content,
           'senderId': msg.senderId,
           'timestamp': msg.createdAt.millisecondsSinceEpoch,
-          'h': msg.id,       // ID сообщения
-          'ttl': 5,          // Время жизни пакета
+          'h': msg.id.hashCode.toString(), // Компактный хеш
+          'ttl': 5, // Начальный TTL
         });
 
-        // 2. Получаем IP адрес соседа
-        final mesh = locator<MeshService>();
-        String? targetIp = mesh.resolveIpForUser(bestNextHop.nodeId);
-
-        // Фолбек: если в карте нет, пробуем использовать nodeId как IP (для старых версий)
-        targetIp ??= bestNextHop.nodeId;
-
-        // Грубая проверка: это вообще IP? (должен содержать точки)
-        if (!targetIp.contains('.')) {
-          _log("⚠️ Cannot route via Wi-Fi: No IP address for ${bestNextHop.nodeId}");
-          // Тут можно было бы добавить отправку через Bluetooth, но пока просто выходим
-          return;
-        }
-
-        // 3. Отправляем на реальный IP
-        await NativeMeshService.sendTcp(packet, host: targetIp);
-
-        // 4. Обновляем статус в базе на "SENT" (чтобы пропали часики)
-        await db.updateMessageStatus(msg.id, "SENT");
-        await db.removeFromOutbox(msg.id);
+        // Передаем через Native-слой (Wi-Fi Direct)
+        // В качестве host используем IP соседа, который ты сохранил в метаданных ноды
+        await NativeMeshService.sendTcp(packet, host: bestNextHop.nodeId);
 
         _log("✅ Signal successfully relayed to next hop.");
       } catch (e) {
         _log("⚠️ Transmission failed: $e. Falling back to Cache.");
-        // Если не вышло - оставляем в Outbox
         await db.addToOutbox(msg, "GRID_SYNC");
       }
     } else {
@@ -525,19 +465,10 @@ class TacticalMeshOrchestrator with WidgetsBindingObserver {
 
   // ====================== SONAR TASK ======================
   Future<void> _startSonar() async {
-    // 1. Проверяем, активно ли приложение
-    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) return;
-
-    // 2. 🔥 ВАЖНОЕ ИЗМЕНЕНИЕ:
-    // Мы НЕ вызываем .request() здесь. Мы только проверяем статус.
-    // Если прав нет — мы просто выходим. Пусть UI показывает пользователю кнопку "Дать права".
-    var status = await Permission.microphone.status;
-    if (!status.isGranted) {
-      _log("🔇 Sonar skipped: Permission not granted yet.");
+    if (_bleActive) {
+      _log("⏳ Skipping Sonar, BLE is active to avoid HAL_LOCKED.");
       return;
     }
-
-    if (_bleActive) return;
     if (_sonar.isTransmitting) return;
 
     _log("🔊 Starting Sonar FFT Sweep...");
@@ -547,8 +478,6 @@ class TacticalMeshOrchestrator with WidgetsBindingObserver {
       _log("⚠️ Sonar task failed: $e");
     }
   }
-
-
 
 
 

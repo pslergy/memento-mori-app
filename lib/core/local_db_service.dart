@@ -350,22 +350,9 @@ class LocalDatabaseService {
     }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
-  // 🔻 ИЗМЕНЕНИЕ: Добавлен параметр limit
-  Future<List<Map<String, dynamic>>> getPendingFromOutbox({int limit = 50}) async {
+  Future<List<Map<String, dynamic>>> getPendingFromOutbox() async {
     final db = await database;
-    // 🔻 ИЗМЕНЕНИЕ: Добавлен LIMIT в SQL запрос
-    return await db.query('outbox', orderBy: 'createdAt ASC', limit: limit);
-  }
-
-  // 🔻 НОВЫЙ МЕТОД: Для обновления статуса после отправки через Mesh
-  Future<void> updateMessageStatus(String id, String status) async {
-    final db = await database;
-    await db.update(
-      'messages',
-      {'status': status},
-      where: 'id = ?',
-      whereArgs: [id],
-    );
+    return await db.query('outbox', orderBy: 'createdAt ASC');
   }
 
   Future<void> removeFromOutbox(String id) async {

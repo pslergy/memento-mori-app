@@ -6,22 +6,6 @@ import 'locator.dart';
 import 'mesh_service.dart';
 
 class NativeMeshService {
-  static bool _activated = false;
-
-  /// ❌ НИКАКОГО Bluetooth/Wifi здесь
-  static void preInit() {}
-
-  /// ✅ ТОЛЬКО ПОСЛЕ permissions
-  static Future<void> activate() async {
-    if (_activated) return;
-
-    // Получаем adapters ТОЛЬКО ТУТ
-    // BluetoothAdapter.instance
-    // WifiP2PManager.initialize()
-
-    _activated = true;
-  }
-
   // Канал для Wi-Fi Direct и системных функций
   static const MethodChannel _channel = MethodChannel('memento/wifi_direct');
 

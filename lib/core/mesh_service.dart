@@ -11,7 +11,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:memento_mori_app/core/storage_service.dart';
 import 'package:memento_mori_app/core/ultrasonic_service.dart';
-
+import 'package:permission_handler/permission_handler.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:device_info_plus/device_info_plus.dart';
@@ -52,8 +52,6 @@ enum MeshPacketType {
 class MeshService with ChangeNotifier {
   static final MeshService _instance = MeshService._internal();
   factory MeshService() => _instance;
-  final Map<String, String> _idToIpMap = {};
-
   MeshService._internal() {
     // Запускаем таймер очистки "мертвых" нод раз в 10 секунд
     _cleanupTimer = Timer.periodic(const Duration(seconds: 10), (_) => _pruneDeadNodes());
@@ -666,25 +664,26 @@ class MeshService with ChangeNotifier {
 
   // --- СЕТЕВАЯ ЛОГИКА ---
 
-
-
-
   Future<void> startDiscovery(SignalType type) async {
     if (!_isMeshEnabled) return;
 
     // 🔥 ПРОВЕРКА GPS ДЛЯ BLUETOOTH
+    if (type == SignalType.bluetooth || type == SignalType.mesh) {
+      bool gpsStatus = await Geolocator.isLocationServiceEnabled();
+      if (_isGpsEnabled != gpsStatus) {
+        _isGpsEnabled = gpsStatus;
+        notifyListeners(); // Уведомляем UI, чтобы показать ошибку
+      }
+
+      if (!gpsStatus) {
+        _log("❌ Scan blocked: GPS is OFF. Please enable Location.");
+        return;
+      }
+    }
 
     _log("📡 Scanning: ${type.name.toUpperCase()}");
     if (type == SignalType.mesh) NativeMeshService.startDiscovery();
     if (type == SignalType.bluetooth) _scanBluetooth();
-  }
-
-  Future<void> initAfterPermissions() async {
-    _log("🔓 Permissions granted. Booting Mesh Kernel...");
-
-    await checkHardwareStatus(); // только read-only
-    await initBackgroundProtocols();
-    await activateGroosaProtocol();
   }
 
   // Добавь проверку в метод инициализации, чтобы сразу знать статус
@@ -943,8 +942,6 @@ class MeshService with ChangeNotifier {
         jsonString = rawData.toString();
       }
 
-
-
       if (jsonString.isEmpty) {
         _log("⚠️ [Mesh] Empty payload received. Aborting.");
         return;
@@ -962,11 +959,6 @@ class MeshService with ChangeNotifier {
         _log("♻️ [Gossip] Duplicate pulse ($packetHash). Dropping to save battery.");
         return;
       }
-      // 🔻 ВСТАВИТЬ СЮДА: Если есть IP и ID, запоминаем маршрут
-      if (senderIp != null && data['senderId'] != null) {
-        _idToIpMap[data['senderId']] = senderIp;
-      }
-
 
       // --- 4. МАРШРУТИЗАЦИЯ ОБРАТНОГО ПУТИ (Peer Lock) ---
       // Фиксируем IP отправителя. В Wi-Fi Direct IP могут меняться,
@@ -1085,16 +1077,6 @@ class MeshService with ChangeNotifier {
     } catch (e) {
       _log("❌ [Mesh-Critical] Crash during pulse processing: $e");
     }
-  }
-
-  String? resolveIpForUser(String userId) {
-    // 1. Проверяем таблицу
-    if (_idToIpMap.containsKey(userId)) return _idToIpMap[userId];
-
-    // 2. Если не нашли, но это Host - возвращаем стандартный адрес
-    if (_isHost == false && _lastKnownPeerIp == "192.168.49.1") return "192.168.49.1";
-
-    return null;
   }
 
 
@@ -1408,7 +1390,7 @@ class MeshService with ChangeNotifier {
   }
 
   Future<void> sendTcpBurst(String message) async {
-    String targetIp = _lastKnownPeerIp.isNotEmpty ? _lastKnownPeerIp : "192.168.49.1";
+    String targetIp = _isHost ? _lastKnownPeerIp : "192.168.49.1";
 
     _log("🚀 [Burst] Initiating TCP transfer to $targetIp");
 
@@ -1488,6 +1470,19 @@ class MeshService with ChangeNotifier {
 
   // --- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ---
 
+  Future<bool> _isHardwareReady() async {
+    if (!Platform.isAndroid) return true;
+    await [Permission.location, Permission.bluetoothScan, Permission.bluetoothConnect].request();
+
+    if (!(await Geolocator.isLocationServiceEnabled())) {
+      await Geolocator.openLocationSettings();
+      return false;
+    }
+    if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
+      if (Platform.isAndroid) await FlutterBluePlus.turnOn();
+    }
+    return true;
+  }
 
 
   void _addLog(String msg) => _log(msg);
