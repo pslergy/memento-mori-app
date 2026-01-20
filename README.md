@@ -180,7 +180,8 @@ This is an open research project. Contributions are welcome, especially in:
 * Android HAL quirks (Samsung, Pixel, Xiaomi)
 * Cryptographic review and security testing
 
-`CONTRIBUTING.md` coming soon.
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening issues or pull requests.
+
 
 ---
 
