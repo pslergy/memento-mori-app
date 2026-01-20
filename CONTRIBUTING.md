@@ -1,124 +1,155 @@
-# Contributing to Memento Mori
+Contributing to Memento Mori
 
-First of all, thank you for your interest in **Memento Mori**.
+Thank you for your interest in Memento Mori.
 
-This project is designed as a communication lifeline for restricted, degraded, or adversarial environments. Contributions are welcome, but the bar for quality, security, and architectural discipline is intentionally high.
+Memento Mori is an independent research project exploring resilient, decentralized communication under severely constrained and adversarial conditions. The system is designed to operate where conventional assumptions about connectivity, power availability, and OS cooperation no longer hold.
 
-Memento Mori is a **senior-led, security-first project**. Please read this document carefully before contributing.
+Contributions are welcome, but please note that this project is security-first, failure-aware, and architecturally conservative by design.
 
----
+🚀 Areas of Contribution
 
-## 🚀 How You Can Contribute
+We are particularly interested in contributions in the following domains:
 
-We are especially interested in contributions in the following areas:
+🔊 Acoustic Transport (Sonar Link)
 
-* **Acoustic Transport Layer (Sonar Link)**
-  Improving BFSK modulation, symbol timing, synchronization robustness, or Goertzel-based detection accuracy.
+Improvements to:
 
-* **Security Review & Hardening**
-  Auditing cryptographic flows, including AES-256-GCM usage, key lifecycle management, and offline threat models.
+BFSK modulation and symbol timing
 
-* **Native Android Optimization**
-  Enhancing Kotlin Foreground Services, reducing wake locks, and improving battery behavior on low-end or vendor-modified devices.
+Clock drift tolerance and synchronization
 
-If you are unsure where to start, open an Issue describing your background and interests.
+Goertzel-based detection accuracy and CPU efficiency
 
----
+Robustness in noisy or reverberant environments
 
-## 🛠 Development Process
+Signal processing expertise is highly appreciated here.
 
-### 1️⃣ Branching Strategy
+🔐 Security Review & Hardening
 
-We use a simplified GitFlow model:
+Security contributions may include:
 
-* `main`
-  Production-ready, stable code only.
+Cryptographic flow auditing (AES-256-GCM, Ed25519)
 
-* `feature/<feature-name>`
-  New functionality or experimental subsystems.
+Key lifecycle analysis and offline identity guarantees
 
-* `fix/<bug-name>`
-  Bug fixes and stability improvements.
+Threat modeling for delay-tolerant, intermittently connected nodes
 
-Direct commits to `main` are not accepted.
+Review of merge semantics between offline and online identity states
 
----
+All security discussions are expected to be concrete and threat-model driven.
 
-### 2️⃣ Pull Request (PR) Guidelines
+📱 Native Android & OS-Level Optimization
 
-All Pull Requests must follow these rules:
+Help is welcome in areas such as:
 
-* **Atomic Commits**
-  Each commit should represent a single logical change.
+Foreground service stabilization under OEM power managers
 
-* **Security First**
-  No plaintext secrets, no debug backdoors, no unencrypted logs.
+Wake-lock minimization and scheduling strategies
 
-* **Documentation Required**
-  If you modify core logic, update:
+Bluetooth, Audio, and Wi-Fi HAL contention mitigation
 
-  * Inline documentation, and/or
-  * README / architecture notes where appropriate.
+Behavior analysis on low-end or vendor-modified devices (Xiaomi, Huawei, Tecno, etc.)
 
-* **Real Device Testing**
-  Whenever possible, validate mesh behavior on **at least two physical devices**. Emulators are insufficient for Bluetooth, Audio, and Wi-Fi Direct layers.
+If you are unsure where to start, feel free to open an Issue describing your background and what area you are interested in exploring.
 
-PRs that do not meet these criteria may be closed without review.
+🛠 Development Workflow
+1️⃣ Branching Model
 
----
+We follow a simplified GitFlow-style approach:
 
-### 3️⃣ Coding Standards
+main
+Stable, production-grade research code only.
 
-#### Flutter / Dart
+feature/<name>
+New features, experimental subsystems, or architectural work.
 
-* Follow `flutter_lints`
-* Deterministic state handling only
-* Prefer **BLoC / Cubit / FSM-based logic**
-* Avoid background work outside orchestrator control
+fix/<name>
+Bug fixes, performance improvements, and stability patches.
 
-#### Kotlin / Android
+Direct commits to main are not accepted.
 
-* Use **Coroutines** responsibly
-* Fixed or bounded thread pools only
-* No unbounded background execution
-* Respect hardware interlocks (Bluetooth / Audio / Wi-Fi)
+2️⃣ Pull Request Guidelines
 
----
+All Pull Requests are expected to meet the following criteria:
 
-## 🛡️ Security & Privacy Principles
+Atomic Commits
+Each commit should represent one logical, reviewable change.
 
-Memento Mori follows a **Zero-Knowledge** design philosophy.
+Security Awareness
+No plaintext secrets, debug backdoors, or unencrypted diagnostic output.
 
-### We do NOT accept:
+Documentation Alignment
+Changes to core logic must be accompanied by:
 
-* Centralized telemetry
-* Hidden analytics
-* User behavior tracking
-* Cloud-dependent core features
+Inline documentation, and/or
 
-All new code must preserve:
+Updates to README or architecture notes when relevant.
 
-* Offline survivability
-* Plausible deniability
-* Minimal observable surface
+Real Device Validation
+Mesh behavior should be tested on physical Android devices whenever possible.
+Emulators are insufficient for Bluetooth, Audio, and Wi-Fi Direct layers.
 
-If a feature weakens these guarantees, it will be rejected.
+Pull Requests that do not meet these expectations may be closed without detailed review.
 
----
+📐 Coding Standards
+Flutter / Dart
 
-## 📫 Questions & Discussion
+Follow flutter_lints
 
-If you have questions about:
+Deterministic state management only
 
-* Architecture
-* Threat models
-* Transport layers
-* Identity & merge logic
+Prefer BLoC / Cubit / explicit FSMs
 
-Please open an **Issue** with the label `question`.
+Avoid background execution outside orchestrator control
 
-Clear, technical questions are always welcome.
+Kotlin / Android
 
----
+Structured concurrency using Coroutines
 
-*Memento Mori — In an era of total surveillance, privacy is a protocol.*
+Bounded thread pools only
+
+No unbounded background execution
+
+Respect hardware interlocks between Bluetooth, Audio, and Wi-Fi subsystems
+
+🛡️ Security & Privacy Principles
+
+Memento Mori adheres to a Zero-Knowledge, Offline-First design philosophy.
+
+The project does not accept contributions that introduce:
+
+Centralized telemetry
+
+Hidden analytics
+
+Behavioral tracking
+
+Cloud-dependent core functionality
+
+All accepted contributions must preserve:
+
+Offline survivability
+
+Minimal observable surface
+
+Plausible deniability under inspection
+
+Features that weaken these guarantees will not be merged.
+
+📫 Questions & Technical Discussion
+
+For questions related to:
+
+System architecture
+
+Threat models
+
+Transport layers
+
+Identity and merge semantics
+
+Please open an Issue with the label question.
+
+Clear, technically grounded discussions are always welcome.
+
+Memento Mori — In environments where infrastructure fails, protocol design becomes survival.
