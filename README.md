@@ -169,7 +169,7 @@ that explain *why* Memento Mori exists and *how* it differs from conventional me
 These documents are considered part of the project specification.
 Core changes should remain consistent with them.
 
-
+---
 
 
 ## 🤝 Contributing
