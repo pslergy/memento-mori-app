@@ -150,24 +150,25 @@ Every contribution helps keep the project sustainable and open.
 
 ---
 
-📚 Project Documentation
+## 📚 Project Documentation
 
 This repository is accompanied by a set of architectural and design documents
-that explain why Memento Mori exists and how it differs from conventional messengers.
+that explain *why* Memento Mori exists and *how* it differs from conventional messengers.
 
-🧭 Architecture Overview
-→ ARCHITECTURE.md
-High-level system design, transport layers, orchestrator logic, and data flow.
+* **🧭 Architecture Overview**
+  → [`ARCHITECTURE.md`](ARCHITECTURE.md)
+  High-level system design, transport layers, orchestrator logic, and data flow.
 
-❓ Why this is not Signal or Matrix
-→ WHY_NOT_SIGNAL_OR_MATRIX.md
-Explicit comparison of assumptions, threat models, and architectural goals.
+* **❓ Why this is not Signal or Matrix**
+  → [`WHY_NOT_SIGNAL_OR_MATRIX.md`](WHY_NOT_SIGNAL_OR_MATRIX.md)
+  Explicit comparison of assumptions, threat models, and architectural goals.
 
-🛡 Threat Model (coming soon)
-Offline-first security assumptions, adversarial environments, and OS hostility.
+* **🛡 Threat Model (coming soon)**
+  Offline-first security assumptions, adversarial environments, and OS hostility.
 
 These documents are considered part of the project specification.
 Core changes should remain consistent with them.
+
 
 
 
