@@ -172,7 +172,7 @@ Core changes should remain consistent with them.
 ---
 
 
-## 🤝 Contributing
+### 🤝 Contributing
 
 This is an open research project. Contributions are welcome, especially in:
 
