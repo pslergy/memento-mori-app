@@ -1,211 +1,139 @@
-# Memento Mori
+<div align="center">
 
+# Memento Mori
 ### Autonomous Shadow Mesh Infrastructure
+
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Android-green.svg)](https://flutter.dev)
+[![Status](https://img.shields.io/badge/Status-Research%20Alpha-orange.svg)]()
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)
 
 **Resilient Decentralized Communication for Extreme Environments**
 
-Memento Mori is not just a messenger.
-It is a fault-tolerant, autonomous mesh infrastructure designed to operate under *total network degradation*.
+<p align="center">
+  <!-- PLACEHOLDER FOR DEMO GIF OR SCREENSHOT -->
+  <!-- <img src="assets/screenshots/radar_demo.gif" width="300" alt="Sonar Radar Demo" /> -->
+  <i>(Visual demonstration coming soon)</i>
+</p>
 
-The project implements a **“shadow communication layer”** beneath the traditional Internet, leveraging a synergistic combination of **acoustic signaling**, **radio-based discovery**, and **cloud gateways** when available.
+</div>
 
-It is built for environments where connectivity is intermittent, hostile, monitored, or deliberately suppressed.
+---
+
+> ⚠️ **RESEARCH PREVIEW (ALPHA)**
+>
+> **Memento Mori is currently under active engineering development.**
+> The protocol implementation, database schema, and routing logic may undergo breaking changes. This software is designed for research and testing of **Delay-Tolerant Networks (DTN)** and is not yet recommended for mission-critical use without prior validation.
+
+---
+
+## 💀 The Mission
+
+**Memento Mori** is a fault-tolerant, autonomous mesh infrastructure designed to operate under **total network degradation**.
+
+The project implements a **“shadow communication layer”** beneath the traditional Internet, leveraging a synergistic combination of acoustic signaling, radio-based discovery, and cloud gateways when available. It is built for environments where connectivity is intermittent, hostile, monitored, or deliberately suppressed.
 
 ---
 
 ## 🧠 Core Engineering Innovation
 
-### Tactical Orchestrator (Decision Engine)
+### 1. Tactical Orchestrator (Decision Engine)
+The primary challenge of mobile mesh networks is **surviving the operating system**. Aggressive power management (Doze mode) and shared hardware resources (Bluetooth/Audio/Wi-Fi) often kill background mesh processes.
 
-The primary challenge of mobile mesh networks is not routing — it is **surviving the operating system**.
+Memento Mori solves this via a deterministic **Hardware Interlock**:
+*   **Anti-Deadlock Logic:** Enforces exclusive HAL access to prevent Bluetooth GATT status 133 errors.
+*   **Biological Burst-Mode:** Nodes synchronize wake cycles to exchange data in short, high-throughput bursts, saving up to **90% battery**.
+*   **Crash Guard:** Prevents audio driver starvation during Sonar operations on specific chipsets (MediaTek/Spreadtrum).
 
-Aggressive power management, background execution limits, and shared hardware resources (Bluetooth, Audio, Wi-Fi) make naïve mesh implementations unstable or unusable.
+### 2. Multi-Layer Hybrid Transport
+The app dynamically switches transport layers based on tactical conditions:
 
-Memento Mori solves this via the **Tactical Orchestrator**, a deterministic decision engine coordinating all subsystems.
+*   **🦇 Acoustic Sonar (L2):** Air-gapped discovery using ultrasonic BFSK modulation (18-20kHz). Works in radio silence or RF-monitored zones using the Goertzel algorithm on the CPU.
+*   **📡 BLE Control Plane:** "Zero-Connect" topology inference. Nodes broadcast gradient state (hop counts) directly in Advertising packets without establishing heavy connections.
+*   **⚡ Wi-Fi Direct (Data Plane):** Automatic escalation. When a BLE link is verified, a high-bandwidth Wi-Fi group is formed to flush the message queue (Outbox) instantly.
 
-### Key Logic Components
-
-#### Biological Burst-Mode
-
-Instead of continuous scanning, nodes synchronize *wake cycles*.
-
-* Devices wake simultaneously
-* Exchange data in short, high-throughput **Burst Windows**
-* Return to deep idle
-
-Result: **up to 90% energy savings** compared to constant discovery models.
-
----
-
-#### Hardware Interlock Orchestration
-
-Mobile chipsets cannot safely run Bluetooth, Audio (FFT/Sonar), and Wi-Fi Direct concurrently.
-
-The orchestrator enforces **exclusive HAL access**, preventing:
-
-* BLE GATT deadlocks (Android Status 133)
-* Audio driver starvation
-* Vendor-specific chipset crashes (MediaTek, Spreadtrum)
-
-Subsystems are **time-sliced**, not parallelized.
+### 3. Identity Transmigration
+*   **Ghost State:** Fully functional offline identity (Ed25519) stored in SQLite (WAL mode).
+*   **Atomic Merge:** When internet becomes available, the offline "Ghost" identity is cryptographically bound to a persistent ID without history loss or forks.
 
 ---
 
-#### GridScore Heuristic (Routing Intelligence)
+## 🗺️ Roadmap & Status
 
-Routing decisions are based on a dynamic neighbor score:
+We are building a robust offline ecosystem. Current progress:
 
-* **Hops to Internet** (Gradient propagation)
-* **Battery Level**
-* **Queue Pressure** (message backlog)
-
-This creates a self-optimizing mesh that naturally prefers stable, energy-sufficient uplinks.
-
----
-
-## 🚀 Multi-Layer Transport Stack
-
-### Heterogeneous, Adaptive, Opportunistic
-
-Memento Mori dynamically switches transport layers depending on tactical conditions.
+- [x] **Core:** BLE Zero-Connect Discovery & Advertising Parsing
+- [x] **Core:** Hardware Interlock (GATT/Sonar conflict resolution)
+- [x] **Transport:** Acoustic Sonar Layer (BFSK signaling)
+- [x] **Transport:** Wi-Fi Direct auto-negotiation (Failover escalation)
+- [x] **Security:** Ghost Identity & Local Encryption (SQLite WAL)
+- [x] **UI:** Basic "Radar" interface and Chat view
+- [ ] **Routing:** Stabilize Gradient Descent (Multi-hop reliability)
+- [ ] **Security:** Implement Double Ratchet Algorithm for E2EE
+- [ ] **Network:** LoRa WAN hardware integration (USB/UART)
+- [ ] **UI:** Camouflage Mode (Calculator disguise polishing)
 
 ---
 
-### 1️⃣ Acoustic L2 Layer — *Sonar Link*
+## 🐛 Known Issues (Work in Progress)
 
-**Use case:**
-Node discovery in radio silence, BLE-restricted environments, or heavily monitored zones.
-
-**Technology:**
-
-* Custom protocol over BFSK modulation
-* Goertzel algorithm for efficient frequency detection on mobile CPUs
-* No DSP acceleration required
-
-**Dynamic Frequency Selection (DFS):**
-
-* Real-time FFT spectrum analysis
-* Automatic selection of quiet ultrasonic bands (18–20 kHz)
-
-This layer enables **air-gapped discovery** without RF emissions.
+*   **Huawei/Xiaomi Devices:** Aggressive battery optimization ("Power Genie") may kill the background service after 10-15 minutes. *Workaround: Manual whitelist in settings required.*
+*   **Audio Audibility:** In very quiet rooms, young people or pets might hear the lower bound of the ultrasonic handshake (~17.5kHz).
+*   **Wi-Fi Direct:** Legacy devices (Android 9 and below) might experience slow group formation negotiation.
 
 ---
 
-### 2️⃣ Control Plane — *BLE Signaling*
+## 🛠 Tech Stack
 
-**Zero-Connect Discovery**
-
-* Gradient state (hop count)
-* Data availability flag
-  Encoded directly in BLE Advertising packets
-
-Nodes infer topology **without establishing connections**.
-
-**GATT Hardening**
-
-* Defensive connection profile
-* Backoff and reset strategy to mitigate Android GATT Status 133
-* BLE is used for signaling only, not bulk data
+*   **Language:** Dart (Flutter) + Kotlin (Native Channels).
+*   **Architecture:** Clean Architecture + BLoC.
+*   **Database:** SQLite (Direct FFI with WAL mode) for ACID compliance.
+*   **Crypto:** `pointycastle` / `cryptography` (Ed25519, AES-GCM).
 
 ---
 
-### 3️⃣ Data Plane — *Wi-Fi Direct & TCP*
+## 📥 Getting Started
 
-**Escalation Path**
+### Prerequisites
+*   Flutter SDK (3.x+)
+*   Android Device (API 26+ recommended)
+*   *Note: Emulator support is limited due to Bluetooth/Wi-Fi Direct requirements.*
 
-* When an uplink is detected via BLE
-* Wi-Fi Direct group is automatically formed
-* Accumulated Outbox is flushed at high speed
+### Installation
 
-**Socket Binding Fix**
+```bash
+# 1. Clone the repository
+git clone https://github.com/pslergy/memento-mori-app.git
 
-* Explicit bind to `0.0.0.0:55555`
-* Resolves “isolated socket” issues on vendor-modified Android firmware
+# 2. Install dependencies
+cd memento-mori-app
+flutter pub get
 
-This ensures reliable data transfer even on heavily customized ROMs.
+# 3. Run on physical device
+flutter run --release
 
----
+## 🤝 Contributing
 
-## 🧬 Identity & Data Integrity
+This is an open research project. We welcome contributions, especially in:
+*   **DSP / Audio signal processing:** Optimization of the Goertzel algorithm.
+*   **Android HAL:** Handling specifics for Samsung/Pixel/Xiaomi hardware quirks.
+*   **Security:** Cryptographic review and penetration testing.
 
-### Identity Transmigration Protocol
-
-Solves the classic offline identity problem.
-
-#### Ghost State
-
-* Local Ed25519 keypair generation
-* Messages incubated in SQLite (WAL mode)
-* Fully functional offline identity
-
-#### Landing Pass
-
-* Cryptographic commitment allowing later identity binding
-* No trust required at message creation time
-
-#### Atomic Merge
-
-* Backend (Node.js + Prisma)
-* Atomic ownership transfer from `ghostId` → `authId`
-* Idempotent, duplication-safe
-
-Offline history survives reconnection **without forks or loss**.
+See `CONTRIBUTING.md` (coming soon) for details.
 
 ---
 
-## 🔐 Security & Anti-Forensics
+## 📄 License
 
-* **Camouflage Mode**
-  App fully disguises itself as a functional calculator.
+This project is licensed under the **GNU General Public License v3.0** - see the [LICENSE](LICENSE) file for details.
 
-* **Panic Trigger**
-
-  * Coercion PIN
-  * Shake-to-Wipe (accelerometer)
-    Instant destruction of keys and database.
-
-* **Offline Entropy Injection**
-  Random padding added to packets to resist traffic analysis by packet size.
+> **Disclaimer:** This software is provided "as is", without warranty of any kind. It is intended for educational and defensive research purposes. Authors are not responsible for any misuse of this technology.
 
 ---
 
-## 🛠 Tech Stack & Engineering Trade-offs
-
-* **Flutter (Dart)**
-  Fast iteration, deterministic FSM orchestration, cross-platform UI.
-
-* **Native Kotlin**
-  Critical paths only:
-
-  * FFT / Goertzel
-  * Wi-Fi Direct
-  * Low-level socket control
-
-* **SQLite (WAL Mode)**
-  Chosen over Hive/Realm for:
-
-  * Strict ACID guarantees
-  * Crash-safe message queues
-  * Deterministic replay during merges
-
----
-
-## 👨‍🔬 Research Goals
-
-Memento Mori explores the practical limits of **Delay-Tolerant Networks (DTN)** on modern mobile hardware.
-
-Primary focus areas:
-
-* Autonomy under OS constraints
-* Stealth and low observability
-* Survivability in adversarial environments
-
-This is both an applied system and a research platform.
-
----
-
-## 👤 Author
-
-**Pslergy**
-Senior Software Architect
-Distributed Systems · Mesh Networks · Hardware Interop
+<div align="center">
+  <sub><b>Memento Mori Project</b></sub><br>
+  <sub>High-Resilience Distributed Systems Research</sub>
+  <br>
+  <sub>Created by <b>Pslergy</b></sub>
+</div>
