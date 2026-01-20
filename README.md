@@ -1,6 +1,7 @@
 <div align="center">
 
 # Memento Mori
+Independent research project exploring resilient mobile mesh networking under OS-level constraints.
 
 ### Autonomous Shadow Mesh Infrastructure
 
