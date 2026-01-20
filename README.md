@@ -5,9 +5,11 @@
 ### Autonomous Shadow Mesh Infrastructure
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Open Source](https://img.shields.io/badge/Open%20Source-Yes-success.svg)]()
 [![Platform](https://img.shields.io/badge/Platform-Android-green.svg)](https://flutter.dev)
 [![Status](https://img.shields.io/badge/Status-Research%20Alpha-orange.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-pink.svg)](https://github.com/sponsors/pslergy)
 
 **Resilient Decentralized Communication for Extreme Environments**
 
@@ -129,25 +131,23 @@ flutter run --release
 
 ---
 
-❤️ Support the Project
+## ❤️ Support the Project
 
-Memento Mori is an independent open-source research project developed without corporate backing.
+**Memento Mori** is an independent open-source research project developed without corporate backing.
 
 If you find this work valuable and want to support:
 
-long-term research into resilient offline communication
+* long-term research into resilient offline communication
+* maintenance across diverse Android hardware
+* documentation, testing, and security audits
 
-maintenance across diverse Android hardware
+You can support the project via **GitHub Sponsors**:
 
-documentation, testing, and security audits
-
-You can support the project via GitHub Sponsors:
-
-👉 https://github.com/sponsors/pslergy
+👉 [https://github.com/sponsors/pslergy](https://github.com/sponsors/pslergy)
 
 Every contribution helps keep the project sustainable and open.
 
-
+---
 
 ## 🤝 Contributing
 
