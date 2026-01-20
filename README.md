@@ -101,7 +101,7 @@ We are building a robust offline ecosystem. Current progress:
 
 ### Installation
 
-```bash
+````bash
 # 1. Clone the repository
 git clone https://github.com/pslergy/memento-mori-app.git
 
