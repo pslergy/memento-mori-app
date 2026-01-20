@@ -110,7 +110,7 @@ cd memento-mori-app
 flutter pub get
 
 # 3. Run on physical device
-flutter run --release
+flutter run --release````
 
 ## 🤝 Contributing
 
