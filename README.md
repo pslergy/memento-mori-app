@@ -129,6 +129,26 @@ flutter run --release
 
 ---
 
+❤️ Support the Project
+
+Memento Mori is an independent open-source research project developed without corporate backing.
+
+If you find this work valuable and want to support:
+
+long-term research into resilient offline communication
+
+maintenance across diverse Android hardware
+
+documentation, testing, and security audits
+
+You can support the project via GitHub Sponsors:
+
+👉 https://github.com/sponsors/pslergy
+
+Every contribution helps keep the project sustainable and open.
+
+
+
 ## 🤝 Contributing
 
 This is an open research project. Contributions are welcome, especially in:
