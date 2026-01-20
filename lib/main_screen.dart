@@ -59,8 +59,9 @@ class _MainScreenState extends State<MainScreen> {
 
     // 2. Слушатель входящих запросов на связь через Сонар
     _linkSubscription = locator<MeshService>().linkRequestStream.listen((senderId) {
-      _showLinkConfirmation(senderId);
-      SonarOverlay.show(context, senderId); // 🔥 Магия появляется на экране!
+      _showTacticalLinkDialog(senderId);
+      // Опционально: показываем визуальный эффект SonarOverlay
+      SonarOverlay.show(context, senderId);
     });
 
     _loadInitialData();
@@ -71,6 +72,52 @@ class _MainScreenState extends State<MainScreen> {
       const EmergencyRadarScreen(),
       const MeshControlScreen(),
     ];
+  }
+
+  void _showTacticalLinkDialog(String senderId) {
+    HapticFeedback.heavyImpact();
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => FadeInUp(
+        duration: const Duration(milliseconds: 300),
+        child: AlertDialog(
+          backgroundColor: AppColors.surface,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+            side: BorderSide(color: AppColors.sonarPurple.withOpacity(0.5), width: 1),
+          ),
+          title: Row(
+            children: [
+              const Icon(Icons.record_voice_over, color: AppColors.sonarPurple),
+              const SizedBox(width: 12),
+              Text("INCOMING SONAR LINK", style: GoogleFonts.russoOne(color: Colors.white, fontSize: 14)),
+            ],
+          ),
+          content: Text(
+            "Nomad #$senderId is nearby and requesting a secure Wi-Fi Bridge. Establish trust?",
+            style: const TextStyle(color: Colors.white70, fontSize: 13),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text("IGNORE", style: TextStyle(color: AppColors.warningRed)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.gridCyan,
+                foregroundColor: Colors.black,
+              ),
+              onPressed: () {
+                Navigator.pop(ctx);
+                _establishSecureLink(senderId);
+              },
+              child: const Text("ACCEPT LINK", style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   void _loadInitialData() async {
@@ -132,7 +179,7 @@ class _MainScreenState extends State<MainScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text("Handshaking... Connecting to grid."), backgroundColor: AppColors.gridCyan),
     );
-    await NativeMeshService.connect(targetId);
+    await locator<MeshService>().connectToNode(targetId);
   }
 
   void _checkAndShowAds() async {

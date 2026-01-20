@@ -7,6 +7,7 @@ import 'core/api_service.dart';
 import 'core/locator.dart';
 import 'core/mesh_prep_service.dart';
 import 'core/mesh_service.dart';
+import 'core/native_mesh_service.dart';
 import 'core/storage_service.dart';
 import 'core/websocket_service.dart';
 
@@ -26,6 +27,12 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      print("🧪 [DEBUG] Manual Hardware Probe Start...");
+      final caps = await NativeMeshService.getHardwareCapabilities();
+      print("🛠️ HARDWARE REPORT: $caps");
+    });
+
     _initApp();
   }
 

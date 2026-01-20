@@ -6,8 +6,26 @@ import 'locator.dart';
 import 'mesh_service.dart';
 
 class NativeMeshService {
+  static bool _activated = false;
+
+  /// ❌ НИКАКОГО Bluetooth/Wifi здесь
+  static void preInit() {}
+
+  /// ✅ ТОЛЬКО ПОСЛЕ permissions
+  static Future<void> activate() async {
+    if (_activated) return;
+
+    // Получаем adapters ТОЛЬКО ТУТ
+    // BluetoothAdapter.instance
+    // WifiP2PManager.initialize()
+
+    _activated = true;
+  }
+
   // Канал для Wi-Fi Direct и системных функций
   static const MethodChannel _channel = MethodChannel('memento/wifi_direct');
+
+  static const MethodChannel _p2pChannel = MethodChannel('memento/p2p');
 
   // Канал для Акустического Сонара (Звук)
   static const MethodChannel _sonarChannel = MethodChannel('memento/sonar');
@@ -33,7 +51,7 @@ class NativeMeshService {
         case 'onAutoLinkRequest':
           final String senderId = call.arguments.toString();
           print("🔊 [Native] Auto-Link signal caught for: $senderId");
-          // Мы НЕ подключаемся сразу, а просим MeshService показать диалог пользователю
+          // Передаем сигнал в MeshService, который через стрим покажет диалог в MainScreen
           locator<MeshService>().handleIncomingLinkRequest(senderId);
           break;
 
@@ -50,16 +68,12 @@ class NativeMeshService {
 
         case 'onMessageReceived':
           try {
-            // Принимаем Map с сообщением и IP отправителя
             final Map<dynamic, dynamic> args = call.arguments;
             final incomingData = {
               'message': args['message']?.toString() ?? '',
               'senderIp': args['senderIp']?.toString() ?? '',
             };
-
             print("📩 [Mesh-Packet] From ${incomingData['senderIp']}: ${incomingData['message']}");
-
-            // Отправляем в MeshService для вирусной ретрансляции и логики
             locator<MeshService>().processIncomingPacket(incomingData);
             _messageController.add(incomingData);
           } catch (e) {
@@ -75,23 +89,21 @@ class NativeMeshService {
     // --- 🔊 Настройка канала Сонара (Акустика) ---
     _sonarChannel.setMethodCallHandler((call) async {
       print("🔊 [Native -> Sonar] Incoming Method: ${call.method}");
-
       switch (call.method) {
         case 'onSignalDetected':
           try {
             final String signal = call.arguments.toString();
-            // Пробрасываем пойманный звук в UltrasonicService
             locator<UltrasonicService>().handleInboundSignal(signal);
           } catch (e) {
             print("❌ [NativeService] Sonar signal error: $e");
           }
           break;
-
         default:
           print("⚠️ Unknown Sonar method: ${call.method}");
       }
     });
   }
+
 
   static Future<Map<double, double>> runFrequencySweep() async {
     try {
@@ -107,6 +119,27 @@ class NativeMeshService {
     } catch (e) {
       print("❌ [Native] FFT sweep failed: $e");
       rethrow;
+    }
+  }
+
+
+  static Future<Map<String, dynamic>> getHardwareCapabilities() async {
+    try {
+      // Спрашиваем через p2p канал (где мы прописали это в Kotlin)
+      final Map<dynamic, dynamic>? result = await _p2pChannel.invokeMethod('getHardwareCapabilities');
+      return result != null ? Map<String, dynamic>.from(result) : {};
+    } catch (e) {
+      print("❌ Caps Error: $e");
+      return {"hasAware": false, "hasDirect": true};
+    }
+  }
+
+  static Future<void> startAwareSession(String peerId) async {
+    try {
+      // Пока вызываем заглушку, но канал уже пробит
+      await _p2pChannel.invokeMethod('startAwareSession', {'peerId': peerId});
+    } catch (e) {
+      print("❌ Aware Session Error: $e");
     }
   }
 
@@ -154,9 +187,8 @@ class NativeMeshService {
   static Future<void> forceReset() async {
     try {
       await _channel.invokeMethod('forceReset');
-      print("☢️ [Native] P2P Stack Reset performed.");
     } catch (e) {
-      print("❌ [Native] Force Reset Error: $e");
+      print("❌ Force Reset Error: $e");
     }
   }
 

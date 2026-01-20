@@ -73,6 +73,11 @@ flutter:
     - family: RobotoMono
       fonts:
         - asset: assets/fonts/RobotoMono-VariableFont_wght.ttf
+
+
+    - family: Orbitron
+      fonts:
+        - asset: assets/fonts/Orbitron-Bold.ttf
     #    - family: RussoOne
     #      fonts:
     #        - asset: assets/fonts/RussoOne-Regular.ttf # ← Закомментируй это!

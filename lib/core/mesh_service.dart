@@ -11,7 +11,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:memento_mori_app/core/storage_service.dart';
 import 'package:memento_mori_app/core/ultrasonic_service.dart';
-import 'package:permission_handler/permission_handler.dart';
+
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:device_info_plus/device_info_plus.dart';
@@ -52,7 +52,12 @@ enum MeshPacketType {
 class MeshService with ChangeNotifier {
   static final MeshService _instance = MeshService._internal();
   factory MeshService() => _instance;
-  MeshService._internal();
+  final Map<String, String> _idToIpMap = {};
+
+  MeshService._internal() {
+    // Запускаем таймер очистки "мертвых" нод раз в 10 секунд
+    _cleanupTimer = Timer.periodic(const Duration(seconds: 10), (_) => _pruneDeadNodes());
+  }
   GossipManager get _gossipManager => locator<GossipManager>();
 
   final BluetoothMeshService _btService = BluetoothMeshService();
@@ -62,6 +67,7 @@ class MeshService with ChangeNotifier {
   ApiService get apiService => _apiService;
   // Состояние обнаруженных узлов (Радар)
   final Map<String, SignalNode> _nearbyNodes = {};
+
   final Map<String, int> _lastSeenTimestamps = {};
 
   MeshState _state = MeshState.idle;
@@ -72,7 +78,8 @@ class MeshService with ChangeNotifier {
   // 🔁 Таймер периодического сканирования
   Timer? _scanTimer;
 
-
+  bool _isTransferring = false;
+  bool get isTransferring => _isTransferring;
   bool _isBtScanning = false;
   LocalDatabaseService get db => _db;
 
@@ -139,26 +146,54 @@ class MeshService with ChangeNotifier {
     };
   }
 
+  Future<void> checkMyPower() async {
+    final caps = await NativeMeshService.getHardwareCapabilities();
+    _log("🛠️ HARDWARE REPORT: $caps");
+  }
+
   // --- СИСТЕМА ОБНАРУЖЕНИЯ И ОЧИСТКИ ---
 
   Future<void> initBackgroundProtocols() async {
     _log("⚙️ Activating Autonomous Link...");
 
-    // 🔥 РЕШЕНИЕ ОШИБКИ И СТАБИЛИЗАЦИЯ ТЕХНО
+    // 1. 🛡️ HARDWARE AUDIT: Опрашиваем способности чипа
+    // Это первая строка, чтобы Оркестратор знал, какие ресурсы у него есть.
+    final caps = await NativeMeshService.getHardwareCapabilities();
+    _log("🛠️ HARDWARE REPORT: $caps");
+
+    // 2. 🔥 СТАБИЛИЗАЦИЯ (Wakelock)
     try {
       await WakelockPlus.enable();
     } catch (e) {
       _log("⚠️ Wakelock not supported");
     }
 
+    // 3. 🚀 BACKGROUND PERSISTENCE: Запуск "бессмертного" сервиса
     await BackgroundService.start();
 
-    if (autoMesh) startDiscovery(SignalType.mesh);
-    if (autoBT) startDiscovery(SignalType.bluetooth);
+    // 4. 🧭 ADAPTIVE DISCOVERY: Выбор протокола на основе железа
+    if (autoMesh) {
+      if (caps['hasAware'] == true) {
+        // Если Nova 13 подтвердит NAN, мы будем использовать его
+        _log("💎 [Elite Path] Wi-Fi Aware detected. Prioritizing Silent Mesh.");
+        // Пока используем стандартный старт, но помечаем в логах успех
+        startDiscovery(SignalType.mesh);
+      } else {
+        _log("🚜 [Legacy Path] NAN not supported. Using standard Wi-Fi Direct.");
+        startDiscovery(SignalType.mesh);
+      }
+    }
 
-    // Запуск автоматической очистки пропавших узлов (раз в 15 сек)
+    if (autoBT) {
+      _log("🦷 Engaging Bluetooth Control Plane...");
+      startDiscovery(SignalType.bluetooth);
+    }
+
+    // 5. 🧹 MAINTENANCE: Очистка "призраков"
     _cleanupTimer?.cancel();
-    _cleanupTimer = Timer.periodic(const Duration(seconds: 15), (_) => _performCleanup());
+    _cleanupTimer = Timer.periodic(const Duration(seconds: 15), (_) => _pruneDeadNodes());
+
+    _log("✅ Grid Core is now autonomous.");
   }
 
   Future<void> activateGroosaProtocol() async {
@@ -191,7 +226,90 @@ class MeshService with ChangeNotifier {
     // Уведомляем UI (через Provider), что состояние обновилось
     notifyListeners();
   }
+  Timer? _transferGuardTimer;
 
+  Future<void> connectToNode(String address) async {
+    // Если уже идет процесс, не плодим запросы
+    if (_isTransferring) {
+      _log("⚠️ [Block] Connection already in progress. Wait for timeout.");
+      return;
+    }
+
+    _isTransferring = true;
+    _log("🧨 [NUCLEAR-ATTACK] Target: $address. Engaging P2P Stack...");
+    notifyListeners();
+
+    // 🛡️ ТАЙМЕР-СТРАЖ (Watchdog)
+    // Если через 20 секунд линк не поднимется — принудительно разблокируем систему
+    _transferGuardTimer?.cancel();
+    _transferGuardTimer = Timer(const Duration(seconds: 20), () {
+      if (_isTransferring && !_isP2pConnected) {
+        _log("🚨 [WATCHDOG] Connection timed out. Resetting local state.");
+        _isTransferring = false;
+        notifyListeners();
+      }
+    });
+
+    try {
+      // 1. ПРИНУДИТЕЛЬНЫЙ СБРОС: Перед каждым коннектом на Huawei/Tecno
+      // нужно вызвать forceReset, чтобы вывести чип из состояния BUSY (2)
+      _log("☢️ Executing Pre-emptive Stack Reset...");
+      await NativeMeshService.forceReset();
+      await Future.delayed(const Duration(milliseconds: 1500));
+
+      // 2. ПОПЫТКА КОННЕКТА
+      _log("🔗 Engaging Native Connect for $address");
+      await NativeMeshService.connect(address);
+
+    } catch (e) {
+      _log("❌ [Link Fault] $e");
+      _isTransferring = false;
+      _transferGuardTimer?.cancel();
+      notifyListeners();
+    }
+  }
+
+
+
+  Future<void> engageSuperiorLink(SignalNode node) async {
+    final caps = await NativeMeshService.getHardwareCapabilities();
+
+    if (caps['hasAware'] == true) {
+      // 🚀 ВАРИАНТ А: Wi-Fi Aware (NAN)
+      // Никаких окон! Полный стелс и авто-линк.
+      _log("💎 [Ultra-Link] Hardware supports NAN. Activating Silent Bridge...");
+      await NativeMeshService.startAwareSession(node.id);
+    }
+    else {
+      // 🚜 ВАРИАНТ Б: Wi-Fi Direct
+      // Фолбек для старых/дешевых устройств. Будет окно.
+      _log("🚜 [Legacy-Link] NAN not supported. Falling back to Wi-Fi Direct...");
+      await connectToNode(node.id);
+    }
+  }
+
+
+
+// --- 🧹 AGING POLICY: ОЧИСТКА СПИСКА ---
+  void _pruneDeadNodes() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    bool changed = false;
+
+    // Удаляем ноды, которых не видели более 45 секунд
+    _lastSeenTimestamps.removeWhere((id, ts) {
+      if (now - ts > 45000) {
+        _nearbyNodes.remove(id);
+        changed = true;
+        return true;
+      }
+      return false;
+    });
+
+    if (changed) {
+      _log("🧹 Pruned dead nodes. Active: ${_nearbyNodes.length}");
+      notifyListeners();
+    }
+  }
 
 
   void _performCleanup() {
@@ -260,20 +378,105 @@ class MeshService with ChangeNotifier {
     notifyListeners(); // Обновляет экран "The Chain"
   }
 
+
+  // 🔥 ОБНОВЛЯЕМ ЭТОТ МЕТОД: Он теперь "авто-киллер"
   void handleNativePeers(List<dynamic> raw) {
     for (var item in raw) {
-      // Ключевое исправление: проверяем все возможные ключи адреса
-      final String address = item['metadata'] ?? item['id'] ?? item['address'] ?? "";
+      final String addr = item['metadata'] ?? item['address'] ?? "";
+      final String name = item['name'] ?? "WiFi_Node";
+      if (addr.isEmpty) continue;
 
-      if (address.isEmpty) continue; // Не добавляем "битые" ноды
+      // Регистрируем в UI только Wi-Fi ноды
+      _registerNode(SignalNode(id: addr, name: name, type: SignalType.mesh, metadata: addr));
 
-      final node = SignalNode(
-          id: address,
-          name: item['name'] ?? 'P2P Node',
-          type: SignalType.mesh,
-          metadata: address // Сохраняем MAC-адрес здесь
-      );
-      _registerNode(node);
+      // Если мы в режиме "Охоты" - цепляемся за первую же Wi-Fi ноду
+      if (_isEscalating && !_isP2pConnected && !_isTransferring) {
+        _log("🏹 Hunt Success: Found Wi-Fi target. Executing Link...");
+        connectToNode(addr);
+      }
+    }
+  }
+
+
+  // Внутри MeshService
+
+  Future<void> _executeCascadeTransfer(ScanResult target, int peerHops) async {
+    final String mac = target.device.remoteId.str;
+    final db = locator<LocalDatabaseService>();
+    final pending = await db.getPendingFromOutbox();
+    if (pending.isEmpty) return;
+
+    final msgData = pending.first;
+    final String payload = jsonEncode({
+      'type': 'OFFLINE_MSG',
+      'content': msgData['content'],
+      'senderId': _apiService.currentUserId,
+      'h': msgData['id'],
+      'ttl': 5,
+    });
+
+    _isTransferring = true;
+    _log("⛓️ Starting Cascade: Wi-Fi -> BLE -> Sonar");
+
+    // --- СТУПЕНЬ 1: WI-FI DIRECT (DATA PLANE) ---
+    _log("📡 Stage 1: Attempting Wi-Fi Direct...");
+    try {
+      await NativeMeshService.connect(mac);
+
+      // Ждем 10 секунд. Если onNetworkConnected не сработал - Wi-Fi мертв.
+      await Future.delayed(const Duration(seconds: 10));
+      if (_isP2pConnected) {
+        _log("✅ Stage 1 Success: Wi-Fi Direct Linked.");
+        return;
+      }
+    } catch (e) {
+      _log("⚠️ Stage 1 Failed: Wi-Fi Busy.");
+    }
+
+    // --- СТУПЕНЬ 2: BLUETOOTH GATT (CONTROL PLANE) ---
+    if (!_isP2pConnected) {
+      _log("🦷 Stage 2: Wi-Fi failed. Attacking via Bluetooth GATT...");
+
+      // Включаем "Хищника"
+      bool bleSuccess = false;
+      try {
+        await _btService.sendMessage(target.device, payload);
+        bleSuccess = true; // sendMessage внутри имеет свои ретраи
+        _log("✅ Stage 2 Success: Delivered via BLE GATT.");
+        return;
+      } catch (e) {
+        _log("⚠️ Stage 2 Failed: GATT 133 or Timeout.");
+      }
+    }
+
+    // --- СТУПЕНЬ 3: SONAR (ACOUSTIC PLANE) ---
+    if (!_isP2pConnected) {
+      _log("🔊 Stage 3: Radio silence detected. Escalating to SONAR...");
+
+      try {
+        // Шлем только хеш и Short-ID, чтобы сосед понял, что у нас есть почта
+        // Весь месседж в сонар не влезет, но это "пинок" для соседа
+        await locator<UltrasonicService>().transmitFrame("REQ:${msgData['id']}");
+        _log("✅ Stage 3 Success: Sonar Alert emitted.");
+      } catch (e) {
+        _log("❌ Stage 3 Failed: Audio HAL busy.");
+      }
+    }
+
+    _isTransferring = false;
+    notifyListeners();
+  }
+
+  int _failedRadioCycles = 0;
+
+  void handleRadioSilence() {
+    _failedRadioCycles++;
+
+    if (_failedRadioCycles >= 3) {
+      _log("🚨 TOTAL RADIO SILENCE DETECTED. Escalating to Acoustic Sovereignty...");
+      // Увеличиваем частоту и громкость Сонара для пробития среды
+      locator<UltrasonicService>().transmitBeacon();
+      _failedRadioCycles = 0;
     }
   }
 
@@ -421,7 +624,7 @@ class MeshService with ChangeNotifier {
 
     _log("📡 [Uplink-Seeker] Probing neighbors for internet access...");
 
-    // 1. Сначала проверяем себя (вдруг инет уже есть)
+    // 1. Проверяем локальный статус (Self-check)
     await NetworkMonitor().checkNow();
     if (NetworkMonitor().currentRole == MeshRole.BRIDGE) {
       _log("✅ Internet found on this device.");
@@ -430,18 +633,31 @@ class MeshService with ChangeNotifier {
       return;
     }
 
-    // 2. Рассылаем запрос "Кто видит мост?"
+    // 2. Подготовка поискового сигнала
     final probe = jsonEncode({
       'type': 'MAGNET_QUERY',
       'senderId': _apiService.currentUserId,
     });
 
+    // 3. ТАКТИЧЕСКИЙ ПРОБРОС (Только по живым IP-каналам)
+    // Мы шлем TCP только тем, у кого метаданные — это реальный IP, а не MAC
     for (var node in _nearbyNodes.values) {
-      NativeMeshService.sendTcp(probe, host: node.metadata);
+      final String metadata = node.metadata;
+
+      // Фильтр: Если в адресе есть ":" — это MAC-адрес Bluetooth, TCP туда слать НЕЛЬЗЯ.
+      // Если это только цифры и точки — это IP Wi-Fi Direct.
+      if (node.type == SignalType.mesh && !metadata.contains(":")) {
+        _log("🔗 Probing Wi-Fi peer via TCP: $metadata");
+        NativeMeshService.sendTcp(probe, host: metadata);
+      }
     }
 
-    // 3. Таймаут поиска (30 секунд)
-    Timer(const Duration(seconds: 30), () {
+    // 4. ЭСКАЛАЦИЯ НА BLUETOOTH (Zero-Connect Growth)
+    // Если мы ищем аплинк, нам нужно обновить "зрение" через Bluetooth
+    _scanBluetooth();
+
+    // 5. Таймаут поиска
+    Timer(const Duration(seconds: 20), () {
       _isSearchingUplink = false;
       notifyListeners();
       _log("⌛ Uplink probe cycle completed.");
@@ -450,26 +666,25 @@ class MeshService with ChangeNotifier {
 
   // --- СЕТЕВАЯ ЛОГИКА ---
 
+
+
+
   Future<void> startDiscovery(SignalType type) async {
     if (!_isMeshEnabled) return;
 
     // 🔥 ПРОВЕРКА GPS ДЛЯ BLUETOOTH
-    if (type == SignalType.bluetooth || type == SignalType.mesh) {
-      bool gpsStatus = await Geolocator.isLocationServiceEnabled();
-      if (_isGpsEnabled != gpsStatus) {
-        _isGpsEnabled = gpsStatus;
-        notifyListeners(); // Уведомляем UI, чтобы показать ошибку
-      }
-
-      if (!gpsStatus) {
-        _log("❌ Scan blocked: GPS is OFF. Please enable Location.");
-        return;
-      }
-    }
 
     _log("📡 Scanning: ${type.name.toUpperCase()}");
     if (type == SignalType.mesh) NativeMeshService.startDiscovery();
     if (type == SignalType.bluetooth) _scanBluetooth();
+  }
+
+  Future<void> initAfterPermissions() async {
+    _log("🔓 Permissions granted. Booting Mesh Kernel...");
+
+    await checkHardwareStatus(); // только read-only
+    await initBackgroundProtocols();
+    await activateGroosaProtocol();
   }
 
   // Добавь проверку в метод инициализации, чтобы сразу знать статус
@@ -481,13 +696,20 @@ class MeshService with ChangeNotifier {
 
   // 🔥 ТЕПЕРЬ ЭТО FUTURE, чтобы BackgroundService мог его "ждать"
   Future<void> stopDiscovery() async {
-    await NativeMeshService.stopDiscovery();
-    await FlutterBluePlus.stopScan();
-
-    await _scanSub?.cancel();
-    _scanSub = null;
-
-    _log("🛑 Scanners paused.");
+    try {
+      _log("🛑 Attempting to stop P2P discovery...");
+      await NativeMeshService.stopDiscovery();
+    } catch (e) {
+      if (e.toString().contains("2")) {
+        _log("☢️ [P2P-CRITICAL] Stack Deadlock detected (Error 2). Executing Force Reset...");
+        // Вызываем ядерный сброс
+        await NativeMeshService.forceReset();
+      } else {
+        _log("⚠️ Stop Discovery warning: $e");
+      }
+    } finally {
+      await FlutterBluePlus.stopScan();
+    }
   }
 
   void _scanCloud() async {
@@ -510,15 +732,17 @@ class MeshService with ChangeNotifier {
   // Добавь это поле в начало класса MeshService для контроля повторных попыток
   final Map<String, DateTime> _linkCooldowns = {};
 
-  // Карта кулдаунов, чтобы не спамить одну и ту же ноду каждые 2 секунды
-
-
-  // Карта кулдаунов (MAC-адрес -> время последней попытки)
 
 
 
+  bool _isEscalating = false; // Флаг режима "Охоты по Wi-Fi"
 
 
+
+
+
+
+  String? _targetIdToHunt;
 
 
   Future<void> _scanBluetooth() async {
@@ -526,39 +750,24 @@ class MeshService with ChangeNotifier {
     _isBtScanning = true;
 
     try {
-      if (!await Geolocator.isLocationServiceEnabled()) {
-        _log("❌ Bluetooth Scan blocked: GPS is OFF");
-        _isBtScanning = false;
-        return;
-      }
-
       final orchestrator = locator<TacticalMeshOrchestrator>();
-      final db = locator<LocalDatabaseService>();
-      final int pendingCount = await db.getOutboxCount();
+      final pendingCount = await _db.getOutboxCount();
 
-      // 1. ПОДГОТОВКА ТАКТИЧЕСКОГО МАЯКА (Advertising)
-      final String myShortId = _apiService.currentUserId.isNotEmpty
-          ? _apiService.currentUserId.substring(0, 4)
-          : "GHST";
+      // 1. ВЕЩАНИЕ (Маяк)
+      final String myShortId = _apiService.currentUserId.isNotEmpty ? _apiService.currentUserId.substring(0, 4) : "GHST";
       final String myTacticalName = "M_${orchestrator.myHops}_${pendingCount > 0 ? '1' : '0'}_$myShortId";
 
-      _log("🦷 Pulsing Tactical Beacon: $myTacticalName");
-
-      // Сбрасываем старую рекламу перед новой
       await _btService.stopAdvertising();
-      await Future.delayed(const Duration(milliseconds: 200));
       await _btService.startAdvertising(myTacticalName);
 
-      // 2. ОЧИСТКА СЛУШАТЕЛЕЙ
+      // 2. СКАНИРОВАНИЕ
       await _scanSub?.cancel();
-      _scanSub = null;
       await FlutterBluePlus.stopScan();
 
-      // 3. ОБРАБОТКА ЭФИРА (Discovery & Hop Protocol)
       _scanSub = FlutterBluePlus.scanResults.listen((results) async {
-        for (final r in results) {
-          // Фильтр по нашему Service UUID
-          if (!r.advertisementData.serviceUuids.contains(Guid(_btService.SERVICE_UUID))) continue;
+        for (ScanResult r in results) {
+          final bool isOurNode = r.advertisementData.serviceUuids.contains(Guid(_btService.SERVICE_UUID));
+          if (!isOurNode) continue;
 
           final String advName = r.advertisementData.localName;
           final String mac = r.device.remoteId.str;
@@ -567,7 +776,6 @@ class MeshService with ChangeNotifier {
           bool peerHasData = false;
           String peerId = mac.substring(mac.length - 4);
 
-          // Разбор тактического имени соседа
           if (advName.startsWith("M_")) {
             final parts = advName.split("_");
             if (parts.length >= 4) {
@@ -577,83 +785,131 @@ class MeshService with ChangeNotifier {
             }
           }
 
-          // --- ШАГ А: ОБНОВЛЕНИЕ ГРАДИЕНТА (Zero-Connect) ---
-          // Мы узнаем о близости выхода мгновенно из пакета рекламы
+          // ТИХОЕ ОБНОВЛЕНИЕ ГРАДИЕНТА (БЕЗ UI)
           orchestrator.processRoutingPulse(RoutingPulse(
-            nodeId: peerId,
-            hopsToInternet: peerHops,
-            batteryLevel: 1.0,
-            queuePressure: peerHasData ? 1 : 0,
+            nodeId: peerId, hopsToInternet: peerHops, batteryLevel: 1.0, queuePressure: peerHasData ? 1 : 0,
           ));
 
-          _registerNode(SignalNode(
-              id: mac,
-              name: "Nomad_$peerId",
-              type: SignalType.bluetooth,
-              metadata: mac,
-              bridgeDistance: peerHops
-          ));
-
-          // --- ШАГ Б: ПРИНЯТИЕ РЕШЕНИЯ ОБ ЭСКАЛАЦИИ ---
-          final lastAttempt = _linkCooldowns[mac];
-          final bool isInCooldown = lastAttempt != null &&
-              DateTime.now().difference(lastAttempt).inSeconds < 45;
-
-          if (isInCooldown || _btService.state == BleAdvertiseState.connecting) continue;
-
-          // Условие для перехвата данных (Я - Мост, у соседа есть данные)
-          bool shouldPull = (orchestrator.myHops == 0 && peerHasData);
-
-          // Условие для сброса данных (У меня есть данные, сосед ближе к инету)
-          bool shouldPush = (pendingCount > 0 && peerHops < orchestrator.myHops);
-
-          if (shouldPull || shouldPush) {
-            // 🔥 АТОМНЫЙ ЗАМОК: Предотвращаем GATT-шторм
-            _linkCooldowns[mac] = DateTime.now();
-
-            // 🔥 ПОЛНАЯ ТИШИНА: Выключаем всё радио перед коннектом
-            await _scanSub?.cancel();
-            _scanSub = null;
-            await FlutterBluePlus.stopScan();
-            await _btService.stopAdvertising();
-            await Future.delayed(const Duration(milliseconds: 1000));
-
-            if (shouldPull) {
-              _log("🧲 [Bridge] Magnet pull: Snatching data from $peerId");
-              // Для приема маленьких пульсов используем BLE
-              await _btService.quickLinkAndPing(r.device, orchestrator.generatePulse().toBytes());
-            } else {
-              _log("🚀 [Escalation] Cascade Offload: Moving data to $peerId via Wi-Fi Direct");
-
-              // ПЕРЕХОДИМ НА WI-FI DIRECT ДЛЯ НАДЕЖНОЙ ПЕРЕДАЧИ
-              // Твой нативный метод connect использует MAC-адрес
-              await NativeMeshService.connect(mac);
-
-              // Логика отправки пакета из Outbox находится в методе onNetworkConnected
-              // Он сработает автоматически, как только Android поднимет P2P-группу
+          // ПРИНЯТИЕ РЕШЕНИЯ О КАСКАДНОМ ПРОБИТИИ
+          if (pendingCount > 0 && peerHops < orchestrator.myHops) {
+            if (!_linkCooldowns.containsKey(mac) && !_isTransferring) {
+              _linkCooldowns[mac] = DateTime.now();
+              _executeCascadeRelay(r, peerHops); // Вызываем наш каскад
+              break;
             }
-            break;
           }
         }
       });
 
-      // 4. ЗАПУСК СКАНЕРА
       await FlutterBluePlus.startScan(
         withServices: [Guid(_btService.SERVICE_UUID)],
-        timeout: const Duration(seconds: 15),
-        androidUsesFineLocation: true,
+        timeout: const Duration(seconds: 10),
       );
 
-    } catch (e) {
-      _log("❌ BT Burst Error: $e");
-    } finally {
-      // Авто-завершение цикла через 15 сек
-      Future.delayed(const Duration(seconds: 15), () async {
-        await _btService.stopAdvertising();
-        _isBtScanning = false;
-        _log("💤 [BT] Burst cycle completed.");
-      });
+    } catch (e) { _log("❌ BT Radar Error: $e"); }
+    finally { Future.delayed(const Duration(seconds: 10), () => _isBtScanning = false); }
+  }
+
+  // ============================================================
+  // ⛓️ КАСКАДНЫЙ ПРОТОКОЛ (WiFi -> BLE -> Sonar)
+  // ============================================================
+
+  Future<void> _executeCascadeRelay(ScanResult target, int peerHops) async {
+    _isTransferring = true;
+    notifyListeners();
+    _log("⛓️ Engaging Cascade for node ${target.device.remoteId}");
+
+    final pending = await _db.getPendingFromOutbox();
+    if (pending.isEmpty) { _isTransferring = false; return; }
+
+    // --- STAGE 1: WI-FI DIRECT HUNT ---
+    _log("📡 Stage 1: Wi-Fi Hunt initiated...");
+    _isEscalating = true;
+    _targetIdToHunt = target.device.remoteId.str.substring(target.device.remoteId.str.length - 4);
+
+    await NativeMeshService.startDiscovery();
+
+    // Ждем 10 секунд появления Wi-Fi линка
+    await Future.delayed(const Duration(seconds: 10));
+
+    if (_isP2pConnected) {
+      _log("✅ Stage 1 Success: Wi-Fi link established.");
+      _isEscalating = false;
+      return;
     }
+
+    // --- STAGE 2: BLE GATT ATTACK ---
+    _log("⚠️ Stage 1 Failed (Wi-Fi silent). Stage 2: BLE GATT...");
+    _isEscalating = false;
+
+    try {
+      final String payload = jsonEncode({
+        'type': 'OFFLINE_MSG',
+        'content': pending.first['content'],
+        'senderId': _apiService.currentUserId,
+        'h': pending.first['id'],
+        'ttl': 5,
+      });
+
+      await _btService.sendMessage(target.device, payload);
+      _log("✅ Stage 2 Success: Delivered via BLE GATT.");
+      _isTransferring = false;
+      notifyListeners();
+      return;
+    } catch (e) { _log("⚠️ Stage 2 Failed: GATT 133."); }
+
+    // --- STAGE 3: SONAR FALLBACK ---
+    _log("🔊 Stage 3: Radio Timeout. Escalating to SONAR...");
+    try {
+      await locator<UltrasonicService>().transmitFrame("MSG:${pending.first['id'].hashCode}");
+      _log("✅ Stage 3 Success: Sonar Packet Emitted.");
+    } catch (e) { _log("❌ Total isolation."); }
+
+    _isTransferring = false;
+    notifyListeners();
+  }
+
+  // 🔥 ОБНОВЛЯЕМ ЭТОТ МЕТОД: Он теперь "авто-киллер"
+
+
+  // 🔥 ЭТОТ МЕТОД ОТВЕЧАЕТ ЗА РЕАЛЬНУЮ ПЕРЕДАЧУ ПОСЛЕ УСТАНОВКИ ЛИНКА
+  // --- 🔥 ВЫГРУЗКА ДАННЫХ ПОСЛЕ УСТАНОВКИ ЛИНКА ---
+  void onNetworkConnected(bool isHost, String hostAddress) async {
+    _isP2pConnected = true;
+    _isHost = isHost;
+    _isTransferring = false;
+    _transferGuardTimer?.cancel(); // Выключаем стража
+
+    _log("🌐 [CONNECTED] Wi-Fi Group Established.");
+    notifyListeners();
+
+    // Твоя логика отправки через TCP...
+    await Future.delayed(const Duration(seconds: 5));
+    _log("🚀 [OFFLOAD] Sending signals...");
+
+    // 2. ВЫГРУЗКА
+    final pending = await _db.getPendingFromOutbox();
+    if (pending.isNotEmpty) {
+      // КЛИЕНТ всегда шлет на .49.1 - это железное правило Android
+      String targetIp = isHost ? hostAddress : "192.168.49.1";
+
+      _log("🚀 [OFFLOAD] Pushing signals to $targetIp");
+
+      for (var msgData in pending) {
+        final packet = jsonEncode({
+          'type': 'OFFLINE_MSG',
+          'chatId': msgData['chatRoomId'],
+          'content': msgData['content'],
+          'senderId': _apiService.currentUserId,
+          'h': msgData['id'],
+        });
+
+        // Пробуем отправить
+        await NativeMeshService.sendTcp(packet, host: targetIp);
+      }
+      _log("✅ [SUCCESS] Mesh transmission complete.");
+    }
+    notifyListeners();
   }
 
 
@@ -687,6 +943,8 @@ class MeshService with ChangeNotifier {
         jsonString = rawData.toString();
       }
 
+
+
       if (jsonString.isEmpty) {
         _log("⚠️ [Mesh] Empty payload received. Aborting.");
         return;
@@ -704,6 +962,11 @@ class MeshService with ChangeNotifier {
         _log("♻️ [Gossip] Duplicate pulse ($packetHash). Dropping to save battery.");
         return;
       }
+      // 🔻 ВСТАВИТЬ СЮДА: Если есть IP и ID, запоминаем маршрут
+      if (senderIp != null && data['senderId'] != null) {
+        _idToIpMap[data['senderId']] = senderIp;
+      }
+
 
       // --- 4. МАРШРУТИЗАЦИЯ ОБРАТНОГО ПУТИ (Peer Lock) ---
       // Фиксируем IP отправителя. В Wi-Fi Direct IP могут меняться,
@@ -731,13 +994,22 @@ class MeshService with ChangeNotifier {
           break;
 
         case 'MAGNET_PULSE':
-          final pulse = RoutingPulse.fromJson(data); // Используем наш класс
-          locator<TacticalMeshOrchestrator>().processRoutingPulse(pulse); // Скармливаем мозгу
+          final int peerDist = data['dist'] ?? 255;
+          final String peerId = data['senderId'] ?? "Unknown";
 
-          if (pulse.hopsToInternet < 5) {
-            HapticFeedback.heavyImpact();
+          // Если сосед ближе к интернету, чем я - обновляю свой градиент
+          if (peerDist < _myDistanceToBridge) {
+            _myDistanceToBridge = peerDist + 1;
+            _log("🧭 Route Optimized: Found path to Internet via $peerId ($peerDist hops)");
+
+            // Срочно уведомляем Оркестратор о смене градиента
+            locator<TacticalMeshOrchestrator>().processRoutingPulse(RoutingPulse(
+              nodeId: peerId,
+              hopsToInternet: peerDist,
+              batteryLevel: (data['batt'] ?? 0) / 100.0,
+              queuePressure: data['press'] ?? 0,
+            ));
           }
-          notifyListeners();
           break;
 
         case 'PING':
@@ -815,30 +1087,39 @@ class MeshService with ChangeNotifier {
     }
   }
 
+  String? resolveIpForUser(String userId) {
+    // 1. Проверяем таблицу
+    if (_idToIpMap.containsKey(userId)) return _idToIpMap[userId];
+
+    // 2. Если не нашли, но это Host - возвращаем стандартный адрес
+    if (_isHost == false && _lastKnownPeerIp == "192.168.49.1") return "192.168.49.1";
+
+    return null;
+  }
+
 
 
   /// Рассылка статуса близости к интернету
   void broadcastMagnetStatus() async {
+    final orchestrator = locator<TacticalMeshOrchestrator>();
     final currentRole = NetworkMonitor().currentRole;
-    _myDistanceToBridge = (currentRole == MeshRole.BRIDGE) ? 0 : 99;
 
-    // Если мы не мост, но видим мост среди соседей
-    if (_myDistanceToBridge != 0) {
-      int minDist = 98;
-      for (var node in _nearbyNodes.values) {
-        if (node.bridgeDistance < minDist) minDist = node.bridgeDistance;
-      }
-      _myDistanceToBridge = minDist + 1;
-    }
+    // Если я BRIDGE - мои хопы 0. Если нет - беру из оркестратора.
+    _myDistanceToBridge = (currentRole == MeshRole.BRIDGE) ? 0 : orchestrator.myHops;
 
     final pulse = jsonEncode({
       'type': 'MAGNET_PULSE',
       'senderId': _apiService.currentUserId,
-      'dist': _myDistanceToBridge,
+      'dist': _myDistanceToBridge, // Метрика Hops
+      'batt': await _battery.batteryLevel,
+      'press': await _db.getOutboxCount(),
     });
 
+    _log("🧲 Emitting Magnet Pulse (My Hops: $_myDistanceToBridge)");
+
+    // 1. Шлем по Wi-Fi всем активным соседям (L3 Ping)
     for (var node in _nearbyNodes.values) {
-      if (node.type == SignalType.mesh) {
+      if (node.type == SignalType.mesh && !node.metadata.contains(":")) {
         NativeMeshService.sendTcp(pulse, host: node.metadata);
       }
     }
@@ -1127,27 +1408,22 @@ class MeshService with ChangeNotifier {
   }
 
   Future<void> sendTcpBurst(String message) async {
-    String targetIp;
+    String targetIp = _lastKnownPeerIp.isNotEmpty ? _lastKnownPeerIp : "192.168.49.1";
 
-    if (!_isHost) {
-      // Я - КЛИЕНТ. Шлю всегда Хосту.
-      targetIp = "192.168.49.1";
-      _log("📡 Route: Client -> Host ($targetIp)");
-    } else {
-      // Я - ХОСТ. Шлю КЛИЕНТУ на его реальный IP.
-      if (_lastKnownPeerIp.isEmpty || _lastKnownPeerIp == "192.168.49.1") {
-        _log("⚠️ Error: I am Host, but Peer IP is not captured yet.");
-        return;
+    _log("🚀 [Burst] Initiating TCP transfer to $targetIp");
+
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await NativeMeshService.sendTcp(message, host: targetIp);
+        _log("✅ [Burst] Success on attempt $attempt");
+        return; // Успех, выходим
+      } catch (e) {
+        _log("⚠️ [Burst] Attempt $attempt failed: $e");
+        // Ждем дольше с каждой попыткой (2с, 4с, 6с)
+        await Future.delayed(Duration(seconds: attempt * 2));
       }
-      targetIp = _lastKnownPeerIp;
-      _log("📡 Route: Host -> Client ($targetIp)");
     }
-
-    // Тот самый Burst (3 попытки)
-    for (int i = 0; i < 3; i++) {
-      await NativeMeshService.sendTcp(message, host: targetIp);
-      await Future.delayed(const Duration(milliseconds: 200));
-    }
+    _log("❌ [Burst] Fatal: Could not reach $targetIp after 3 attempts.");
   }
 
   // --- ДОПОЛНИТЕЛЬНЫЕ МЕТОДЫ СВЯЗИ ---
@@ -1188,26 +1464,30 @@ class MeshService with ChangeNotifier {
 
 
 
+  /// Функция активации "Маяка Интернета"
+  /// Вызывается Оркестратором на BRIDGE-ноде
+  void emitInternetMagnetWave() async {
+    if (NetworkMonitor().currentRole != MeshRole.BRIDGE) return;
 
-  // lib/core/mesh_service.dart
+    final wave = {
+      'type': 'MAGNET_WAVE',
+      'bridgeId': _apiService.currentUserId,
+      'hops': 0, // Я - источник
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+      'senderId': _apiService.currentUserId,
+    };
 
+    _log("📡 [Global] Emitting Internet Magnet Wave...");
+
+    // Выстреливаем во все стороны (BLE + Wi-Fi)
+    String payload = jsonEncode(wave);
+    sendTcpBurst(payload);
+    // BLE Advertising обновится автоматически в следующем такте Оркестратора
+  }
 
 
   // --- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ---
 
-  Future<bool> _isHardwareReady() async {
-    if (!Platform.isAndroid) return true;
-    await [Permission.location, Permission.bluetoothScan, Permission.bluetoothConnect].request();
-
-    if (!(await Geolocator.isLocationServiceEnabled())) {
-      await Geolocator.openLocationSettings();
-      return false;
-    }
-    if (await FlutterBluePlus.adapterState.first != BluetoothAdapterState.on) {
-      if (Platform.isAndroid) await FlutterBluePlus.turnOn();
-    }
-    return true;
-  }
 
 
   void _addLog(String msg) => _log(msg);
@@ -1219,34 +1499,7 @@ class MeshService with ChangeNotifier {
   bool _isRouteReady = false;
   bool get isRouteReady => _isRouteReady;
 
-  void onNetworkConnected(bool isHost, String hostAddress) async {
-    _isP2pConnected = true;
-    _isHost = isHost;
 
-    _log("🌐 [MESH-LINK] Connected to group. Sending payload...");
-
-    final db = locator<LocalDatabaseService>();
-    final pending = await db.getPendingFromOutbox();
-
-    if (pending.isNotEmpty) {
-      final msg = pending.first;
-      final packet = jsonEncode({
-        'type': 'OFFLINE_MSG',
-        'chatId': msg['chatRoomId'],
-        'content': msg['content'],
-        'senderId': _apiService.currentUserId,
-        'h': msg['id'],
-      });
-
-      // 🔥 ТЕПЕРЬ МЫ ШЛЕМ НА IP, А НЕ НА MAC!
-      // Если я клиент - шлю Хосту (192.168.49.1)
-      // Если я хост - шлю клиенту (hostAddress)
-      String targetIp = isHost ? hostAddress : "192.168.49.1";
-
-      await NativeMeshService.sendTcp(packet, host: targetIp);
-      _log("🚀 [DATA] Signal offloaded via Wi-Fi Direct to $targetIp");
-    }
-  }
 
   void logSonarEvent(String msg, {bool isError = false}) {
     final timestamp = DateTime.now().toIso8601String().split('T').last.substring(0, 8);
@@ -1298,8 +1551,9 @@ class MeshService with ChangeNotifier {
 
   void onNetworkDisconnected() {
     _isP2pConnected = false;
-    notifyListeners();
+    _isTransferring = false; // СБРОС: линк упал, флаг больше не нужен
     _log("🔌 Link severed.");
+    notifyListeners();
   }
 
   void stopAll() async {
@@ -1421,6 +1675,12 @@ void _triggerSlowScan() {
     startDiscovery(SignalType.mesh);
   });
 }
+
+  void resetTransferLock() {
+    _isTransferring = false;
+    _log("🔓 Manual lock reset performed.");
+    notifyListeners();
+  }
   void _startSonar() {
     final sonar = UltrasonicService();
     sonar.transmitBeacon(); // 🔊 ультразвуковой маяк

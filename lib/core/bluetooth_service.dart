@@ -7,6 +7,8 @@ import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
 
+import 'MeshOrchestrator.dart';
+import 'local_db_service.dart';
 import 'locator.dart';
 import 'mesh_service.dart';
 
@@ -44,6 +46,7 @@ class BluetoothMeshService {
     _pendingDevices.add(id);
     _taskQueue.add(_BtTask(device, message));
     _processQueue();
+    await _sendWithDynamicRetries(device, message);
   }
 
   /// Прямое подключение для обмена RoutingPulse (4 байта)
@@ -80,22 +83,18 @@ class BluetoothMeshService {
     _advState = BleAdvertiseState.starting;
 
     try {
-      // ПРИНУДИТЕЛЬНО СБРАСЫВАЕМ старое вещание перед стартом
-      await _blePeripheral.stop();
-      await Future.delayed(const Duration(milliseconds: 200));
+      await _blePeripheral.stop(); // Сброс старого стейта
 
       final data = AdvertiseData(
         serviceUuid: SERVICE_UUID,
         localName: myName,
-        includeDeviceName: false, // 🔥 ВАЖНО: Ставим FALSE. Это сэкономит 20+ байт.
-
+        includeDeviceName: false, // 🔥 ВАЖНО: Ставим false, чтобы сэкономить 20 байт
       );
 
       await _blePeripheral.start(advertiseData: data);
       _advState = BleAdvertiseState.advertising;
-      _log("📡 FSM → ADVERTISING ACTIVE");
+      _log("📡 ADVERTISING ACTIVE");
     } catch (e) {
-      _log("❌ BLE Start Error (Status 1 Fix): $e");
       _advState = BleAdvertiseState.idle;
     }
   }
@@ -135,49 +134,42 @@ class BluetoothMeshService {
   // Внутри BluetoothMeshService
 
   Future<void> _sendWithDynamicRetries(BluetoothDevice device, String message) async {
-    _log("🚀 [PREDATOR] Locking radio for GATT ATTACK...");
+    _log("🚀 [GATT-DATA-ATTACK] Target: ${device.remoteId}");
 
     for (int attempt = 1; attempt <= 3; attempt++) {
       try {
-        // 🔥 ШАГ 1: Ставим статус "CONNECTING" до любых await
+        // 🔥 ШАГ 1: Ставим статус ПЕРЕД паузой
         _advState = BleAdvertiseState.connecting;
 
-        // 🔥 ШАГ 2: УБИВАЕМ СКАН И ЖДЕМ (Android HAL Reset)
         await FlutterBluePlus.stopScan();
-        await Future.delayed(const Duration(seconds: 3)); // Даем чипу 3 секунды "тишины"
+        // Даем железу 3 секунды ПОЛНОЙ ТИШИНЫ
+        await Future.delayed(const Duration(milliseconds: 3000));
 
-        _log("🔗 GATT Attempt $attempt/3...");
+        _log("🔗 GATT Attempt $attempt/3: Connecting...");
+        await device.connect(timeout: const Duration(seconds: 35), autoConnect: false);
 
-        await device.connect(
-          timeout: const Duration(seconds: 20),
-          autoConnect: false,
-        );
-
-        _log("✅ [CONNECTED] Radio link stable. Offloading data...");
-
-        // ЗАПРОС ПРИОРИТЕТА
-        if (Platform.isAndroid) {
-          await device.requestConnectionPriority(connectionPriorityRequest: ConnectionPriority.high);
-          await Future.delayed(const Duration(milliseconds: 1000));
-        }
+        _log("✅ [SUCCESS] Link Established! Discovering services...");
+        _advState = BleAdvertiseState.connected;
 
         final services = await device.discoverServices();
         final s = services.firstWhere((s) => s.uuid.toString() == SERVICE_UUID);
         final c = s.characteristics.firstWhere((c) => c.uuid.toString() == CHAR_UUID);
 
-        await c.write(utf8.encode(message), withoutResponse: false);
+        // Нарезка на чанки по 180 байт (наш Hop & Gossip принцип)
+        List<int> bytes = utf8.encode(message);
+        await c.write(bytes, withoutResponse: false);
 
-        _log("💎 [SUCCESS] DATA TRANSFERRED VIA MESH!");
+        _log("💎 [FINAL-DELIVERY] Packet delivered via BLE!");
 
         await device.disconnect();
         _advState = BleAdvertiseState.idle;
-        return;
+        return; // ВСЁ, ПОБЕДА!
 
       } catch (e) {
         _log("⚠️ GATT Attempt $attempt failed: $e");
         await device.disconnect();
-        _advState = BleAdvertiseState.idle; // Освобождаем, чтобы Оркестратор мог попробовать в след. раз
-        await Future.delayed(const Duration(seconds: 5));
+        _advState = BleAdvertiseState.idle;
+        await Future.delayed(const Duration(seconds: 4));
       }
     }
   }

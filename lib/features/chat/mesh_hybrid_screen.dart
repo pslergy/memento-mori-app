@@ -331,7 +331,7 @@ class _AllyCard extends StatelessWidget {
     bool isBT = node.type == SignalType.bluetooth;
     return FadeInRight(
       child: Container(
-        width: 110, // Чуть увеличили ширину
+        width: 110,
         margin: const EdgeInsets.only(right: 15),
         padding: const EdgeInsets.all(10),
         decoration: BoxDecoration(
@@ -341,12 +341,12 @@ class _AllyCard extends StatelessWidget {
         ),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
-          mainAxisSize: MainAxisSize.min, // 🔥 Фикс: сжимаем колонку
+          mainAxisSize: MainAxisSize.min,
           children: [
             Icon(isBT ? Icons.bluetooth : Icons.wifi_tethering,
                 color: isBT ? Colors.blueAccent : AppColors.gridCyan, size: 22),
             const SizedBox(height: 6),
-            Flexible( // 🔥 Фикс: текст теперь не давит на границы
+            Flexible(
               child: Text(
                 node.name,
                 style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
@@ -356,18 +356,29 @@ class _AllyCard extends StatelessWidget {
             ),
             const SizedBox(height: 6),
             SizedBox(
-              height: 24, // Жесткая высота для кнопки
+              height: 24,
               child: ElevatedButton(
                 style: ElevatedButton.styleFrom(
                     backgroundColor: AppColors.gridCyan.withOpacity(0.1),
                     side: BorderSide(color: AppColors.gridCyan.withOpacity(0.5), width: 0.5),
                     padding: EdgeInsets.zero
                 ),
-                onPressed: () {
-                  HapticFeedback.lightImpact();
-                  NativeMeshService.connect(node.id);
-                },
-                child: const Text("LINK", style: TextStyle(fontSize: 8, color: AppColors.gridCyan, fontWeight: FontWeight.bold)),
+                onPressed: () async {
+                  // 🔥 ПРЯМАЯ ПРОВЕРКА НАЖАТИЯ
+                  print("👆 [UI] LINK button tapped for node: ${node.id}");
+
+                  HapticFeedback.mediumImpact();
+
+                  // Передаем управление сервису
+                  await locator<MeshService>().connectToNode(node.id);
+                }, // Вот здесь была пропущена запятая
+                child: context.watch<MeshService>().isTransferring
+                    ? const SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.gridCyan)
+                )
+                    : const Text("LINK", style: TextStyle(fontSize: 8, fontWeight: FontWeight.bold)),
               ),
             )
           ],

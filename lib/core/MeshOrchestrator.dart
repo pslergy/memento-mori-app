@@ -116,15 +116,20 @@ extension MeshNetworkStarter on TacticalMeshOrchestrator {
     _startBLE();
 
     // 4️⃣ Sonar (Acoustic Plane) — проверка разрешения
+    // 4️⃣ Sonar (Acoustic Plane)
     Future<void> sonarInit() async {
-      if (_sonar.isTransmitting) return;
+      // Проверяем, дали ли нам права ранее
+      var status = await Permission.microphone.status;
 
-      bool micGranted = await _requestMicrophonePermission(context);
-      if (!micGranted) {
-        _log("⚠️ Microphone permission denied. Sonar will remain off.");
+      // Если прав НЕТ — мы НЕ вызываем request().
+      // Мы просто пишем в лог и выходим.
+      // Это предотвратит сворачивание приложения при авто-запуске.
+      if (!status.isGranted) {
+        _log("⚠️ Sonar Init skipped: Permission missing. User must grant it manually via UI.");
         return;
       }
 
+      // Если права ЕСТЬ, запускаем
       try {
         await _startSonar();
         _log("🔊 Sonar initialized successfully");
@@ -146,66 +151,66 @@ extension MeshNetworkStarter on TacticalMeshOrchestrator {
 
   /// 🔹 Запрос разрешения на микрофон (Just-in-time)
   Future<bool> _requestMicrophonePermission(BuildContext? context) async {
-    final status = await Permission.microphone.status;
+    // Если мы в фоне — возвращаем false и даже не спрашиваем систему.
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return false;
+    }
+    // 1. Сначала просто проверяем статус
+    var status = await Permission.microphone.status;
+
+    // Если уже разрешено - сразу возвращаем true, НЕ ВЫЗЫВАЯ .request()
     if (status.isGranted) return true;
 
-    _log("📢 Requesting microphone permission...");
-
-    // Показать системный диалог
-    final result = await Permission.microphone.request();
-    if (result.isGranted) return true;
-
-    // Можно показать SnackBar или диалог для объяснения
-    if (context != null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            "Microphone permission is required for acoustic offline messaging.",
-          ),
-        ),
-      );
+    // Если мы в фоне - даже не пытаемся просить, это вызовет краш UI
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return false;
     }
-    return false;
+
+    _log("📢 Requesting microphone permission...");
+    final result = await Permission.microphone.request();
+    return result.isGranted;
   }
 
   /// 🔹 BLE стартер (Control Plane)
   Future<void> _startBLE() async {
-    if (_bleActive) return;
-    _bleActive = true;
+    final int pending = await locator<LocalDatabaseService>().getOutboxCount();
+    String myId = _mesh.apiService.currentUserId;
+    String shortId = myId.length > 4 ? myId.substring(0, 4) : "GHST";
 
-    final int pendingCount = await locator<LocalDatabaseService>().getOutboxCount();
-    final String dataFlag = pendingCount > 0 ? "1" : "0";
-    final String myName = "M_${myHops}_${dataFlag}_${_mesh.apiService.currentUserId.substring(0,4)}";
+    // Формат: M_Hops_HasData_ID
+    String tacticalName = "M_${_myHopsToInternet}_${pending > 0 ? '1' : '0'}_$shortId";
+    _log("📡 BLE Pulse: $tacticalName");
 
-    _log("📡 BLE pulse: $myName");
-
-    await _bt.startAdvertising(myName);
+    await _bt.startAdvertising(tacticalName);
+    // Скан на 8 секунд
     _mesh.startDiscovery(SignalType.bluetooth);
-
-    await Future.delayed(const Duration(seconds: 4));
-
+    await Future.delayed(const Duration(seconds: 8));
     await _bt.stopAdvertising();
-    await _mesh.stopDiscovery();
-
-    _bleActive = false;
-    _log("📡 BLE pulse completed");
   }
 }
 
 
 
+class TacticalMeshOrchestrator with WidgetsBindingObserver {
 
-class TacticalMeshOrchestrator {
-  static final TacticalMeshOrchestrator _instance =
-  TacticalMeshOrchestrator._internal();
+  static final TacticalMeshOrchestrator _instance = TacticalMeshOrchestrator._internal();
   factory TacticalMeshOrchestrator() => _instance;
-  TacticalMeshOrchestrator._internal();
+
+
+
 
   final MeshService _mesh = locator<MeshService>();
   final BluetoothMeshService _bt = locator<BluetoothMeshService>();
   final UltrasonicService _sonar = locator<UltrasonicService>();
   final GossipManager _gossip = locator<GossipManager>();
   final ReversePathRegistry reversePath = ReversePathRegistry();
+
+  bool _isAppInForeground = true;
+
+  TacticalMeshOrchestrator._internal() {
+    // 2. Подписываемся на события жизненного цикла
+    WidgetsBinding.instance.addObserver(this);
+  }
 
   final Map<String, RouteInfo> _routingTable = {};
   int _myHopsToInternet = 255;
@@ -253,13 +258,35 @@ class TacticalMeshOrchestrator {
   }
   void _log(String m) => print("🧠 [Orchestrator] $m");
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
 
+    _isAppInForeground = state == AppLifecycleState.resumed;
+
+    if (!_isAppInForeground) {
+      // Если свернули - СРОЧНО выключаем Сонар
+      _stopSonarForce();
+    }
+  }
+
+  // Метод экстренной остановки
+  void _stopSonarForce() {
+    if (_sonar.isTransmitting) {
+      _sonar.stop(); // Убедись, что в UltrasonicService есть метод stop()
+      _log("🔇 App backgrounded. Sonar KILLED to prevent OS lock.");
+    }
+  }
+
+  // Не забудь добавить dispose, хотя синглтон живет вечно
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+  }
   // ====================== PUBLIC ======================
   void start() {
     _listenBattery();
     // Добавляем Jitter: каждый телефон просыпается в свое время
     final jitter = Duration(milliseconds: _rng.nextInt(5000));
-    Future.delayed(jitter, () => _startBiologicalHeartbeat());
+    Future.delayed(Duration(seconds: 2 + _rng.nextInt(10)), () => _startBiologicalHeartbeat());
     _log("🧭 [System] Heartbeat initialized with jitter: ${jitter.inMilliseconds}ms");
   }
 
@@ -267,10 +294,18 @@ class TacticalMeshOrchestrator {
   void _startBiologicalHeartbeat() {
     _heartbeatTimer?.cancel();
 
-    int nextTick = 15 + _rng.nextInt(30);
+    int nextTick = 20 + _rng.nextInt(20);
+
+    // 🔻 ИЗМЕНЕНИЕ: Try-Catch-Finally внутри таймера
     _heartbeatTimer = Timer(Duration(seconds: nextTick), () async {
-      await _executeBurstWindow();
-      _startBiologicalHeartbeat();
+      try {
+        await _executeBurstWindow();
+      } catch (e) {
+        _log("❌ Heartbeat arrhythmia: $e");
+      } finally {
+        // Рекурсивный вызов всегда сработает, даже при ошибке
+        _startBiologicalHeartbeat();
+      }
     });
   }
 
@@ -320,24 +355,42 @@ class TacticalMeshOrchestrator {
       _log("🚀 [Routing] Uplink found: ${bestNextHop.nodeId} (Hops: ${bestNextHop.hopsToInternet})");
 
       try {
-        // Превращаем сообщение в пакет для передачи
+        // 1. Сначала создаем переменную packet (чтобы не было ошибки Undefined name)
         final packet = jsonEncode({
           'type': 'OFFLINE_MSG',
-          'chatId': msg.id, // или твой ChatRoomId
+          'chatId': msg.id, // В твоем коде использовался msg.id как chatId
           'content': msg.content,
           'senderId': msg.senderId,
           'timestamp': msg.createdAt.millisecondsSinceEpoch,
-          'h': msg.id.hashCode.toString(), // Компактный хеш
-          'ttl': 5, // Начальный TTL
+          'h': msg.id,       // ID сообщения
+          'ttl': 5,          // Время жизни пакета
         });
 
-        // Передаем через Native-слой (Wi-Fi Direct)
-        // В качестве host используем IP соседа, который ты сохранил в метаданных ноды
-        await NativeMeshService.sendTcp(packet, host: bestNextHop.nodeId);
+        // 2. Получаем IP адрес соседа
+        final mesh = locator<MeshService>();
+        String? targetIp = mesh.resolveIpForUser(bestNextHop.nodeId);
+
+        // Фолбек: если в карте нет, пробуем использовать nodeId как IP (для старых версий)
+        targetIp ??= bestNextHop.nodeId;
+
+        // Грубая проверка: это вообще IP? (должен содержать точки)
+        if (!targetIp.contains('.')) {
+          _log("⚠️ Cannot route via Wi-Fi: No IP address for ${bestNextHop.nodeId}");
+          // Тут можно было бы добавить отправку через Bluetooth, но пока просто выходим
+          return;
+        }
+
+        // 3. Отправляем на реальный IP
+        await NativeMeshService.sendTcp(packet, host: targetIp);
+
+        // 4. Обновляем статус в базе на "SENT" (чтобы пропали часики)
+        await db.updateMessageStatus(msg.id, "SENT");
+        await db.removeFromOutbox(msg.id);
 
         _log("✅ Signal successfully relayed to next hop.");
       } catch (e) {
         _log("⚠️ Transmission failed: $e. Falling back to Cache.");
+        // Если не вышло - оставляем в Outbox
         await db.addToOutbox(msg, "GRID_SYNC");
       }
     } else {
@@ -384,117 +437,107 @@ class TacticalMeshOrchestrator {
 
   // ====================== BURST WINDOW ======================
   Future<void> _executeBurstWindow() async {
-    // 🛡️ ГВАРД 1: ПРЕДОТВРАЩЕНИЕ КОЛЛИЗИЙ (Hardware Interlock)
-    // Если мы уже в процессе линковки (GATT Handshake) или передачи данных,
-    // Оркестратор обязан уйти в режим полной тишины.
-    if (_bt.state == BleAdvertiseState.connecting || _bt.state == BleAdvertiseState.connected) {
-      _log("🛡️ [Orchestrator] DATA TRANSMISSION DETECTED. Entering Total Silence.");
+    final mesh = locator<MeshService>();
+
+    // 🛡️ ГЛОБАЛЬНЫЙ ЗАМОК: Если мы в процессе коннекта Wi-Fi или данные уже летят - МОЛЧИМ.
+    if (mesh.isTransferring || mesh.isP2pConnected || _bt.state == BleAdvertiseState.connecting) {
+      _log("🛡️ [Orchestrator] Data Plane active. Aborting background pulse.");
       return;
     }
 
-    _isRadioAwake = true;
-    final score = await _evaluateEnvironment();
-    _log("💓 Burst Wake: Score=$score | Pressure=$_messagePressure | Batt=${_batteryAvg.toStringAsFixed(1)}%");
-
-    // 1. ДИНАМИЧЕСКОЕ УПРАВЛЕНИЕ РОЛЯМИ (Self-Healing Topology)
-    if (_role != NodeRole.BRIDGE && score >= 6) {
-      _promoteToBridge();
-    } else if (score < 4 && _role != NodeRole.GHOST) {
-      _stepDown();
+    // 🛡️ ГВАРД: Полная тишина при активном соединении
+    if (_bt.state == BleAdvertiseState.connecting ||
+        mesh.isTransferring ||
+        mesh.isP2pConnected) {
+      _log("🛡️ [Silence] Critical Data Task in progress. Burst aborted.");
+      return;
     }
 
-    _burstQueue.clear();
+    _log("💓 Burst Wake: Score calculation...");
+    _messagePressure = await locator<LocalDatabaseService>().getOutboxCount();
 
-    // 2. СТРАТЕГИЯ BLE (Control Plane)
-    // Вещаем о своем статусе (Hops, DataFlag), чтобы соседи могли принять решение
-    if (_bt.state == BleAdvertiseState.idle) {
-      _burstQueue.add(() async => await _startBLE());
+    // 1. Инициализируем список задач ПЕРЕД использованием
+    List<Future<void> Function()> tasks = [];
+
+    // Задача: BLE Beacon
+    tasks.add(() async => await _startBLE());
+
+    // Задача: Acoustic Discovery
+    if (_batteryAvg > 20) {
+      tasks.add(() async => await _startSonar());
     }
 
-    // 3. СТРАТЕГИЯ SONAR (Acoustic Plane)
-    // Используем ультразвук как "будильник" для спящих нод
-    if (_messagePressure > 0 || _rng.nextDouble() < 0.3) {
-      _burstQueue.add(() async {
-        // Проверка перед пуском: не занял ли кто-то радио-канал за это время?
-        if (_bt.state == BleAdvertiseState.idle) {
-          await _startSonar();
-          // Микро-пауза после сонара, чтобы звук утих в буферах HAL
-          await Future.delayed(const Duration(seconds: 1));
-        }
-      });
+    // Задача: Internet Propagation (Magnet Pulse)
+    if (NetworkMonitor().currentRole == MeshRole.BRIDGE) {
+      tasks.add(() async => _mesh.emitInternetMagnetWave());
+    } else if (_messagePressure > 0) {
+      tasks.add(() async => await _mesh.seekInternetUplink());
     }
 
-    // 4. ТАКТИЧЕСКИЙ РОУТИНГ (Data Plane Optimization)
-    final uplinkNode = _findNodeWithInternet();
-    if (uplinkNode != null) {
-      _log("🌐 [Uplink] Gateway found: ${uplinkNode.name}. Preparing Data Burst...");
-      if (_messagePressure > 0) {
-        _burstQueue.add(() async => await _optimizeRoutingPaths());
-      }
-    } else {
-      _log("⚠️ [Uplink] Isolated. Seeking internet magnets...");
-      // Если накопилось много сообщений, форсируем активный поиск
-      if (_messagePressure > 5) {
-        _burstQueue.add(() async => await _mesh.seekInternetUplink());
-      }
-    }
+    // 🔥 ХАОТИЧЕСКИЙ РОУТИНГ
+    tasks.shuffle(_rng);
 
-    // 5. БЕЗОПАСНОЕ ИСПОЛНЕНИЕ (The Safe Loop)
-    while (_burstQueue.isNotEmpty) {
-      // ПРОВЕРКА ВНУТРИ ЦИКЛА (если коннект начался пока мы в очереди)
-      if (_bt.state != BleAdvertiseState.idle) {
-        _log("🚨 [Abort] Radio hijacked by Linker. Purging queue.");
-        _burstQueue.clear();
+    // 2. Исполнение очереди
+    for (var task in tasks) {
+      // ПРОВЕРКА ПРЯМО ПЕРЕД ЗАПУСКОМ КАЖДОГО МОДУЛЯ
+      final mesh = locator<MeshService>();
+      if (_bt.state != BleAdvertiseState.idle || mesh.isTransferring) {
+        _log("🚨 [Critical Interruption] Radio is occupied by Data Link. Aborting window.");
         break;
       }
 
-      final task = _burstQueue.removeAt(0);
-      try {
-        await task();
-      } catch (e) {
-        _log("❌ Burst task fault: $e");
-      }
+      await task();
 
-      // ГАРАНТИРОВАННЫЙ КУЛДАУН: 2.5 секунды для Tecno/Huawei
-      // Это время нужно для высвобождения дескрипторов Bluetooth-чипа.
-      await Future.delayed(const Duration(milliseconds: 2500));
+      // Длинная пауза между задачами
+      await Future.delayed(Duration(milliseconds: 4000 + _rng.nextInt(2000)));
     }
 
-    await _hibernate();
+    _log("💤 Hibernation initiated.");
   }
-  // ====================== BLE TASK ======================
-  Future<void> _startBLE() async {
-    if (_bleActive) return;
-    _bleActive = true;
 
-    // 1. Кодируем состояние в имени (для обнаружения без хендшейка)
-    final int pendingCount = await locator<LocalDatabaseService>().getOutboxCount();
-    final String dataFlag = pendingCount > 0 ? "1" : "0";
-    final String myName = "M_${myHops}_${dataFlag}_${_mesh.apiService.currentUserId.substring(0,4)}";
+  void updateHops(int newHops, String viaNodeId) {
+    if (newHops < _myHopsToInternet) {
+      _myHopsToInternet = newHops;
+      _log("🧭 Gradient optimized: $_myHopsToInternet hops via $viaNodeId");
 
-    _log("📡 Sleeping Agent pulsing: $myName");
-
-    // 2. Вещаем коротко
-    await _bt.startAdvertising(myName);
-
-    // 3. Аккуратный скан (всего 4 секунды раз в цикл)
-    _mesh.startDiscovery(SignalType.bluetooth);
-
-    await Future.delayed(const Duration(seconds: 4));
-
-    await _bt.stopAdvertising();
-    await _mesh.stopDiscovery();
-
-    _bleActive = false;
+      // Форсируем пересчет путей в БД
+      _optimizeRoutingPaths(viaNodeId);
+    }
   }
+
+  Future<void> _optimizeRoutingPaths([String? preferredUplinkId]) async {
+    final db = locator<LocalDatabaseService>();
+    final database = await db.database;
+
+    if (preferredUplinkId != null) {
+      await database.update('outbox',
+          {
+            'preferred_uplink': preferredUplinkId,
+            'routing_state': 'ROUTING'
+          },
+          where: "routing_state = 'PENDING'"
+      );
+      _log("🧭 Outbox redirected to $preferredUplinkId");
+    }
+  }
+
 
 
   // ====================== SONAR TASK ======================
   Future<void> _startSonar() async {
-    if (_bleActive) {
-      _log("⏳ Skipping Sonar, BLE is active to avoid HAL_LOCKED.");
+    // 1. Проверяем, активно ли приложение
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) return;
+
+    // 2. 🔥 ВАЖНОЕ ИЗМЕНЕНИЕ:
+    // Мы НЕ вызываем .request() здесь. Мы только проверяем статус.
+    // Если прав нет — мы просто выходим. Пусть UI показывает пользователю кнопку "Дать права".
+    var status = await Permission.microphone.status;
+    if (!status.isGranted) {
+      _log("🔇 Sonar skipped: Permission not granted yet.");
       return;
     }
+
+    if (_bleActive) return;
     if (_sonar.isTransmitting) return;
 
     _log("🔊 Starting Sonar FFT Sweep...");
@@ -504,6 +547,8 @@ class TacticalMeshOrchestrator {
       _log("⚠️ Sonar task failed: $e");
     }
   }
+
+
 
 
 
@@ -528,37 +573,7 @@ class TacticalMeshOrchestrator {
   }
 
 
-  Future<void> _optimizeRoutingPaths() async {
-    // 1. Берем очередь через открытый теперь геттер .db
-    final pending = await _mesh.db.getPendingFromOutbox();
-    if (pending.isEmpty) return;
 
-    final neighbors = _mesh.nearbyNodes;
-    // Ищем мосты (дистанция < 5)
-    final bridgeNodes = neighbors.where((n) => n.bridgeDistance < 5).toList();
-
-    if (bridgeNodes.isEmpty) return;
-
-    // Сортируем: лучшие мосты вперед
-    bridgeNodes.sort((a, b) => a.bridgeDistance.compareTo(b.bridgeDistance));
-    final bestBridge = bridgeNodes.first;
-
-    List<String> path = [bestBridge.id];
-
-    // 2. 🔥 SQL-СИГНАЛ: Используем .database инстанс
-    final database = await _mesh.db.database;
-    await database.update('outbox',
-        {
-          'preferred_uplink': bestBridge.id,
-          'hop_path': jsonEncode(path),
-          'routing_state': 'ROUTING'
-        },
-        // Обновляем только те, что еще не в пути
-        where: "routing_state = 'PENDING'"
-    );
-
-    _log("🧭 Path calculated to Bridge ${bestBridge.id}. SQL Signal emitted.");
-  }
 
   // ====================== HIBERNATION ======================
   Future<void> _hibernate() async {

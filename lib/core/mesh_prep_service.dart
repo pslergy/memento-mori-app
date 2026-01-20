@@ -1,26 +1,58 @@
 import 'package:permission_handler/permission_handler.dart';
+import 'package:device_info_plus/device_info_plus.dart';
 import 'dart:io';
 
 class MeshPrepService {
+  /// Тот самый метод, который ищет SplashScreen
   static Future<bool> requestTacticalPermissions() async {
     if (!Platform.isAndroid) return true;
 
-    // Запрашиваем всё одним пакетом
-    Map<Permission, PermissionStatus> statuses = await [
-      Permission.location,           // Для Wi-Fi Direct и BLE
-      Permission.bluetoothScan,      // BLE поиск
-      Permission.bluetoothConnect,   // GATT соединение
-      Permission.bluetoothAdvertise, // BLE вещание
-      Permission.nearbyWifiDevices,  // Android 13+ Wi-Fi Mesh
-      Permission.microphone,         // Сонар
-    ].request();
+    print("🛡️ [Security] Initiating Sequential Mandate...");
 
-    // Проверяем, не отказал ли юзер в чем-то критическом
-    bool allGranted = statuses.values.every((status) => status.isGranted);
+    // 1. Собираем список необходимых разрешений
+    List<Permission> tacticalPermissions = [
+      Permission.location,
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.bluetoothAdvertise,
+      Permission.microphone,
+    ];
 
-    if (allGranted) {
-      print("🛡️ [Security] Universal mandate granted. System is authorized.");
+    // 2. Для Android 13+ добавляем разрешение на устройства рядом
+    final androidInfo = await DeviceInfoPlugin().androidInfo;
+    if (androidInfo.version.sdkInt >= 33) {
+      tacticalPermissions.add(Permission.nearbyWifiDevices);
     }
-    return allGranted;
+
+    // 3. Запрашиваем по очереди (Android лучше переваривает одиночные запросы)
+    for (var permission in tacticalPermissions) {
+      final status = await permission.request();
+      if (!status.isGranted) {
+        print("❌ [Security] Mandate rejected for: ${permission.toString()}");
+        // Можно не выходить сразу, а дать юзеру шанс разрешить остальные
+      }
+    }
+
+    // 4. Проверка финального статуса (всё ли нам дали?)
+    bool locationOk = await Permission.location.isGranted;
+    bool btOk = await Permission.bluetoothConnect.isGranted && await Permission.bluetoothScan.isGranted;
+
+    // Специфичная проверка для Android 13
+    bool nearbyOk = (androidInfo.version.sdkInt >= 33)
+        ? await Permission.nearbyWifiDevices.isGranted
+        : true;
+
+    if (locationOk && btOk && nearbyOk) {
+      print("✅ [Security] ALL SYSTEMS AUTHORIZED.");
+
+      // Попутно просим выключить оптимизацию батареи (не критично, но желательно)
+      if (await Permission.ignoreBatteryOptimizations.isDenied) {
+        await Permission.ignoreBatteryOptimizations.request();
+      }
+
+      return true;
+    }
+
+    return false;
   }
 }
