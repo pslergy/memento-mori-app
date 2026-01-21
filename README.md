@@ -17,7 +17,19 @@ Independent research project exploring resilient mobile mesh networking under OS
 <p align="center">
   <!-- PLACEHOLDER FOR DEMO GIF OR SCREENSHOT -->
   <!-- <img src="assets/screenshots/radar_demo.gif" width="300" alt="Sonar Radar Demo" /> -->
-  <i>(Visual demonstration coming soon)</i>
+  ## 📱 UI Screenshots (Research Preview)
+
+<p align="center">
+  <img src="assets/screenshots/1.jpg" width="220"/>
+  <img src="assets/screenshots/2.jpg" width="220"/>
+  <img src="assets/screenshots/3.jpg" width="220"/>
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/4.jpg" width="220"/>
+  <img src="assets/screenshots/5.jpg" width="220"/>
+</p>
+
 </p>
 
 </div>
