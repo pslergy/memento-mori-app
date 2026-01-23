@@ -223,7 +223,34 @@ Rationale:
 
 ---
 
-## 8. Explicit Non-Goals
+## 8. Failure Model & Recovery Strategy
+
+Memento Mori is designed with the assumption that failures are normal,
+frequent, and often unrecoverable in the short term.
+
+The system explicitly models the following failure classes:
+
+- Transport failure (BLE / Wi-Fi / Audio unavailable or unstable)
+- Process termination by the OS
+- Partial message delivery
+- Power loss at arbitrary execution points
+- Duplicate message propagation
+- Stale or contradictory topology information
+
+Recovery principles:
+
+- No failure blocks future progress
+- All operations are retryable or discardable
+- Message delivery is idempotent
+- Duplication is preferred over loss
+- Time (TTL) is used as a garbage collector
+
+The system does not attempt to guarantee immediate delivery.
+Instead, it guarantees eventual consistency under continued node presence.
+
+---
+
+## 9. Explicit Non-Goals
 
 The following are **intentionally excluded**:
 
@@ -237,7 +264,7 @@ If a proposed feature violates these constraints, it will be rejected.
 
 ---
 
-## 9. Architectural Stability
+## 10. Architectural Stability
 
 This architecture is considered **foundational**.
 
@@ -253,7 +280,7 @@ Changes to these principles require strong justification.
 
 ---
 
-## 10. Authorship & Intent
+## 11. Authorship & Intent
 
 Memento Mori was initiated and architected as an independent research project focused on **resilient, censorship-resistant communication**.
 

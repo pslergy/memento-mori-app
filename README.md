@@ -17,7 +17,19 @@ Independent research project exploring resilient mobile mesh networking under OS
 <p align="center">
   <!-- PLACEHOLDER FOR DEMO GIF OR SCREENSHOT -->
   <!-- <img src="assets/screenshots/radar_demo.gif" width="300" alt="Sonar Radar Demo" /> -->
-  <i>(Visual demonstration coming soon)</i>
+   📱 UI Screenshots (Research Preview)
+
+<p align="center">
+  <img src="assets/screenshots/1.jpg" width="220"/>
+  <img src="assets/screenshots/2.jpg" width="220"/>
+  <img src="assets/screenshots/3.jpg" width="220"/>
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/4.jpg" width="220"/>
+  <img src="assets/screenshots/5.jpg" width="220"/>
+</p>
+
 </p>
 
 </div>
@@ -171,6 +183,23 @@ Core changes should remain consistent with them.
 
 ---
 
+
+## 📈 Project Metrics & Community
+
+| Metric | Value | What it means |
+|--------|-------|---------------|
+| Clones (14 days) | 312 | Real usage by developers |
+| Unique Cloners | 144 | Broad developer interest |
+| Stars | [current] | Community validation |
+
+**Star this repo if:**
+- You work with offline/mesh systems
+- The architecture inspires your own projects  
+- You want to see this research continue
+
+**Goal:** 100 stars to validate community interest for continued development.
+
+---
 
 ### 🤝 Contributing
 
