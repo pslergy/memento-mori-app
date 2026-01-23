@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:animate_do/animate_do.dart';
 
 
@@ -54,7 +53,15 @@ class _TimerScreenState extends State<TimerScreen> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text("TEMPORAL EROSION", style: GoogleFonts.orbitron(color: AppColors.warningRed, fontSize: 10, letterSpacing: 5)),
+              const Text(
+                "TEMPORAL EROSION",
+                style: TextStyle(
+                  color: AppColors.warningRed,
+                  fontSize: 10,
+                  letterSpacing: 5,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
               const SizedBox(height: 40),
 
               // ТАЙМЕР
@@ -69,14 +76,27 @@ class _TimerScreenState extends State<TimerScreen> {
                     children: [
                       Row(
                         mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.baseline, textBaseline: TextBaseline.alphabetic,
+                        crossAxisAlignment: CrossAxisAlignment.baseline,
+                        textBaseline: TextBaseline.alphabetic,
                         children: [
-                          Text(parts[0], style: GoogleFonts.russoOne(fontSize: 50, color: Colors.white)),
-                          Text(".", style: GoogleFonts.russoOne(fontSize: 30, color: AppColors.warningRed)),
-                          Text(parts[1].substring(0, 5), style: GoogleFonts.robotoMono(fontSize: 16, color: Colors.white70)),
+                          Text(
+                            parts[0],
+                            style: const TextStyle(fontSize: 50, color: Colors.white, fontWeight: FontWeight.bold),
+                          ),
+                          Text(
+                            ".",
+                            style: TextStyle(fontSize: 30, color: AppColors.warningRed, fontWeight: FontWeight.bold),
+                          ),
+                          Text(
+                            parts[1].substring(0, 5),
+                            style: const TextStyle(fontSize: 16, color: Colors.white70),
+                          ),
                         ],
                       ),
-                      Text("PERCENT REMAINING", style: GoogleFonts.orbitron(fontSize: 8, color: AppColors.textDim)),
+                      const Text(
+                        "PERCENT REMAINING",
+                        style: TextStyle(fontSize: 8, color: AppColors.textDim, letterSpacing: 1.5),
+                      ),
                     ],
                   ),
                 ],
@@ -87,18 +107,31 @@ class _TimerScreenState extends State<TimerScreen> {
               // МАНИФЕСТ
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 40),
-                child: Text(
+                child: const Text(
                   "Every millisecond is a tactical loss. Reach out. Synchronize. Survive.",
                   textAlign: TextAlign.center,
-                  style: GoogleFonts.robotoMono(color: AppColors.textDim, fontSize: 10, fontStyle: FontStyle.italic),
+                  style: TextStyle(
+                    color: AppColors.textDim,
+                    fontSize: 10,
+                    fontStyle: FontStyle.italic,
+                  ),
                 ),
               ),
 
               const SizedBox(height: 40),
 
               // СТАТИСТИКА
-              Text("${_remainingTime.inSeconds}s", style: GoogleFonts.robotoMono(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w100)),
-              Text("SESSION LOSS: ${_sessionSecondsLost.toStringAsFixed(3)}s", style: GoogleFonts.robotoMono(color: AppColors.warningRed.withOpacity(0.5), fontSize: 12)),
+              Text(
+                "${_remainingTime.inSeconds}s",
+                style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w300),
+              ),
+              Text(
+                "SESSION LOSS: ${_sessionSecondsLost.toStringAsFixed(3)}s",
+                style: TextStyle(
+                  color: AppColors.warningRed.withOpacity(0.5),
+                  fontSize: 12,
+                ),
+              ),
             ],
           ),
         ),

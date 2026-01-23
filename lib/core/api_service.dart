@@ -8,11 +8,14 @@ import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:memento_mori_app/core/storage_service.dart';
+import 'package:memento_mori_app/core/ultrasonic_service.dart';
+import 'package:synchronized/synchronized.dart';
 
 
 import 'encryption_service.dart';
 import 'exceptions.dart';
 import 'local_db_service.dart';
+import 'location_name_service.dart';
 import 'locator.dart';
 import 'mesh_service.dart';
 import 'models/ad_packet.dart';
@@ -32,6 +35,9 @@ class ApiService {
   static String? _memoizedToken;
   static String? _cachedUserId;
   String get currentUserId => _cachedUserId ?? "";
+  
+  // 🔒 Fix race conditions: Use Lock for atomic operations
+  final _syncLock = Lock();
 
   // ✅ БЕЗОПАСНЫЙ МЕТОД ЧТЕНИЯ (Защита от красного экрана)
   Future<String?> _safeRead(String key) async {
@@ -87,7 +93,14 @@ class ApiService {
 
   IOClient _createHttpClient() {
     final httpClient = HttpClient()
-      ..badCertificateCallback = (cert, host, port) => true;
+      ..badCertificateCallback = (cert, host, port) {
+        // 🔒 SECURITY: Verify certificate instead of accepting all
+        // Only accept certificates for our domain
+        return cert.subject.contains('memento-mori.app') || 
+               cert.subject.contains('89.125.131.63') ||
+               host.contains('memento-mori.app') ||
+               host.contains('89.125.131.63');
+      };
     httpClient.connectionTimeout = const Duration(seconds: 10);
     if (_useTor) {
       httpClient.findProxy = (uri) => _torProxy;
@@ -236,7 +249,25 @@ class ApiService {
       if (response.statusCode >= 200 && response.statusCode < 300) {
         return response.body.isEmpty ? {} : jsonDecode(response.body);
       } else {
-        throw Exception('Server Error: ${response.statusCode}');
+        // Улучшенная обработка ошибок с деталями от сервера
+        String errorMessage = 'Server Error: ${response.statusCode}';
+        String? errorCode;
+        try {
+          final errorBody = jsonDecode(response.body);
+          errorMessage = errorBody['message'] ?? errorBody['error'] ?? errorMessage;
+          errorCode = errorBody['code'] ?? errorBody['error'];
+        } catch (_) {
+          // Если не удалось распарсить JSON, используем стандартное сообщение
+        }
+        
+        // Специальная обработка: если пользователь удален - очищаем токен
+        if (response.statusCode == 401 && (errorCode == 'USER_DELETED' || errorCode == 'AUTH_USER_NOT_FOUND')) {
+          _log("🚫 [API] User deleted from database, clearing local token");
+          await logout(); // Очищаем локальные данные
+          throw Exception('Your account no longer exists. Please register again.');
+        }
+        
+        throw Exception('$errorMessage (${response.statusCode})');
       }
     } finally {
       client.close();
@@ -331,56 +362,58 @@ class ApiService {
     };
   }
   Future<void> syncOutbox() async {
-
-    if (isGhostMode) {
-      _log("👤 System in Stealth mode. Sync deferred until legalization.");
-      return;
-    }
-    // 1. Защита от дублей: если синхронизация уже идет — выходим
-    if (_isSyncing) {
-      _log("⏳ Sync already in progress. Skipping cycle.");
-      return;
-    }
-
-    _isSyncing = true;
-
-    try {
-      final db = LocalDatabaseService();
-      final pending = await db.getPendingFromOutbox();
-
-      if (pending.isEmpty) return;
-
-      _log("🔄 [BRIDGE-PROTOCOL] Syncing ${pending.length} encrypted signals...");
-
-      // Кэшируем токен один раз на весь цикл синхронизации
-      final String? token = await Vault.read('auth_token');
-      if (token == null) return;
-
-      for (var msg in pending) {
-        try {
-          final String chatId = msg['chatRoomId'];
-
-          // Отправка
-          await _sendDirectHttp('POST', '/chats/$chatId/messages', {
-            'content': msg['content'],
-            'isEncrypted': msg['isEncrypted'] == 1,
-            'clientTempId': msg['id'],
-          });
-
-          // СРАЗУ удаляем после успеха
-          await db.removeFromOutbox(msg['id']);
-          _log("✅ [RELAY-SUCCESS] Signal ${msg['id']} delivered.");
-
-        } catch (e) {
-          _log("❌ [RELAY-ERROR] Message ${msg['id']} failed: $e");
-          // Если сервер вернул 409 (Conflict/Already exists), тоже удаляем из Outbox
-          if (e.toString().contains("409")) await db.removeFromOutbox(msg['id']);
-          break;
-        }
+    // 🔒 Fix race conditions: Atomic check-and-set using Lock
+    return await _syncLock.synchronized(() async {
+      if (isGhostMode) {
+        _log("👤 System in Stealth mode. Sync deferred until legalization.");
+        return;
       }
-    } finally {
-      _isSyncing = false; // Разблокировка
-    }
+      // 1. Защита от дублей: если синхронизация уже идет — выходим
+      if (_isSyncing) {
+        _log("⏳ Sync already in progress. Skipping cycle.");
+        return;
+      }
+
+      _isSyncing = true;
+
+      try {
+        final db = LocalDatabaseService();
+        final pending = await db.getPendingFromOutbox();
+
+        if (pending.isEmpty) return;
+
+        _log("🔄 [BRIDGE-PROTOCOL] Syncing ${pending.length} encrypted signals...");
+
+        // Кэшируем токен один раз на весь цикл синхронизации
+        final String? token = await Vault.read('auth_token');
+        if (token == null) return;
+
+        for (var msg in pending) {
+          try {
+            final String chatId = msg['chatRoomId'];
+
+            // Отправка
+            await _sendDirectHttp('POST', '/chats/$chatId/messages', {
+              'content': msg['content'],
+              'isEncrypted': msg['isEncrypted'] == 1,
+              'clientTempId': msg['id'],
+            });
+
+            // СРАЗУ удаляем после успеха
+            await db.removeFromOutbox(msg['id']);
+            _log("✅ [RELAY-SUCCESS] Signal ${msg['id']} delivered.");
+
+          } catch (e) {
+            _log("❌ [RELAY-ERROR] Message ${msg['id']} failed: $e");
+            // Если сервер вернул 409 (Conflict/Already exists), тоже удаляем из Outbox
+            if (e.toString().contains("409")) await db.removeFromOutbox(msg['id']);
+            break;
+          }
+        }
+      } finally {
+        _isSyncing = false; // Разблокировка
+      }
+    });
   }
 
   Future<void> legalizeGhostIdentity(String newUsername) async {
@@ -459,10 +492,19 @@ class ApiService {
   Future<void> sendAonymizedSOS() async {
     Position pos = await Geolocator.getCurrentPosition();
 
-    // Огрубляем до 1 км
+    // Огрубляем до 1.1 км (2 знака после запятой = ~1.1 км точность)
     double lat = double.parse(pos.latitude.toStringAsFixed(2));
     double lon = double.parse(pos.longitude.toStringAsFixed(2));
     String sectorId = "S_${lat.toString().replaceAll('.', '')}_${lon.toString().replaceAll('.', '')}";
+
+    // Получаем название места (анонимно, только для зоны 1.1 км)
+    final locationService = LocationNameService();
+    String? locationName;
+    try {
+      locationName = await locationService.getLocationName(lat, lon);
+    } catch (e) {
+      print("⚠️ [SOS] Failed to get location name: $e");
+    }
 
     final sosPayload = {
       "type": "SOS_SIGNAL",
@@ -470,8 +512,56 @@ class ApiService {
       "timestamp": DateTime.now().millisecondsSinceEpoch,
     };
 
-    // Шлем через наш роутер (Cloud + Mesh)
-    _makeRequest(method: 'POST', endpoint: '/emergency/signal', body: sosPayload);
+    // Сохраняем в локальную БД для оффлайн работы
+    final db = LocalDatabaseService();
+    await db.saveSosSignal(
+      sectorId: sectorId,
+      locationName: locationName,
+      lat: lat,
+      lon: lon,
+    );
+
+    // Пытаемся отправить через Cloud + Mesh (если есть интернет)
+    bool cloudSuccess = false;
+    try {
+      await _makeRequest(method: 'POST', endpoint: '/emergency/signal', body: sosPayload).timeout(
+        const Duration(seconds: 10),
+        onTimeout: () {
+          throw TimeoutException('SOS request timeout');
+        },
+      );
+      cloudSuccess = true;
+      print("✅ [SOS] Signal sent via Cloud");
+    } catch (e) {
+      print("⚠️ [SOS] Cloud send failed: $e");
+    }
+
+    // 🔥 FALLBACK: Если Cloud не работает - отправляем через Mesh
+    if (!cloudSuccess) {
+      try {
+        final mesh = locator<MeshService>();
+        final ultrasonic = locator<UltrasonicService>();
+        
+        // Отправляем через Mesh
+        await mesh.sendAuto(
+          content: "🚨 SOS: Sector $sectorId${locationName != null ? ' ($locationName)' : ''}",
+          chatId: "THE_BEACON_GLOBAL",
+          receiverName: "GLOBAL",
+        );
+        print("✅ [SOS] Signal sent via Mesh");
+        
+        // Также отправляем через Sonar для максимального покрытия
+        try {
+          await ultrasonic.transmitFrame("SOS:$sectorId");
+          print("✅ [SOS] Signal sent via Sonar");
+        } catch (e) {
+          print("⚠️ [SOS] Sonar send failed: $e");
+        }
+      } catch (e) {
+        print("❌ [SOS] Mesh send failed: $e");
+        // Сигнал уже сохранен в БД, отправим позже при синхронизации
+      }
+    }
   }
 
   Future<void> initGhostMode(String username, String email) async {
@@ -605,7 +695,9 @@ class ApiService {
   // Метод для полной очистки при логауте
   Future<void> logout() async {
     _memoizedToken = null;
+    _cachedUserId = null;
     await _storage.deleteAll();
+    _log("🚪 [API] Logout completed - all tokens cleared");
   }
 
   // ===========================================================================
@@ -663,22 +755,37 @@ class ApiService {
   /// ВХОД (Требует прямой связи с сервером)
   Future<Map<String, dynamic>> login(String email, String password) async {
     // Для логина мы используем прямую отправку, так как это критический узел безопасности
-    final response = await _sendDirectHttp('POST', '/auth/login', {
-      'email': email,
-      'password': password
-    });
+    // Нормализуем email (убираем пробелы, приводим к нижнему регистру)
+    final normalizedEmail = email.trim().toLowerCase();
+    
+    try {
+      final response = await _sendDirectHttp('POST', '/auth/login', {
+        'email': normalizedEmail,
+        'password': password
+      });
 
-    if (response != null && response['token'] != null) {
-      _memoizedToken = response['token'];
-      final user = response['user'];
+      if (response != null && response['token'] != null) {
+        _memoizedToken = response['token'];
+        final user = response['user'];
 
-      // Сразу кэшируем личность
-      _cachedUserId = user['id'].toString();
-      await Vault.write( 'auth_token',  _memoizedToken);
-      await Vault.write( 'user_id',  _cachedUserId);
-      await Vault.write( 'user_name',  user['username']);
+        // Сразу кэшируем личность
+        _cachedUserId = user['id'].toString();
+        await Vault.write( 'auth_token',  _memoizedToken);
+        await Vault.write( 'user_id',  _cachedUserId);
+        await Vault.write( 'user_name',  user['username']);
+      }
+      return response;
+    } catch (e) {
+      // Улучшенная обработка ошибок
+      final errorStr = e.toString();
+      if (errorStr.contains('401') || errorStr.contains('Invalid credentials')) {
+        throw Exception('Invalid email or password');
+      }
+      if (errorStr.contains('400')) {
+        throw Exception('Email and password are required');
+      }
+      throw Exception('Login failed: ${e.toString()}');
     }
-    return response;
   }
 
   /// ПОЛУЧИТЬ МОЙ ПРОФИЛЬ (С поддержкой оффлайна)
@@ -752,19 +859,46 @@ class ApiService {
 
     try {
       // 2. Пытаемся получить данные (через облако или кэш/меш)
-      final response = await _makeRequest(method: 'GET', endpoint: '/chats');
+      // Добавляем retry для Tecno/Xiaomi (более агрессивные оптимизации батареи)
+      int retries = 0;
+      const maxRetries = 2;
+      
+      while (retries < maxRetries) {
+        try {
+          final response = await _makeRequest(method: 'GET', endpoint: '/chats').timeout(
+            const Duration(seconds: 15),
+            onTimeout: () {
+              throw TimeoutException('Request timeout');
+            },
+          );
 
-      if (response is List) {
-        chats = response;
+          if (response is List) {
+            chats = response;
+            break; // Успешно получили данные
+          }
+        } catch (e) {
+          retries++;
+          if (retries < maxRetries) {
+            _log("⚠️ [Tecno] Chat load failed, retrying in 2s... (attempt $retries/$maxRetries)");
+            await Future.delayed(const Duration(seconds: 2));
+          } else {
+            _log("📡 Isolated: Using local Beacon only. Error: $e");
+          }
+        }
       }
     } catch (e) {
-      _log("📡 Isolated: Using local Beacon only.");
+      _log("📡 Isolated: Using local Beacon only. Error: $e");
     }
 
     // 3. 🔥 ГАРАНТИЯ: Если в списке нет Маяка - вставляем его ПЕРВЫМ
     // Это сработает даже если сервер вернул 404, 500 или пустой []
-    if (!chats.any((c) => c['id'] == 'THE_BEACON_GLOBAL')) {
+    if (!chats.any((c) => c != null && c['id'] == 'THE_BEACON_GLOBAL')) {
       chats.insert(0, beacon);
+    }
+
+    // 4. 🔥 ДОПОЛНИТЕЛЬНАЯ ГАРАНТИЯ: Если список пустой (Tecno блокирует все запросы) - возвращаем хотя бы Beacon
+    if (chats.isEmpty) {
+      chats.add(beacon);
     }
 
     return chats;

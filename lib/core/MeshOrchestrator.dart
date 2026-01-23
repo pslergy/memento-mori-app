@@ -16,6 +16,8 @@ import 'ultrasonic_service.dart';
 import 'network_monitor.dart';
 import 'gossip_manager.dart';
 import 'local_db_service.dart';
+import 'router/router_discovery_service.dart';
+import 'router/router_connection_service.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -172,17 +174,61 @@ extension MeshNetworkStarter on TacticalMeshOrchestrator {
   Future<void> _startBLE() async {
     final int pending = await locator<LocalDatabaseService>().getOutboxCount();
     String myId = _mesh.apiService.currentUserId;
-    String shortId = myId.length > 4 ? myId.substring(0, 4) : "GHST";
+    
+    // Безопасное извлечение короткого ID (максимум 4 символа)
+    String shortId = myId.isNotEmpty && myId.length >= 4 
+        ? myId.substring(0, 4) 
+        : (myId.isNotEmpty ? myId : "GHST");
 
-    // Формат: M_Hops_HasData_ID
+    // Формат: M_Hops_HasData_ID (максимум ~20 символов для BLE)
     String tacticalName = "M_${_myHopsToInternet}_${pending > 0 ? '1' : '0'}_$shortId";
-    _log("📡 BLE Pulse: $tacticalName");
-
-    await _bt.startAdvertising(tacticalName);
-    // Скан на 8 секунд
-    _mesh.startDiscovery(SignalType.bluetooth);
-    await Future.delayed(const Duration(seconds: 8));
-    await _bt.stopAdvertising();
+    
+    final isGhost = NetworkMonitor().currentRole == MeshRole.GHOST;
+    
+    if (isGhost) {
+      // 🟢 GHOST: Рекламируем и сканируем
+      _log("📡 [ADV] BLE Pulse: '$tacticalName' (length: ${tacticalName.length})");
+      await _bt.startAdvertising(tacticalName);
+      
+      // 🔥 ШАГ 2.1: Сканирование начинается параллельно или сразу после генерации токена на BRIDGE
+      // 🔥 ШАГ 3: Синхронизация - сканирование начинается через 0.5s после генерации токена BRIDGE
+      // Даем время BRIDGE обновить advertising с токеном (0.5s задержка на обновление + буфер)
+      _log("⏳ [GHOST] Waiting 0.5s before scan to allow BRIDGE token update...");
+      await Future.delayed(const Duration(milliseconds: 500));
+      
+      // 🔥 ШАГ 2.1: Сканировать не менее 3-5 секунд, сохранять все scanResult
+      // Для GHOST с сообщениями - сканируем дольше (30 секунд), без сообщений - 8 секунд
+      final scanDuration = pending > 0 ? const Duration(seconds: 30) : const Duration(seconds: 8);
+      final minScanDuration = const Duration(seconds: 5); // Минимум 5 секунд для надежности
+      final actualScanDuration = scanDuration.inSeconds > minScanDuration.inSeconds 
+          ? scanDuration 
+          : minScanDuration;
+      
+      _log("🔍 [GHOST] Starting scan for ${actualScanDuration.inSeconds}s (role: GHOST, pending: $pending)");
+      _log("   📋 Will save all scanResult, even if localName == EMPTY (checking manufacturerData)");
+      
+      try {
+        _mesh.startDiscovery(SignalType.bluetooth);
+        _log("✅ [GHOST] Discovery started, waiting ${actualScanDuration.inSeconds}s...");
+        await Future.delayed(actualScanDuration);
+        _log("⏰ [GHOST] Scan duration completed");
+      } catch (e) {
+        _log("❌ [GHOST] Scan error: $e");
+      } finally {
+        await _bt.stopAdvertising();
+        _log("🛑 [GHOST] Advertising stopped");
+      }
+    } else {
+      // 🟣 BRIDGE: Только рекламируем, НЕ сканируем (пассивно ждем подключений)
+      _log("🌉 [BRIDGE] Starting advertising only (no scan - passive mode)");
+      _log("📡 [ADV] BLE Pulse: '$tacticalName' (length: ${tacticalName.length})");
+      
+      await _bt.startAdvertising(tacticalName);
+      _log("✅ [BRIDGE] Advertising active - waiting for GATT connections (passive mode)");
+      
+      // BRIDGE не останавливает advertising - работает постоянно в пассивном режиме
+      // Остановка происходит только при смене роли или остановке сервиса
+    }
   }
 }
 
@@ -399,6 +445,20 @@ class TacticalMeshOrchestrator {
     // 1. Инициализируем список задач ПЕРЕД использованием
     List<Future<void> Function()> tasks = [];
 
+    // Задача: Router Discovery (приоритет 1)
+    final routerDiscovery = RouterDiscoveryService();
+    final routerConnection = RouterConnectionService();
+    if (routerConnection.connectedRouter == null) {
+      tasks.add(() async {
+        final bestRouter = await routerDiscovery.findBestRouter();
+        if (bestRouter != null && bestRouter.isTrusted) {
+          _log("🛰️ [Router] Found best router: ${bestRouter.ssid}, attempting connection...");
+          await routerConnection.connectToRouter(bestRouter);
+          routerConnection.startConnectionMonitoring();
+        }
+      });
+    }
+
     // Задача: BLE Beacon
     tasks.add(() async => await _startBLE());
 
@@ -409,7 +469,12 @@ class TacticalMeshOrchestrator {
 
     // Задача: Internet Propagation (Magnet Pulse)
     if (NetworkMonitor().currentRole == MeshRole.BRIDGE) {
+      // 🔥 ШАГ 1.1: Генерация токена за 1-2 секунды до старта BLE advertising
+      // Вызываем emitInternetMagnetWave() ПЕРВЫМ, чтобы токен был готов до advertising
+      // 1. Сначала генерируем токен и обновляем advertising
       tasks.add(() async => _mesh.emitInternetMagnetWave());
+      // 2. Затем обрабатываем очередь сообщений от GHOST
+      tasks.add(() async => await _processBridgeQueue());
     } else if (_messagePressure > 0) {
       tasks.add(() async => await _mesh.seekInternetUplink());
     }
@@ -463,6 +528,77 @@ class TacticalMeshOrchestrator {
 
 
 
+  // ====================== BRIDGE QUEUE PROCESSING ======================
+  /// Обрабатывает очередь сообщений от GHOST устройств
+  Future<void> _processBridgeQueue() async {
+    if (NetworkMonitor().currentRole != MeshRole.BRIDGE) return;
+
+    try {
+      final queued = await NativeMeshService.getQueuedMessages();
+      if (queued.isEmpty) {
+        _log("📦 [Bridge] Queue is empty");
+        return;
+      }
+
+      _log("📦 [Bridge] Processing ${queued.length} queued messages...");
+
+      final api = locator<ApiService>();
+      final db = locator<LocalDatabaseService>();
+
+      // Группируем по batch_id для обработки
+      final Map<String, List<Map<String, dynamic>>> batches = {};
+      for (var msg in queued) {
+        final batchId = msg['batchId']?.toString() ?? 'unknown';
+        if (!batches.containsKey(batchId)) {
+          batches[batchId] = [];
+        }
+        batches[batchId]!.add(msg);
+      }
+
+      // Обрабатываем каждый batch
+      for (var entry in batches.entries) {
+        final batchId = entry.key;
+        final messages = entry.value;
+
+        _log("📤 [Bridge] Processing batch $batchId (${messages.length} messages)");
+
+        // Парсим и сохраняем сообщения
+        for (var msgData in messages) {
+          try {
+            final messageJson = jsonDecode(msgData['message']?.toString() ?? '{}');
+            final chatId = messageJson['chatId']?.toString() ?? 'THE_BEACON_GLOBAL';
+            final content = messageJson['content']?.toString() ?? '';
+            final senderId = messageJson['senderId']?.toString() ?? 'UNKNOWN';
+            final timestamp = messageJson['timestamp'] ?? DateTime.now().millisecondsSinceEpoch;
+
+            // Сохраняем в локальную БД
+            final chatMessage = ChatMessage(
+              id: messageJson['id']?.toString() ?? 'msg_${DateTime.now().millisecondsSinceEpoch}',
+              content: content,
+              senderId: senderId,
+              createdAt: DateTime.fromMillisecondsSinceEpoch(timestamp as int),
+              status: 'MESH_RELAY',
+            );
+
+            await db.saveMessage(chatMessage, chatId);
+          } catch (e) {
+            _log("⚠️ [Bridge] Failed to process message: $e");
+          }
+        }
+
+        // Помечаем batch как обработанный (через нативный код)
+        // Это будет сделано через обновление SQLite в нативном коде
+      }
+
+      // Отправляем в облако через syncOutbox
+      await api.syncOutbox();
+      _log("✅ [Bridge] Queue processed and synced to cloud");
+
+    } catch (e) {
+      _log("❌ [Bridge] Queue processing error: $e");
+    }
+  }
+
   // ====================== SONAR TASK ======================
   Future<void> _startSonar() async {
     if (_bleActive) {
@@ -483,8 +619,22 @@ class TacticalMeshOrchestrator {
 
   void startBiologicalHeartbeat() {
     _heartbeatTimer?.cancel();
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 30), (timer) async {
+      // 1. Рассылаем пульс (градиент маршрутизации)
       _broadcastRoutingPulse();
+
+      // 2. Обновляем давление очереди (сколько сообщений ждёт uplink)
+      final pending = await LocalDatabaseService().getPendingFromOutbox();
+      _messagePressure = pending.length;
+
+      // 3. Если этот узел стал BRIDGE — объявляем себя магнитом и зовём соседей
+      if (NetworkMonitor().currentRole == MeshRole.BRIDGE) {
+        _mesh.emitInternetMagnetWave();
+      }
+      // 4. Если мы GHOST и в Outbox есть сообщения — активно ищем аплинк через соседей
+      else if (_messagePressure > 0) {
+        await _mesh.seekInternetUplink();
+      }
     });
   }
 

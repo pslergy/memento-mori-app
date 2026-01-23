@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'auth_gate_screen.dart';
 
@@ -19,8 +18,15 @@ class BriefingScreen extends StatelessWidget {
               // 🔥 ИСПРАВЛЕНО: visibility_off с маленькой буквы
               const Icon(Icons.visibility_off, color: Colors.redAccent, size: 60),
               const SizedBox(height: 30),
-              Text("PROTOCOL: INITIALIZATION",
-                  style: GoogleFonts.russoOne(color: Colors.white, fontSize: 20, letterSpacing: 2)),
+              const Text(
+                "PROTOCOL: INITIALIZATION",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 2,
+                ),
+              ),
               const SizedBox(height: 25),
               const Text(
                 "To protect your communication, this application is camouflaged as a standard Calculator.",
@@ -36,11 +42,19 @@ class BriefingScreen extends StatelessWidget {
                     border: Border.all(color: Colors.white10),
                     borderRadius: BorderRadius.circular(15)
                 ),
-                child: Column(
+                    child: Column(
                   children: [
                     const Text("SECRET ACCESS CODE:", style: TextStyle(color: Colors.white38, fontSize: 11)),
                     const SizedBox(height: 10),
-                    Text("3301", style: GoogleFonts.robotoMono(color: Colors.greenAccent, fontSize: 44, fontWeight: FontWeight.bold, letterSpacing: 8)),
+                    const Text(
+                      "3301",
+                      style: TextStyle(
+                        color: Colors.greenAccent,
+                        fontSize: 44,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 8,
+                      ),
+                    ),
                   ],
                 ),
               ),

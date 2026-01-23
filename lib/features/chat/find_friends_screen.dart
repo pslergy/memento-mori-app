@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:animate_do/animate_do.dart';
 
@@ -97,7 +96,14 @@ class _FindFriendsScreenState extends State<FindFriendsScreen> {
     return Scaffold(
       backgroundColor: AppColors.background,
       appBar: AppBar(
-        title: Text('ESTABLISH_TRUST', style: GoogleFonts.orbitron(letterSpacing: 2, fontSize: 14)),
+        title: const Text(
+          'ESTABLISH_TRUST',
+          style: TextStyle(
+            letterSpacing: 2,
+            fontSize: 14,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
         backgroundColor: AppColors.surface,
         elevation: 0,
       ),
@@ -164,7 +170,15 @@ class _FindFriendsScreenState extends State<FindFriendsScreen> {
   Widget _buildSectionHeader(String title) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
-      child: Text(title, style: GoogleFonts.russoOne(color: AppColors.textDim, fontSize: 9, letterSpacing: 1.5)),
+      child: Text(
+        title,
+        style: const TextStyle(
+          color: AppColors.textDim,
+          fontSize: 9,
+          fontWeight: FontWeight.bold,
+          letterSpacing: 1.5,
+        ),
+      ),
     );
   }
 
@@ -204,8 +218,19 @@ class _FindFriendsScreenState extends State<FindFriendsScreen> {
           const SizedBox(height: 50),
           Icon(Icons.radar, size: 40, color: AppColors.textMuted),
           const SizedBox(height: 10),
-          Text("SILENCE IN SECTOR", style: GoogleFonts.russoOne(color: AppColors.textMuted, fontSize: 12)),
-          Text("No local or global signals detected.", style: TextStyle(color: AppColors.textDim, fontSize: 10)),
+          Text(
+            "SILENCE IN SECTOR",
+            style: TextStyle(
+              color: AppColors.textMuted,
+              fontSize: 12,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1,
+            ),
+          ),
+          const Text(
+            "No local or global signals detected.",
+            style: TextStyle(color: AppColors.textDim, fontSize: 10),
+          ),
         ],
       ),
     );

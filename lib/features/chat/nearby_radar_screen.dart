@@ -3,7 +3,6 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:nearby_connections/nearby_connections.dart';
-import 'package:permission_handler/permission_handler.dart';
 
 class NearbyRadarScreen extends StatefulWidget {
   final String myUsername; // Мы передадим имя из профиля
@@ -19,25 +18,6 @@ class _NearbyRadarScreenState extends State<NearbyRadarScreen> {
   String? connectedEndpointId; // С кем мы сейчас говорим
   List<String> logs = []; // Лог событий (или чат)
   final TextEditingController _msgController = TextEditingController();
-
-  @override
-  void initState() {
-    super.initState();
-    _checkPermissions();
-  }
-
-  // 1. Запрос прав (без этого не заработает)
-  void _checkPermissions() async {
-    // Запрашиваем пачку прав для Bluetooth и Геолокации
-    await [
-      Permission.location,
-      Permission.bluetooth,
-      Permission.bluetoothAdvertise,
-      Permission.bluetoothConnect,
-      Permission.bluetoothScan,
-      Permission.nearbyWifiDevices
-    ].request();
-  }
 
   // 2. Начинаем вещать о себе и искать других
   void _startRadar() async {

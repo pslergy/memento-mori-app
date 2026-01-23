@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:animate_do/animate_do.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/locator.dart';
@@ -61,8 +60,15 @@ class _TacticalHUDState extends State<TacticalHUD> {
               children: [
                 _buildPulseDot(isOnline ? AppColors.cloudGreen : AppColors.gridCyan),
                 const SizedBox(width: 10),
-                Text(isOnline ? "UPLINK SECURED" : "MESH ACTIVE",
-                    style: GoogleFonts.orbitron(fontSize: 10, color: Colors.white, fontWeight: FontWeight.bold)),
+                Text(
+                  isOnline ? "UPLINK SECURED" : "MESH ACTIVE",
+                  style: const TextStyle(
+                    fontSize: 10,
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1.2,
+                  ),
+                ),
               ],
             ),
 
@@ -75,8 +81,15 @@ class _TacticalHUDState extends State<TacticalHUD> {
                 children: [
                   Pulse(infinite: true, child: Icon(Icons.waves, color: AppColors.sonarPurple, size: 16)),
                   const SizedBox(width: 10),
-                  Text(_lastAcousticSignal!,
-                      style: GoogleFonts.russoOne(fontSize: 10, color: AppColors.sonarPurple, letterSpacing: 1)),
+                  Text(
+                    _lastAcousticSignal!,
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: AppColors.sonarPurple,
+                      letterSpacing: 1,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
                 ],
               ),
             ),

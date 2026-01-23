@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:animate_do/animate_do.dart';
 
@@ -91,7 +90,15 @@ class _MainScreenState extends State<MainScreen> {
             children: [
               const Icon(Icons.record_voice_over, color: AppColors.sonarPurple),
               const SizedBox(width: 12),
-              Text("INCOMING SONAR LINK", style: GoogleFonts.russoOne(color: Colors.white, fontSize: 14)),
+              const Text(
+                "INCOMING SONAR LINK",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.2,
+                ),
+              ),
             ],
           ),
           content: Text(
@@ -146,7 +153,15 @@ class _MainScreenState extends State<MainScreen> {
             children: [
               const Icon(Icons.record_voice_over, color: AppColors.sonarPurple),
               const SizedBox(width: 10),
-              Text("SIGNAL CAPTURED", style: GoogleFonts.russoOne(color: Colors.white, fontSize: 14)),
+              const Text(
+                "SIGNAL CAPTURED",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.2,
+                ),
+              ),
             ],
           ),
           content: Text(
@@ -229,7 +244,7 @@ class _MainScreenState extends State<MainScreen> {
         items: const <BottomNavigationBarItem>[
           BottomNavigationBarItem(icon: Icon(Icons.hourglass_bottom), label: 'MEMENTO'),
           BottomNavigationBarItem(icon: Icon(Icons.chat_bubble_outline), label: 'COMMS'),
-          BottomNavigationBarItem(icon: Icon(Icons.campaign), label: 'CHANNELS'),
+          BottomNavigationBarItem(icon: Icon(Icons.warning_amber_rounded), label: 'HOT ZONES'),
           BottomNavigationBarItem(icon: Icon(Icons.hub), label: 'THE CHAIN'),
         ],
         currentIndex: _selectedIndex,
@@ -238,8 +253,8 @@ class _MainScreenState extends State<MainScreen> {
         selectedItemColor: AppColors.warningRed,
         unselectedItemColor: AppColors.textDim,
         type: BottomNavigationBarType.fixed,
-        selectedLabelStyle: GoogleFonts.russoOne(fontSize: 10),
-        unselectedLabelStyle: GoogleFonts.russoOne(fontSize: 9),
+        selectedLabelStyle: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.1),
+        unselectedLabelStyle: const TextStyle(fontSize: 9, letterSpacing: 1.0),
       ),
     );
   }
@@ -270,7 +285,7 @@ class _MainScreenState extends State<MainScreen> {
                 children: [
                   _PulseIcon(color: themeColor),
                   const SizedBox(width: 8),
-                  Text(label, style: GoogleFonts.robotoMono(color: themeColor, fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1)),
+                  Text(label, style: TextStyle(fontFamily: 'RobotoMono', color: themeColor, fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1)),
                 ],
               ),
             ),

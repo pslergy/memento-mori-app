@@ -8,8 +8,14 @@ import 'package:local_auth_android/local_auth_android.dart';
 class BioLockScreen extends StatefulWidget {
   final DateTime deathDate;
   final DateTime birthDate;
+  final bool requireBiometric; // Если true - биометрия обязательна (паник-протокол)
 
-  const BioLockScreen({super.key, required this.deathDate, required this.birthDate});
+  const BioLockScreen({
+    super.key, 
+    required this.deathDate, 
+    required this.birthDate,
+    this.requireBiometric = false,
+  });
 
   @override
   State<BioLockScreen> createState() => _BioLockScreenState();
@@ -34,6 +40,22 @@ class _BioLockScreenState extends State<BioLockScreen> {
       final bool canCheckBiometrics = await auth.canCheckBiometrics;
       final bool isDeviceSupported = await auth.isDeviceSupported();
 
+      // 🔥 ПАНИК-ПРОТОКОЛ: Если биометрия обязательна, но недоступна - блокируем вход
+      if (widget.requireBiometric && (!canCheckBiometrics || !isDeviceSupported)) {
+        print("🚫 [PANIC] Biometric required but not available. Access denied.");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('BIOMETRIC AUTHENTICATION REQUIRED'),
+              backgroundColor: Colors.red,
+              duration: Duration(seconds: 3),
+            ),
+          );
+        }
+        return;
+      }
+
+      // Если биометрия не обязательна и недоступна - пропускаем
       if (!canCheckBiometrics || !isDeviceSupported) {
         _onSuccess();
         return;
@@ -93,7 +115,14 @@ class _BioLockScreenState extends State<BioLockScreen> {
     );
   }
 
-  void _onSuccess() {
+  void _onSuccess() async {
+    // 🔥 ПАНИК-ПРОТОКОЛ: Сбрасываем флаг после успешной биометрической аутентификации
+    if (widget.requireBiometric) {
+      await PanicService.resetPanicFlag();
+      print("✅ [PANIC] Panic protocol flag reset after successful biometric authentication");
+    }
+
+    if (!mounted) return;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(builder: (_) => MainScreen(
         deathDate: widget.deathDate,

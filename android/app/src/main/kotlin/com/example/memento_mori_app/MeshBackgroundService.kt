@@ -3,11 +3,15 @@ package com.example.memento_mori_app
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteOpenHelper
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import android.util.Log
 import kotlinx.coroutines.*
+import org.json.JSONArray
+import org.json.JSONObject
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket // 🔥 Обязательно для работы с клиентами
@@ -18,13 +22,41 @@ class MeshBackgroundService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var serverSocket: ServerSocket? = null
     private var serviceJob: Job? = null // Переменная для управления циклом сервера
-    private val MESH_PORT = 55555
+    private var temporaryServerJob: Job? = null // Для временного сервера
+    private var temporaryServerSocket: ServerSocket? = null // Сокет временного сервера
+    private val MESH_PORT = 55555 // Основной порт для mesh сети
+    private val BRIDGE_PULL_PORT = 55556 // Порт для временного BRIDGE сервера
+    private var dbHelper: BridgeQueueDbHelper? = null
 
     companion object {
         const val ACTION_MESSAGE_RECEIVED = "com.example.memento_mori_app.MESSAGE_RECEIVED"
+        private var instance: MeshBackgroundService? = null
+
+        fun startTemporaryServer(context: Context, durationSeconds: Int) {
+            val intent = Intent(context, MeshBackgroundService::class.java).apply {
+                putExtra("temporary", true)
+                putExtra("duration", durationSeconds)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun stopTemporaryServer(context: Context) {
+            instance?.stopTemporaryServerInternal()
+        }
+
+        fun getQueuedMessages(context: Context): List<Map<String, Any>> {
+            return instance?.getQueuedMessagesInternal() ?: emptyList()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        instance = this
+        dbHelper = BridgeQueueDbHelper(this)
+
         createNotificationChannel()
 
         // Создаем системное уведомление для работы в Foreground
@@ -39,8 +71,25 @@ class MeshBackgroundService : Service() {
         // Запуск сервиса в режиме "бессмертия"
         startForeground(1, notification)
 
-        // Запуск TCP сервера
-        startTcpServer()
+        // 🔥 ПРОВЕРКА: Можно ли поднимать TCP сервер?
+        val canStartServer = DeviceDetector.canStartTcpServer(this)
+        
+        if (!canStartServer) {
+            Log.w("P2P_BG", "🚫 TCP server disabled - using BLE GATT instead")
+            // Не поднимаем сервер, но сервис остается активным для других операций
+            return START_STICKY
+        }
+
+        // Проверяем, это временный сервер или постоянный
+        val isTemporary = intent?.getBooleanExtra("temporary", false) ?: false
+        val duration = intent?.getIntExtra("duration", 20) ?: 20
+
+        if (isTemporary) {
+            startTemporaryTcpServer(duration)
+        } else {
+            // Запуск постоянного TCP сервера
+            startTcpServer()
+        }
 
         return START_STICKY
     }
@@ -80,6 +129,10 @@ class MeshBackgroundService : Service() {
                 } catch (e: Exception) {
                     Log.e("P2P_BG", "🚨 Bind failed (Port $MESH_PORT): ${e.message}")
 
+                    // 🔥 КРИТИЧЕСКИЙ ФИКС: Если сервер упал с первого раза - отмечаем краш
+                    // При следующем запуске будет использоваться BLE GATT
+                    DeviceDetector.markTcpServerCrashed(this@MeshBackgroundService)
+                    
                     // 🔥 КРИТИЧЕСКИЙ ФИКС: Пауза перед рестартом.
                     // Без неё цикл крутится со скоростью процессора, забивая логи и вешая телефон.
                     delay(5000)
@@ -92,20 +145,43 @@ class MeshBackgroundService : Service() {
 
     private suspend fun handleClientSecurely(socket: Socket, remoteIp: String?) {
         try {
-            socket.soTimeout = 5000 // Таймаут на чтение — 5 секунд
+            Log.d("P2P_BG", "🔌 [BRIDGE] New client connected from $remoteIp")
+            socket.soTimeout = 10000 // Таймаут на чтение — 10 секунд (для batch)
             val reader = socket.getInputStream().bufferedReader(StandardCharsets.UTF_8)
             val input = reader.readLine()
+            Log.d("P2P_BG", "📥 [BRIDGE] Received data from $remoteIp: ${input?.take(100)}...")
 
             if (!input.isNullOrEmpty()) {
-                Log.d("P2P_BG", "📦 Packet captured from $remoteIp")
+                try {
+                    val json = JSONObject(input)
+                    val type = json.optString("type")
 
-                // Отправляем Broadcast в MainActivity
-                val broadcastIntent = Intent(ACTION_MESSAGE_RECEIVED).apply {
-                    setPackage(packageName) // Для безопасности шлем только своему приложению
-                    putExtra("message", input)
-                    putExtra("senderIp", remoteIp)
+                    when (type) {
+                        "GHOST_UPLOAD" -> {
+                            // Обработка batch загрузки от GHOST
+                            handleGhostUpload(socket, json, remoteIp)
+                        }
+                        else -> {
+                            // Стандартная обработка (для обратной совместимости)
+                            Log.d("P2P_BG", "📦 Packet captured from $remoteIp")
+                            val broadcastIntent = Intent(ACTION_MESSAGE_RECEIVED).apply {
+                                setPackage(packageName)
+                                putExtra("message", input)
+                                putExtra("senderIp", remoteIp)
+                            }
+                            sendBroadcast(broadcastIntent)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("P2P_BG", "JSON parse error: ${e.message}")
+                    // Fallback на старую обработку
+                    val broadcastIntent = Intent(ACTION_MESSAGE_RECEIVED).apply {
+                        setPackage(packageName)
+                        putExtra("message", input)
+                        putExtra("senderIp", remoteIp)
+                    }
+                    sendBroadcast(broadcastIntent)
                 }
-                sendBroadcast(broadcastIntent)
             }
         } catch (e: Exception) {
             Log.e("P2P_BG", "Read error from $remoteIp: ${e.message}")
@@ -122,11 +198,176 @@ class MeshBackgroundService : Service() {
         }
     }
 
+    private suspend fun handleGhostUpload(socket: Socket, json: JSONObject, remoteIp: String?) {
+        try {
+            val token = json.optString("token")
+            val batchId = json.optString("batchId")
+            val senderId = json.optString("senderId")
+            val messages = json.getJSONArray("messages")
+            val count = json.optInt("count", 0)
+
+            Log.d("P2P_BG", "📦 GHOST_UPLOAD from $senderId: $count messages (batch: $batchId)")
+
+            // Сохраняем в SQLite очередь
+            dbHelper?.let { db ->
+                val dbWritable = db.writableDatabase
+                for (i in 0 until messages.length()) {
+                    val msg = messages.getJSONObject(i)
+                    val content = dbWritable.compileStatement(
+                        "INSERT INTO bridge_queue (sender_id, batch_id, message_json, received_at, processed) VALUES (?, ?, ?, ?, 0)"
+                    )
+                    content.bindString(1, senderId)
+                    content.bindString(2, batchId)
+                    content.bindString(3, msg.toString())
+                    content.bindLong(4, System.currentTimeMillis())
+                    content.executeInsert()
+                    content.close()
+                }
+            }
+
+            // Отправляем ACK
+            val ack = JSONObject().apply {
+                put("type", "UPLOAD_ACK")
+                put("batchId", batchId)
+                put("received", count)
+                put("status", "OK")
+                put("processed", true)
+            }
+
+            val out = socket.getOutputStream()
+            out.write((ack.toString() + "\n").toByteArray(StandardCharsets.UTF_8))
+            out.flush()
+
+            Log.d("P2P_BG", "✅ ACK sent for batch $batchId")
+        } catch (e: Exception) {
+            Log.e("P2P_BG", "GHOST_UPLOAD error: ${e.message}")
+            // Отправляем ошибку
+            try {
+                val errorAck = JSONObject().apply {
+                    put("type", "UPLOAD_ACK")
+                    put("status", "ERROR")
+                    put("error", e.message)
+                }
+                val out = socket.getOutputStream()
+                out.write((errorAck.toString() + "\n").toByteArray(StandardCharsets.UTF_8))
+                out.flush()
+            } catch (e2: Exception) {
+                Log.e("P2P_BG", "Failed to send error ACK: ${e2.message}")
+            }
+        }
+    }
+
+    private fun startTemporaryTcpServer(durationSeconds: Int) {
+        // Закрываем предыдущий временный сервер, если он есть
+        temporaryServerJob?.cancel()
+        temporaryServerSocket?.close()
+        temporaryServerSocket = null
+        
+        temporaryServerJob = serviceScope.launch(Dispatchers.IO) {
+            var ss: ServerSocket? = null
+            try {
+                ss = ServerSocket()
+                ss.reuseAddress = true
+                ss.bind(InetSocketAddress("0.0.0.0", BRIDGE_PULL_PORT)) // Используем отдельный порт для временного сервера
+                temporaryServerSocket = ss // Сохраняем ссылку для возможности закрытия извне
+                // Не перезаписываем serverSocket, чтобы основной сервер продолжал работать
+
+                Log.d("P2P_BG", "🛡️ TEMPORARY BRIDGE SERVER started on port $BRIDGE_PULL_PORT for ${durationSeconds}s")
+
+                // Таймер для автоматического закрытия
+                val timeoutJob = launch {
+                    delay(durationSeconds * 1000L)
+                    if (!ss.isClosed) {
+                        Log.d("P2P_BG", "⏰ Temporary server timeout after ${durationSeconds}s, closing...")
+                        try {
+                            ss.close()
+                        } catch (e: Exception) {
+                            Log.e("P2P_BG", "Error closing server: ${e.message}")
+                        }
+                    }
+                }
+
+                while (ss != null && !ss.isClosed && isActive) {
+                    val client = try {
+                        Log.d("P2P_BG", "👂 [BRIDGE] Waiting for connections on port $BRIDGE_PULL_PORT...")
+                        ss.accept()
+                    } catch (e: Exception) {
+                        // Различаем нормальное закрытие от ошибок
+                        if (ss == null || ss.isClosed) {
+                            Log.d("P2P_BG", "ℹ️ [BRIDGE] Server closed normally (timeout or stop requested)")
+                        } else {
+                            Log.e("P2P_BG", "❌ [BRIDGE] Accept error (server still open): ${e.message}")
+                        }
+                        break
+                    }
+
+                    val remoteIp = client.inetAddress.hostAddress
+                    Log.d("P2P_BG", "✅ [BRIDGE] Client accepted from $remoteIp")
+                    serviceScope.launch(Dispatchers.IO) {
+                        handleClientSecurely(client, remoteIp)
+                    }
+                }
+
+                timeoutJob.cancel()
+            } catch (e: Exception) {
+                Log.e("P2P_BG", "Temporary server error: ${e.message}")
+                
+                // 🔥 КРИТИЧЕСКИЙ ФИКС: Если временный сервер упал - отмечаем краш
+                DeviceDetector.markTcpServerCrashed(this@MeshBackgroundService)
+            } finally {
+                // Очищаем ссылку на сокет
+                if (temporaryServerSocket == ss) {
+                    temporaryServerSocket = null
+                }
+                ss?.close()
+                Log.d("P2P_BG", "🧹 [BRIDGE] Temporary server socket cleaned up")
+            }
+        }
+    }
+
+    private fun stopTemporaryServerInternal() {
+        Log.d("P2P_BG", "🛑 [BRIDGE] Stopping temporary server...")
+        temporaryServerJob?.cancel()
+        try {
+            // Закрываем временный серверный сокет, а не основной serverSocket
+            temporaryServerSocket?.close()
+            temporaryServerSocket = null
+        } catch (e: Exception) {
+            Log.e("P2P_BG", "Stop temporary server error: ${e.message}")
+        }
+        Log.d("P2P_BG", "✅ [BRIDGE] Temporary server stop requested")
+    }
+
+    private fun getQueuedMessagesInternal(): List<Map<String, Any>> {
+        val messages = mutableListOf<Map<String, Any>>()
+        dbHelper?.let { db ->
+            val dbReadable = db.readableDatabase
+            val cursor = dbReadable.rawQuery(
+                "SELECT id, sender_id, batch_id, message_json, received_at FROM bridge_queue WHERE processed = 0 ORDER BY received_at ASC LIMIT 100",
+                null
+            )
+            while (cursor.moveToNext()) {
+                messages.add(mapOf(
+                    "id" to cursor.getLong(0),
+                    "senderId" to cursor.getString(1),
+                    "batchId" to cursor.getString(2),
+                    "message" to cursor.getString(3),
+                    "receivedAt" to cursor.getLong(4)
+                ))
+            }
+            cursor.close()
+        }
+        return messages
+    }
+
     override fun onDestroy() {
         Log.d("P2P_BG", "🔌 Shutting down Mesh service...")
+        instance = null
         try { serverSocket?.close() } catch (e: Exception) {}
         serviceJob?.cancel()
+        temporaryServerJob?.cancel()
         serviceScope.cancel()
+        dbHelper?.close()
         super.onDestroy()
     }
 
@@ -144,5 +385,29 @@ class MeshBackgroundService : Service() {
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
         }
+    }
+}
+
+// SQLite Helper для очереди сообщений на BRIDGE
+class BridgeQueueDbHelper(context: Context) : SQLiteOpenHelper(context, "bridge_queue.db", null, 1) {
+    override fun onCreate(db: SQLiteDatabase) {
+        db.execSQL("""
+            CREATE TABLE bridge_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                message_json TEXT NOT NULL,
+                received_at INTEGER NOT NULL,
+                processed INTEGER DEFAULT 0,
+                uploaded_at INTEGER
+            )
+        """.trimIndent())
+        db.execSQL("CREATE INDEX idx_processed ON bridge_queue(processed)")
+        db.execSQL("CREATE INDEX idx_received_at ON bridge_queue(received_at)")
+    }
+
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        db.execSQL("DROP TABLE IF EXISTS bridge_queue")
+        onCreate(db)
     }
 }

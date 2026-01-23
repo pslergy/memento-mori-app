@@ -5,10 +5,10 @@ import 'package:device_info_plus/device_info_plus.dart';
 
 import 'locator.dart';
 import 'gossip_manager.dart';
-import 'mesh_service.dart';
 import 'native_mesh_service.dart';
 import 'MeshOrchestrator.dart';
 import 'local_db_service.dart';
+import 'network_monitor.dart';
 import '../splash_screen.dart';
 
 class MeshPermissionScreen extends StatefulWidget {
@@ -73,14 +73,13 @@ class _MeshPermissionScreenState extends State<MeshPermissionScreen> {
   Future<void> _requestPermissionsAndStart() async {
     setState(() => _loading = true);
 
-    // Базовый список разрешений
+    // Базовый список разрешений (без notification — на некоторых Tecno/HiOS это может крашить системный диалог)
     List<Permission> permissions = [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
       Permission.bluetoothAdvertise,
       Permission.microphone,
       Permission.location,
-      Permission.notification,
     ];
 
     // Android 13+ (API 33) требует отдельное разрешение для поиска устройств рядом
@@ -108,10 +107,12 @@ class _MeshPermissionScreenState extends State<MeshPermissionScreen> {
       // Инициализация систем (только один раз при первом запуске)
       await locator<LocalDatabaseService>().setFirstLaunchDone();
 
-      // Запуск сервисов
+      // Запуск базовых нативных сервисов и мониторинга сети
       NativeMeshService.init();
-      locator<TacticalMeshOrchestrator>().start();
-      locator<GossipManager>().startEpidemicCycle();
+      NetworkMonitor().start();
+
+      // Полный старт Mesh-оркестратора (Wi-Fi Direct + BLE + Sonar + Gossip)
+      await locator<TacticalMeshOrchestrator>().startMeshNetwork(context: context);
 
       if (!mounted) return;
       // Летим в Сплеш, он направит дальше

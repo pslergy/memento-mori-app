@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:memento_mori_app/features/auth/survival_guide_screen.dart';
 
 class RecoveryPhraseScreen extends StatelessWidget {
@@ -24,10 +23,15 @@ class RecoveryPhraseScreen extends StatelessWidget {
             children: [
               const Icon(Icons.security, size: 60, color: Colors.redAccent),
               const SizedBox(height: 20),
-              Text(
+              const Text(
                 "SECRET RECOVERY KEY",
                 textAlign: TextAlign.center,
-                style: GoogleFonts.russoOne(fontSize: 22, color: Colors.white, letterSpacing: 1),
+                style: TextStyle(
+                  fontSize: 22,
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.2,
+                ),
               ),
               const SizedBox(height: 15),
               const Text(

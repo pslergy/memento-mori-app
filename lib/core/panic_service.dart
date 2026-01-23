@@ -1,22 +1,43 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter/services.dart';
+import 'locator.dart';
+import 'local_db_service.dart';
 
 class PanicService {
   static const _storage = FlutterSecureStorage();
+  static const String _panicFlagKey = 'panic_protocol_activated';
+
+  /// Проверяет, был ли активирован паник-протокол
+  static Future<bool> isPanicProtocolActivated() async {
+    final flag = await _storage.read(key: _panicFlagKey);
+    return flag == 'true';
+  }
+
+  /// Сбрасывает флаг паник-протокола
+  static Future<void> resetPanicFlag() async {
+    await _storage.delete(key: _panicFlagKey);
+    print("✅ [PANIC] Panic protocol flag reset");
+  }
 
   /// ПОЛНАЯ ЗАЧИСТКА
-  /// Удаляет токены и закрывает приложение
+  /// Удаляет сообщения за 24 часа, устанавливает флаг и закрывает приложение
   static Future<void> killSwitch(BuildContext context) async {
     print("--- [PANIC PROTOCOL INITIATED] ---");
 
-    // 1. Стираем ключи доступа
-    await _storage.deleteAll();
+    try {
+      // 1. Удаляем сообщения за последние 24 часа
+      final db = locator<LocalDatabaseService>();
+      await db.deleteMessagesLast24Hours();
+    } catch (e) {
+      print("⚠️ [PANIC] Failed to delete messages: $e");
+    }
 
-    // 2. (Опционально) Можно отправить на сервер сигнал "Я скомпрометирован",
-    // чтобы сервер удалил чаты удаленно, но это опасно (может не быть сети).
+    // 2. Устанавливаем флаг паник-протокола (НЕ удаляем токены, чтобы можно было войти)
+    await _storage.write(key: _panicFlagKey, value: 'true');
+    print("🚩 [PANIC] Panic protocol flag set - will require calculator + biometric on next launch");
 
-    // 3. Визуальный эффект сброса (опционально)
+    // 3. Визуальный эффект сброса
     if (context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -28,8 +49,7 @@ class PanicService {
     }
 
     // 4. Жесткое завершение процесса
-    // В Android это убьет приложение.
-    // При перезапуске юзер попадет в калькулятор, а вход будет невозможен (токен удален).
+    // При следующем запуске будет запрошен калькулятор и биометрия
     await Future.delayed(const Duration(milliseconds: 200));
     SystemChannels.platform.invokeMethod('SystemNavigator.pop');
   }

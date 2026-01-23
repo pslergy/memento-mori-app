@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:math_expressions/math_expressions.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:memento_mori_app/features/auth/auth_gate_screen.dart'; // 🔥 Обязательно импортируй это
@@ -39,6 +38,9 @@ class _CalculatorGateState extends State<CalculatorGate> {
 
       if (!mounted) return;
 
+      // 🔥 ПАНИК-ПРОТОКОЛ: Проверяем, был ли активирован паник-протокол
+      final bool isPanicActivated = await PanicService.isPanicProtocolActivated();
+      
       // КРИТИЧЕСКИЙ ФИКС: Если токен есть - мы пускаем.
       // Даже если даты потерялись из-за бага Tecno, мы подставим фолбек.
       if (token != null) {
@@ -51,14 +53,30 @@ class _CalculatorGateState extends State<CalculatorGate> {
         final DateTime birth = DateTime.tryParse(birthStr ?? '')
             ?? DateTime(2000, 1, 1);
 
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(
-            builder: (_) => BioLockScreen(
-              deathDate: death,
-              birthDate: birth,
+        // 🔥 ПАНИК-ПРОТОКОЛ: Если активирован - ВСЕГДА требуем биометрию
+        if (isPanicActivated) {
+          print("🚩 [PANIC] Panic protocol active - requiring biometric authentication");
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(
+              builder: (_) => BioLockScreen(
+                deathDate: death,
+                birthDate: birth,
+                requireBiometric: true, // Принудительно требуем биометрию
+              ),
             ),
-          ),
-        );
+          );
+        } else {
+          // Обычный вход - биометрия опциональна
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(
+              builder: (_) => BioLockScreen(
+                deathDate: death,
+                birthDate: birth,
+                requireBiometric: false,
+              ),
+            ),
+          );
+        }
       } else {
         // Если токена нет совсем - значит регистрации не было
         print("🔑 [Access] No identity found in Vault. To Auth Gate.");
@@ -119,9 +137,30 @@ class _CalculatorGateState extends State<CalculatorGate> {
                 mainAxisAlignment: MainAxisAlignment.end,
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  Text(_expression, style: GoogleFonts.robotoMono(fontSize: 32, color: Colors.grey)),
+                  Text(
+                    _expression,
+                    style: const TextStyle(
+                      fontSize: 32,
+                      color: Colors.grey,
+                    ),
+                  ),
                   const SizedBox(height: 10),
-                  Text(_result, style: GoogleFonts.robotoMono(fontSize: 64, color: Colors.white)),
+                  const Text(
+                    // Плейсхолдер результата, реальное значение уже в _result
+                    "",
+                    style: TextStyle(
+                      fontSize: 64,
+                      color: Colors.white,
+                    ),
+                  ),
+                  Text(
+                    _result,
+                    style: const TextStyle(
+                      fontSize: 48,
+                      color: Colors.white,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
                 ],
               ),
             ),

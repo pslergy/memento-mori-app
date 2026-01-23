@@ -4,7 +4,6 @@ import 'dart:io';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:animate_do/animate_do.dart';
 import 'package:http/io_client.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -266,7 +265,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         Text(
           "By starting, you establish a Ghost Identity.\nThis process is irreversible in offline mode.",
           textAlign: TextAlign.center,
-          style: GoogleFonts.robotoMono(color: AppColors.textDim, fontSize: 10),
+          style: const TextStyle(color: AppColors.textDim, fontSize: 10),
         ),
       ],
       onNext: _handleFinalStep,
@@ -282,7 +281,17 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           const SizedBox(height: 20),
-          FadeInDown(child: Text(title, style: GoogleFonts.orbitron(fontSize: 20, color: Colors.white, letterSpacing: 2))),
+          FadeInDown(
+            child: Text(
+              title,
+              style: const TextStyle(
+                fontSize: 20,
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 2,
+              ),
+            ),
+          ),
           const SizedBox(height: 8),
           FadeInDown(delay: const Duration(milliseconds: 100), child: Text(desc, style: TextStyle(color: AppColors.textDim, fontSize: 12))),
           const SizedBox(height: 40),
@@ -298,7 +307,10 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
             onPressed: _isLoading ? null : onNext,
             child: _isLoading
                 ? const CupertinoActivityIndicator(color: Colors.black)
-                : Text(isLast ? "START" : "CONTINUE", style: GoogleFonts.russoOne()),
+                : Text(
+                    isLast ? "START" : "CONTINUE",
+                    style: const TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                  ),
           ),
         ],
       ),
@@ -348,7 +360,12 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
               const SizedBox(width: 8),
               Text(
                 isOffline ? "GHOST PROTOCOL ACTIVE (OFFLINE)" : "CLOUD UPLINK SECURED",
-                style: GoogleFonts.robotoMono(fontSize: 9, fontWeight: FontWeight.bold, color: isOffline ? AppColors.stealthOrange : AppColors.cloudGreen),
+                style: TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                  color: isOffline ? AppColors.stealthOrange : AppColors.cloudGreen,
+                  letterSpacing: 0.8,
+                ),
               ),
             ],
           ),

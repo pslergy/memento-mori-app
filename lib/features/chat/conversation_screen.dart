@@ -5,7 +5,6 @@ import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:memento_mori_app/core/api_service.dart';
 import 'package:memento_mori_app/core/storage_service.dart';
 import 'package:memento_mori_app/core/websocket_service.dart';
@@ -17,8 +16,12 @@ import '../../core/local_db_service.dart';
 import '../../core/locator.dart';
 import '../../core/mesh_service.dart';
 import '../../core/native_mesh_service.dart';
+import '../../core/message_status.dart';
+import '../../core/room_state.dart';
+import '../../core/room_state.dart' show RoomStateHelper;
 import '../../ghost_input/ghost_controller.dart';
 import '../../ghost_input/ghost_keyboard.dart';
+import '../../dev_tools/room_timeline_debugger.dart';
 
 // --- Модель сообщения ---
 class ChatMessage {
@@ -28,6 +31,8 @@ class ChatMessage {
   final String senderId;
   final String? senderUsername;
   final DateTime createdAt;
+  final DateTime? receivedAt;
+  final Map<String, int>? vectorClock; // Vector clock для конфликт-разрешения
   String status;
   bool hasWarning = false;
 
@@ -38,6 +43,8 @@ class ChatMessage {
     required this.senderId,
     this.senderUsername,
     required this.createdAt,
+    this.receivedAt,
+    this.vectorClock,
     this.status = 'SENT',
   });
 
@@ -54,6 +61,30 @@ class ChatMessage {
       parsedDate = DateTime.now();
     }
 
+    DateTime? parsedReceivedAt;
+    var rawReceivedAt = json['receivedAt'];
+    if (rawReceivedAt != null) {
+      if (rawReceivedAt is int) {
+        parsedReceivedAt = DateTime.fromMillisecondsSinceEpoch(rawReceivedAt);
+      } else if (rawReceivedAt is String) {
+        parsedReceivedAt = DateTime.tryParse(rawReceivedAt);
+      }
+    }
+
+    Map<String, int>? parsedVectorClock;
+    var rawVectorClock = json['vectorClock'];
+    if (rawVectorClock != null) {
+      if (rawVectorClock is String) {
+        try {
+          parsedVectorClock = Map<String, int>.from(jsonDecode(rawVectorClock));
+        } catch (e) {
+          // Игнорируем ошибки парсинга
+        }
+      } else if (rawVectorClock is Map) {
+        parsedVectorClock = Map<String, int>.from(rawVectorClock);
+      }
+    }
+
     return ChatMessage(
       // Принудительно в String, если база вернула числовой ID
       id: json['id']?.toString() ?? '',
@@ -62,6 +93,8 @@ class ChatMessage {
       senderId: json['senderId']?.toString() ?? '',
       senderUsername: json['senderUsername'] ?? 'Nomad',
       createdAt: parsedDate,
+      receivedAt: parsedReceivedAt,
+      vectorClock: parsedVectorClock,
       status: json['status'] ?? 'SENT',
     );
   }
@@ -74,6 +107,8 @@ class ChatMessage {
       'senderId': senderId,
       'senderUsername': senderUsername,
       'createdAt': createdAt.toIso8601String(),
+      'receivedAt': receivedAt?.toIso8601String(),
+      'vectorClock': vectorClock != null ? jsonEncode(vectorClock) : null,
       'status': status,
     };
   }
@@ -112,12 +147,32 @@ class _ConversationScreenState extends State<ConversationScreen> {
   bool _isLoadingHistory = true;
   bool _isLocalMode = false;
   bool _isSending = false;
+  RoomState _roomState = RoomState.active;
 
   @override
   void initState() {
     super.initState();
     SecurityService.enableSecureMode(); // Защита от скриншотов
     _initializeChat();
+    _updateRoomState();
+    // Слушаем изменения сетевого статуса
+    NetworkMonitor().onRoleChanged.listen((_) => _updateRoomState());
+  }
+
+  void _updateRoomState() {
+    final networkMonitor = NetworkMonitor();
+    final hasInternet = networkMonitor.currentRole == MeshRole.BRIDGE;
+    final mesh = locator<MeshService>();
+    final isSyncing = mesh.isP2pConnected;
+    
+    if (mounted) {
+      setState(() {
+        _roomState = RoomStateHelper.fromNetworkStatus(
+          hasInternet: hasInternet,
+          isSyncing: isSyncing,
+        );
+      });
+    }
   }
 
   Future<void> _initializeChat() async {
@@ -215,7 +270,14 @@ class _ConversationScreenState extends State<ConversationScreen> {
     if (mounted) {
       setState(() {
         _messages.add(newMessage);
-        _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+        // Сортировка по (created_at, author_id, message_id)
+        _messages.sort((a, b) {
+          final timeCompare = a.createdAt.compareTo(b.createdAt);
+          if (timeCompare != 0) return timeCompare;
+          final authorCompare = a.senderId.compareTo(b.senderId);
+          if (authorCompare != 0) return authorCompare;
+          return a.id.compareTo(b.id);
+        });
       });
       HapticFeedback.lightImpact(); // Вибрация при получении
       WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
@@ -258,6 +320,30 @@ class _ConversationScreenState extends State<ConversationScreen> {
     final encryption = locator<EncryptionService>();
 
     final String msgId = data['id']?.toString() ?? data['clientTempId'] ?? "mesh_${data['timestamp']}";
+    final String senderId = data['senderId'] ?? "Unknown";
+
+    // Если это наше собственное сообщение, полученное обратно - обновляем статус
+    if (senderId == _currentUserId && msgId.startsWith("temp_")) {
+      final newStatus = isFromCloud 
+          ? MessageStatus.deliveredServer 
+          : MessageStatus.deliveredMesh;
+      await db.updateMessageStatus(msgId, newStatus);
+      // Обновляем статус в UI
+      if (mounted) {
+        setState(() {
+          final existingMsg = _messages.firstWhere(
+            (m) => m.id == msgId,
+            orElse: () => ChatMessage(id: '', content: '', senderId: '', createdAt: DateTime.now()),
+          );
+          if (existingMsg.id == msgId) {
+            existingMsg.status = isFromCloud 
+                ? MessageStatus.deliveredServer 
+                : MessageStatus.deliveredMesh;
+          }
+        });
+      }
+      return; // Не добавляем эхо своего сообщения
+    }
 
     if (_processedIds.contains(msgId)) return;
     _processedIds.add(msgId);
@@ -275,12 +361,31 @@ class _ConversationScreenState extends State<ConversationScreen> {
       }
     }
 
+    final now = DateTime.now();
+    final createdAt = DateTime.fromMillisecondsSinceEpoch(data['timestamp'] ?? now.millisecondsSinceEpoch);
+    
+    // Парсим vector clock если есть
+    Map<String, int>? vectorClock;
+    if (data['vectorClock'] != null) {
+      try {
+        if (data['vectorClock'] is String) {
+          vectorClock = Map<String, int>.from(jsonDecode(data['vectorClock']));
+        } else if (data['vectorClock'] is Map) {
+          vectorClock = Map<String, int>.from(data['vectorClock']);
+        }
+      } catch (e) {
+        // Игнорируем ошибки парсинга
+      }
+    }
+
     final newMessage = ChatMessage(
       id: msgId,
       content: content,
-      senderId: data['senderId'] ?? "Unknown",
+      senderId: senderId,
       senderUsername: data['senderUsername'] ?? "Nomad",
-      createdAt: DateTime.fromMillisecondsSinceEpoch(data['timestamp'] ?? DateTime.now().millisecondsSinceEpoch),
+      createdAt: createdAt,
+      receivedAt: now, // 📊 receivedAt: только для статистики/отладки, НЕ для сортировки
+      vectorClock: vectorClock, // 🔄 Только для синхронизации
       status: isFromCloud ? "SENT" : "MESH_LINK",
     );
 
@@ -290,7 +395,14 @@ class _ConversationScreenState extends State<ConversationScreen> {
       HapticFeedback.lightImpact(); // Тактильный сигнал о приеме
       setState(() {
         _messages.add(newMessage);
-        _messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+        // Сортировка по (created_at, author_id, message_id)
+        _messages.sort((a, b) {
+          final timeCompare = a.createdAt.compareTo(b.createdAt);
+          if (timeCompare != 0) return timeCompare;
+          final authorCompare = a.senderId.compareTo(b.senderId);
+          if (authorCompare != 0) return authorCompare;
+          return a.id.compareTo(b.id);
+        });
       });
       WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
     }
@@ -304,14 +416,25 @@ class _ConversationScreenState extends State<ConversationScreen> {
     final mesh = locator<MeshService>();
     final db = LocalDatabaseService();
 
-    final String tempId = "temp_${DateTime.now().millisecondsSinceEpoch}";
+    final now = DateTime.now();
+    final String tempId = "temp_${now.millisecondsSinceEpoch}";
+    
+    // 🔄 vectorClock: используется ТОЛЬКО для синхронизации
+    // "Какие сообщения мне не хватает", "до какого момента я в курсе"
+    // НЕ используется для UI-логики или сортировки
+    final vectorClock = <String, int>{
+      _currentUserId!: now.millisecondsSinceEpoch,
+    };
+    
     final myMsg = ChatMessage(
         id: tempId,
         content: text,
         senderId: _currentUserId!,
         senderUsername: "Me",
-        createdAt: DateTime.now(),
-        status: "SENDING"
+      createdAt: now,
+      receivedAt: null, // 📊 receivedAt: только для статистики/отладки, НЕ для сортировки
+      vectorClock: vectorClock, // 🔄 Только для синхронизации
+        status: MessageStatus.sentLocal
     );
 
     // Сначала показываем у себя (Optimistic UI)
@@ -319,21 +442,30 @@ class _ConversationScreenState extends State<ConversationScreen> {
     _ghostController.clear();
     _scrollToBottom();
 
+    // Сохраняем в БД со статусом SENDING
+    await db.saveMessage(myMsg, _chatId!);
+
     try {
       // 🔥 УЛЬТРА-ОТПРАВКА (Cloud + Mesh + Sonar)
       await mesh.sendAuto(
         content: text,
         chatId: _chatId,
         receiverName: widget.friendName,
+        messageId: tempId, // Передаем ID для обновления статуса
       );
 
-      // Обновляем статус
+      // Статус обновляется внутри sendAuto на DELIVERED_TO_NETWORK
+      // Обновляем статус в зависимости от канала доставки
+      final newStatus = mesh.isP2pConnected 
+          ? MessageStatus.deliveredMesh 
+          : (NetworkMonitor().currentRole == MeshRole.BRIDGE 
+              ? MessageStatus.deliveredServer 
+              : MessageStatus.deliveredMesh);
+      
       setState(() {
-        myMsg.status = mesh.isP2pConnected ? "MESH_LINK" : "PENDING_RELAY";
+        myMsg.status = newStatus;
       });
-
-      // Пишем в БД
-      await db.saveMessage(myMsg, _chatId!);
+      await db.updateMessageStatus(tempId, newStatus);
 
     } catch (e) {
       setState(() => myMsg.status = "OFFLINE_QUEUED");
@@ -351,12 +483,49 @@ class _ConversationScreenState extends State<ConversationScreen> {
       backgroundColor: Colors.black,
       appBar: AppBar(
         backgroundColor: const Color(0xFF0D0D0D),
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(widget.friendName, style: GoogleFonts.russoOne(fontSize: 14)),
-            Text(_chatId?.substring(0, 12) ?? "", style: GoogleFonts.robotoMono(fontSize: 8, color: Colors.white24)),
-          ],
+        title: GestureDetector(
+          onLongPress: () {
+            // Dev tool: Long press to open timeline debugger
+            if (_chatId != null) {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => RoomTimelineDebugger(roomId: _chatId!),
+                ),
+              );
+            }
+          },
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      widget.friendName,
+                      style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  Text(
+                    _roomState.shortText,
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                ],
+              ),
+              Text(
+                _roomState.displayText,
+                style: TextStyle(
+                  fontSize: 8,
+                  color: _roomState == RoomState.active
+                      ? Colors.green
+                      : _roomState == RoomState.syncing
+                          ? Colors.orange
+                          : Colors.redAccent,
+                  letterSpacing: 1,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
       body: Column(
@@ -399,7 +568,10 @@ class _ConversationScreenState extends State<ConversationScreen> {
               child: Text(message.content, style: const TextStyle(color: Colors.white, fontSize: 14)),
             ),
             const SizedBox(height: 2),
-            Text(message.status, style: const TextStyle(color: Colors.white24, fontSize: 8)),
+            if (isMe) Text(
+              MessageStatus.getDisplayText(message.status),
+              style: const TextStyle(color: Colors.white24, fontSize: 8),
+            ),
           ],
         ),
       ),

@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:memento_mori_app/features/camouflage/calculator_gate.dart';
 
 class SurvivalGuideScreen extends StatelessWidget {
@@ -16,8 +15,15 @@ class SurvivalGuideScreen extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const SizedBox(height: 20),
-              Text("TACTICAL BRIEFING",
-                  style: GoogleFonts.russoOne(color: Colors.redAccent, fontSize: 24, letterSpacing: 2)),
+              const Text(
+                "TACTICAL BRIEFING",
+                style: TextStyle(
+                  color: Colors.redAccent,
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 2,
+                ),
+              ),
               const SizedBox(height: 10),
               const Text("Read carefully. This is your only copy of the protocol.",
                   style: TextStyle(color: Colors.white38, fontSize: 12)),

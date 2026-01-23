@@ -2,8 +2,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:animate_do/animate_do.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 
 import 'package:memento_mori_app/core/api_service.dart';
@@ -65,7 +65,15 @@ class _ProfileScreenState extends State<ProfileScreen> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text("IDENTITY LEGALIZATION", style: GoogleFonts.russoOne(color: AppColors.gridCyan, fontSize: 18)),
+              const Text(
+                "IDENTITY LEGALIZATION",
+                style: TextStyle(
+                  color: AppColors.gridCyan,
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.2,
+                ),
+              ),
               const SizedBox(height: 10),
               const Text("Connect your Ghost Identity to a permanent Cloud account.",
                   textAlign: TextAlign.center, style: TextStyle(color: AppColors.textDim, fontSize: 12)),
@@ -100,7 +108,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 },
                 child: _isLegalizing
                     ? const CircularProgressIndicator(color: Colors.black)
-                    : Text("EXECUTE UPLINK", style: GoogleFonts.russoOne()),
+                    : const Text(
+                        "EXECUTE UPLINK",
+                        style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                      ),
               ),
               const SizedBox(height: 15),
             ],
@@ -117,7 +128,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
     return Scaffold(
       backgroundColor: AppColors.background,
       appBar: AppBar(
-        title: Text('IDENTITY_CORE', style: GoogleFonts.orbitron(letterSpacing: 2, fontSize: 14)),
+        title: const Text(
+          'IDENTITY_CORE',
+          style: TextStyle(
+            letterSpacing: 2,
+            fontSize: 14,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
         backgroundColor: AppColors.surface,
         elevation: 0,
       ),
@@ -206,11 +224,18 @@ class _ProfileScreenState extends State<ProfileScreen> {
       ),
       builder: (context) => Container(
         padding: const EdgeInsets.all(24),
-        child: Column(
+            child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text("IDENTITY MASKING",
-                style: GoogleFonts.russoOne(color: Colors.white, fontSize: 18)),
+            const Text(
+              "IDENTITY MASKING",
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 1.2,
+              ),
+            ),
             const SizedBox(height: 10),
             const Text("Select a decoy identity to hide this terminal from prying eyes.",
                 textAlign: TextAlign.center,
@@ -284,10 +309,24 @@ class _ProfileScreenState extends State<ProfileScreen> {
             ],
           ),
           const SizedBox(height: 20),
-          Text(user['username'] ?? 'Nomad',
-              style: GoogleFonts.russoOne(color: Colors.white, fontSize: 22, letterSpacing: 1)),
+          Text(
+            user['username'] ?? 'Nomad',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 22,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1,
+            ),
+          ),
           const SizedBox(height: 5),
-          Text(user['id'] ?? '', style: GoogleFonts.robotoMono(color: AppColors.textDim, fontSize: 9)),
+          Text(
+            user['id'] ?? '',
+            style: const TextStyle(
+              color: AppColors.textDim,
+              fontSize: 9,
+              fontFamily: 'monospace',
+            ),
+          ),
           const SizedBox(height: 15),
           Text("ACTIVE SINCE ${createdAt.year}.${createdAt.month}.${createdAt.day}",
               style: const TextStyle(color: AppColors.textDim, fontSize: 10, fontWeight: FontWeight.bold)),
@@ -309,7 +348,13 @@ class _ProfileScreenState extends State<ProfileScreen> {
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
         ),
         icon: const Icon(Icons.verified_user_outlined),
-        label: Text("LEGALIZE IDENTITY", style: GoogleFonts.russoOne(letterSpacing: 1)),
+        label: const Text(
+          "LEGALIZE IDENTITY",
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            letterSpacing: 1,
+          ),
+        ),
         onPressed: () => _showLegalizeDialog(context),
       ),
     );
@@ -332,7 +377,15 @@ class _ProfileScreenState extends State<ProfileScreen> {
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text("PROTOCOL NUKE", style: GoogleFonts.russoOne(color: AppColors.warningRed, fontSize: 14)),
+                const Text(
+                  "PROTOCOL NUKE",
+                  style: TextStyle(
+                    color: AppColors.warningRed,
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1,
+                  ),
+                ),
                 const Text("Permanently erase all grid data", style: TextStyle(color: AppColors.textDim, fontSize: 10)),
               ],
             ),

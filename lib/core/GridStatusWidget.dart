@@ -1,7 +1,6 @@
 import 'package:animate_do/animate_do.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:memento_mori_app/core/ultrasonic_service.dart';
 import 'package:provider/provider.dart';
 
@@ -43,7 +42,15 @@ class GridPulseIndicator extends StatelessWidget {
         children: [
           Pulse(child: Icon(icon, color: statusColor, size: 16), infinite: true),
           SizedBox(width: 10),
-          Text(label, style: GoogleFonts.orbitron(color: statusColor, fontSize: 10, fontWeight: FontWeight.bold)),
+          Text(
+            label,
+            style: TextStyle(
+              color: statusColor,
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1.0,
+            ),
+          ),
           Spacer(),
           // Кнопка быстрого SOS (через Сонар)
           IconButton(

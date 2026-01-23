@@ -19,6 +19,7 @@ dependencies:
   intl: ^0.20.2
   provider: ^6.1.1 # 🔥 БЫЛО ПОТЕРЯНО
   math_expressions: ^2.4.0
+  qr_flutter: ^4.1.0
 
   # --- DI & Architecture ---
   get_it: ^7.7.0 # 🔥 БЫЛО ПОТЕРЯНО
@@ -37,6 +38,7 @@ dependencies:
   nearby_connections: ^4.0.0
   flutter_blue_plus: ^1.34.5
   geolocator: ^13.0.1
+  geocoding: ^3.0.0 # Reverse geocoding для получения названия места
   flutter_ble_peripheral: ^2.0.1 # 🔥 БЫЛО ПОТЕРЯНО
 
   # --- Deep Tech (Sonar) ---
@@ -46,6 +48,7 @@ dependencies:
 
   # --- Безопасность ---
   cryptography: ^2.5.0
+  crypto: ^3.0.3
   flutter_secure_storage: ^9.2.4
   sqflite: ^2.3.0
   path: ^1.8.3
@@ -53,6 +56,7 @@ dependencies:
   flutter_local_notifications: ^17.1.2
   uuid: ^4.4.0
   battery_plus: ^6.0.1
+  synchronized: ^3.1.0
 
 dev_dependencies:
   flutter_test:
@@ -70,17 +74,11 @@ flutter:
     - family: Orbitron
       fonts:
         - asset: assets/fonts/Orbitron-VariableFont_wght.ttf
+        - asset: assets/fonts/Orbitron-Bold.ttf
+          weight: 700
     - family: RobotoMono
       fonts:
         - asset: assets/fonts/RobotoMono-VariableFont_wght.ttf
-
-
-    - family: Orbitron
-      fonts:
-        - asset: assets/fonts/Orbitron-Bold.ttf
-    #    - family: RussoOne
-    #      fonts:
-    #        - asset: assets/fonts/RussoOne-Regular.ttf # ← Закомментируй это!
   assets:
     - assets/audio/
     - assets/fonts/

@@ -1,11 +1,12 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:animate_do/animate_do.dart';
 
 import 'package:memento_mori_app/core/websocket_service.dart';
 import 'package:memento_mori_app/core/api_service.dart';
 import 'package:memento_mori_app/core/locator.dart';
+import 'package:memento_mori_app/core/local_db_service.dart';
+import 'package:memento_mori_app/core/location_name_service.dart';
 
 import '../features/theme/app_colors.dart';
 
@@ -34,8 +35,43 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
   }
 
   Future<void> _loadInitialZones() async {
-    // В ApiService нужно будет добавить GET /api/emergency/active
-    // Пока сделаем имитацию или пустой список
+    // Загружаем зоны из локальной БД (оффлайн) и с сервера (онлайн)
+    final db = LocalDatabaseService();
+    final locationService = LocationNameService();
+
+    try {
+      // Загружаем агрегированные SOS сигналы из локальной БД
+      final localZones = await db.getAggregatedSosSignals();
+      
+      // Обновляем названия мест для зон, где их еще нет
+      for (var zone in localZones) {
+        if (zone['locationName'] == null && zone['sectorId'] != null) {
+          final locationName = await locationService.getLocationNameFromSectorId(zone['sectorId'] as String);
+          if (locationName != null) {
+            zone['locationName'] = locationName;
+          }
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _hotZones.clear();
+          _hotZones.addAll(localZones.map((z) => z as Map<String, dynamic>));
+        });
+      }
+    } catch (e) {
+      print("⚠️ [EmergencyRadar] Failed to load initial zones: $e");
+    }
+
+    // Пытаемся загрузить с сервера (если есть интернет)
+    try {
+      final api = locator<ApiService>();
+      // TODO: Добавить GET /api/emergency/active в ApiService
+      // final serverZones = await api.getActiveEmergencyZones();
+      // Объединяем с локальными зонами
+    } catch (e) {
+      print("⚠️ [EmergencyRadar] Server sync failed (offline mode): $e");
+    }
   }
 
   void _handleNewAlert(Map<String, dynamic> alert) {
@@ -95,9 +131,10 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
               alignment: Alignment.centerLeft,
               child: Text(
                 "GRID INTELLIGENCE // HOT ZONES",
-                style: GoogleFonts.russoOne(
+                style: const TextStyle(
                   color: Colors.white,
                   fontSize: 12,
+                  fontWeight: FontWeight.bold,
                   letterSpacing: 1,
                 ),
               ),
@@ -147,11 +184,12 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
                               alignment: Alignment.centerLeft,
                               fit: BoxFit.scaleDown, // Сжимает текст, если он не лезет
                               child: Text(
-                                zone['sectorId'] ?? "UNKNOWN_SECTOR",
-                                style: GoogleFonts.robotoMono(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 14
+                                zone['locationName'] ?? zone['sectorId'] ?? "UNKNOWN_SECTOR",
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 14,
+                                  letterSpacing: 0.5,
                                 ),
                               ),
                             ),
@@ -163,9 +201,16 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
                     ),
                     const SizedBox(height: 12),
                     Text(
-                      "Grid integrity compromised. Detected ${zone['count']} pulses in this sector.",
+                      "Grid integrity compromised. Detected ${zone['count']} SOS signal(s) in this sector.",
                       style: TextStyle(color: AppColors.textDim, fontSize: 10, height: 1.3),
                     ),
+                    if (zone['sectorId'] != null && zone['locationName'] == null) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        "Sector: ${zone['sectorId']}",
+                        style: TextStyle(color: AppColors.textDim.withOpacity(0.6), fontSize: 8),
+                      ),
+                    ],
                     const SizedBox(height: 15),
                     _buildCardActions(zone['sectorId']),
                   ],
@@ -206,7 +251,10 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
             style: ElevatedButton.styleFrom(backgroundColor: AppColors.white05, foregroundColor: Colors.white),
             onPressed: () {}, // Переход к карте (если будет)
             icon: const Icon(Icons.map_outlined, size: 14),
-            label: Text("VIEW AREA", style: GoogleFonts.russoOne(fontSize: 10)),
+            label: const Text(
+              "VIEW AREA",
+              style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 0.8),
+            ),
           ),
         ),
         const SizedBox(width: 10),
@@ -217,7 +265,10 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
               // Логика переключения Gossip-менеджера в режим приоритета для этой зоны
             },
             icon: const Icon(Icons.wifi_tethering, size: 14),
-            label: Text("JOIN RESCUE", style: GoogleFonts.russoOne(fontSize: 10)),
+            label: const Text(
+              "JOIN RESCUE",
+              style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 0.8),
+            ),
           ),
         ),
       ],
@@ -231,10 +282,25 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
       children: [
         Pulse(
           infinite: true,
-          child: Container(width: 6, height: 6, decoration: const BoxDecoration(color: AppColors.cloudGreen, shape: BoxShape.circle)),
+          child: Container(
+            width: 6,
+            height: 6,
+            decoration: const BoxDecoration(
+              color: AppColors.cloudGreen,
+              shape: BoxShape.circle,
+            ),
+          ),
         ),
         const SizedBox(width: 6),
-        Text("LIVE FEED", style: GoogleFonts.robotoMono(color: AppColors.cloudGreen, fontSize: 8, fontWeight: FontWeight.bold)),
+        const Text(
+          "LIVE FEED",
+          style: TextStyle(
+            color: AppColors.cloudGreen,
+            fontSize: 8,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 1,
+          ),
+        ),
       ],
     );
   }
@@ -246,10 +312,20 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
         children: [
           Icon(Icons.shield_outlined, size: 50, color: AppColors.textMuted),
           const SizedBox(height: 20),
-          Text("ALL SECTORS CLEAR", style: GoogleFonts.russoOne(color: AppColors.textDim, fontSize: 14)),
-          Text("No mass emergency signals detected on the global grid.",
-              textAlign: TextAlign.center,
-              style: TextStyle(color: AppColors.textDim, fontSize: 10)),
+          const Text(
+            "ALL SECTORS CLEAR",
+            style: TextStyle(
+              color: AppColors.textDim,
+              fontSize: 14,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1,
+            ),
+          ),
+          const Text(
+            "No mass emergency signals detected on the global grid.",
+            textAlign: TextAlign.center,
+            style: TextStyle(color: AppColors.textDim, fontSize: 10),
+          ),
         ],
       ),
     );

@@ -9,30 +9,41 @@ import 'package:memento_mori_app/core/api_service.dart';
 import 'package:memento_mori_app/splash_screen.dart';
 import 'package:provider/provider.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'core/MeshOrchestrator.dart';
 import 'core/background_service.dart';
 import 'core/gossip_manager.dart';
 import 'core/locator.dart';
 import 'core/mesh_permission_screen.dart';
-import 'core/mesh_prep_service.dart';
 import 'core/mesh_service.dart';
 import 'core/native_mesh_service.dart';
 import 'core/websocket_service.dart';
 
 
-void main() async {
+Future<String> _writeCrash(Object error, StackTrace stack) async {
+  try {
+    final dir = await getApplicationSupportDirectory();
+    final file = File('${dir.path}/crash_${DateTime.now().millisecondsSinceEpoch}.log');
+    await file.writeAsString('ERROR: $error\n\n$stack');
+    return file.path;
+  } catch (_) {
+    return 'crash log write failed';
+  }
+}
+
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  bool isAuthorized = await MeshPrepService.requestTacticalPermissions();
+
+  // Глобальный перехват Flutter-ошибок с записью в файл
+  FlutterError.onError = (FlutterErrorDetails details) async {
+    await _writeCrash(details.exception, details.stack ?? StackTrace.current);
+    FlutterError.dumpErrorToConsole(details);
+  };
+
   setupLocator();
-  locator<TacticalMeshOrchestrator>().start();
 
-  NativeMeshService.init();
-  BackgroundService.init();
-  await WebSocketService().initNotifications();
-  await WakelockPlus.enable();
-
-  bool isFirstLaunch = await LocalDatabaseService().isFirstLaunch();
+  final bool isFirstLaunch = await LocalDatabaseService().isFirstLaunch();
 
   runApp(
     MultiProvider(

@@ -1,4 +1,5 @@
 import 'dart:typed_data'; // 🔥 ОБЯЗАТЕЛЬНО ДЛЯ Uint8List
+import 'dart:math' as math;
 import 'package:cryptography/cryptography.dart';
 import 'dart:convert';
 
@@ -61,8 +62,10 @@ class EncryptionService {
     final publicKey = await keyPair.extractPublicKey();
     final privateKeyBytes = await keyPair.extractPrivateKeyBytes();
 
-    // Создаем уникальный Ghost ID
-    final String ghostId = "GHOST_${DateTime.now().millisecondsSinceEpoch}_${username.hashCode.abs()}";
+    // 🔒 Fix Ghost Identity collision: Add secure random to prevent collisions
+    final random = math.Random.secure();
+    final randomSuffix = random.nextInt(999999);
+    final String ghostId = "GHOST_${DateTime.now().millisecondsSinceEpoch}_${username.hashCode.abs()}_$randomSuffix";
 
     print("🛡️ [Security] Ghost Identity established locally for: $username");
 

@@ -50,6 +50,15 @@ class NativeMeshService {
           locator<MeshService>().onNetworkDisconnected();
           break;
 
+        case 'onP2pStateChanged':
+          final args = Map<String, dynamic>.from(call.arguments);
+          final bool enabled = args['enabled'] ?? false;
+          print("📡 [Native] Wi-Fi Direct state changed: ${enabled ? 'ENABLED' : 'DISABLED'}");
+          if (!enabled) {
+            print("⚠️ [Native] Wi-Fi Direct is DISABLED. Please enable it in settings.");
+          }
+          break;
+
         case 'onMessageReceived':
           try {
             final Map<dynamic, dynamic> args = call.arguments;
@@ -149,11 +158,60 @@ class NativeMeshService {
   }
 
   /// Поиск устройств Wi-Fi Direct
-  static Future<void> startDiscovery() async {
+  /// Возвращает true если discovery запущен, false если Wi-Fi Direct отключен
+  static Future<bool> startDiscovery() async {
     try {
       await _channel.invokeMethod('startDiscovery');
+      return true;
+    } on PlatformException catch (e) {
+      if (e.code == 'P2P_DISABLED') {
+        print("⚠️ [Native] Wi-Fi Direct is DISABLED. Requesting activation...");
+        // Запрашиваем активацию
+        await requestP2pActivation();
+        return false;
+      }
+      print("❌ [Native] Discovery Error: ${e.message}");
+      return false;
     } catch (e) {
       print("❌ [Native] Discovery Error: $e");
+      return false;
+    }
+  }
+
+  /// Проверяет состояние Wi-Fi Direct
+  static Future<bool> checkP2pState() async {
+    try {
+      final result = await _channel.invokeMethod('checkP2pState');
+      // Безопасное приведение типа: результат может быть Map<Object?, Object?>
+      final Map<dynamic, dynamic> resultMap = Map<dynamic, dynamic>.from(result ?? {});
+      final enabled = resultMap['enabled'] ?? false;
+      return enabled is bool ? enabled : false;
+    } catch (e) {
+      print("❌ [Native] Check P2P state error: $e");
+      return false;
+    }
+  }
+
+  /// Проверяет, активен ли discovery
+  static Future<bool> checkDiscoveryState() async {
+    try {
+      final result = await _channel.invokeMethod('checkDiscoveryState');
+      final Map<dynamic, dynamic> resultMap = Map<dynamic, dynamic>.from(result ?? {});
+      final active = resultMap['active'] ?? false;
+      return active is bool ? active : false;
+    } catch (e) {
+      print("❌ [Native] Check discovery state error: $e");
+      return false;
+    }
+  }
+
+  /// Запрашивает активацию Wi-Fi Direct (открывает настройки)
+  static Future<void> requestP2pActivation() async {
+    try {
+      await _channel.invokeMethod('requestP2pActivation');
+      print("📱 [Native] Opening Wi-Fi settings for user to enable Wi-Fi Direct");
+    } catch (e) {
+      print("❌ [Native] Request P2P activation error: $e");
     }
   }
 
@@ -189,19 +247,75 @@ class NativeMeshService {
   }
 
   /// Отправка данных через TCP (Burst Mode)
-  static Future<void> sendTcp(String message, {required String host}) async {
+  static Future<void> sendTcp(String message, {required String host, int? port}) async {
     try {
       // Гарантируем терминатор строки для Kotlin BufferedReader
       final String payload = message.endsWith('\n') ? message : '$message\n';
+      
+      // Используем переданный порт или порт по умолчанию (55556 для временного BRIDGE сервера)
+      final int targetPort = port ?? 55556;
 
       await _channel.invokeMethod('sendTcp', {
         'host': host,
-        'port': 55555,
+        'port': targetPort,
         'message': payload
       });
-      print("🚀 [Native] TCP Burst delivered to $host");
+      print("🚀 [Native] TCP Burst delivered to $host:$targetPort");
     } catch (e) {
       print("❌ [Native] TCP Transmission Failure: $e");
+    }
+  }
+
+  /// Запускает кратковременный TCP сервер на указанное время
+  /// Проверяет, можно ли поднимать TCP сервер на этом устройстве
+  static Future<bool> canStartTcpServer() async {
+    try {
+      final result = await _channel.invokeMethod('canStartTcpServer');
+      return result as bool? ?? true; // По умолчанию разрешаем
+    } catch (e) {
+      print("⚠️ [Native] CanStartTcpServer check error: $e");
+      return true; // По умолчанию разрешаем, если проверка не удалась
+    }
+  }
+
+  static Future<void> startTemporaryTcpServer({required int durationSeconds}) async {
+    try {
+      // Проверяем, можно ли поднимать сервер
+      final canStart = await canStartTcpServer();
+      if (!canStart) {
+        print("🚫 [Native] TCP server disabled for this device - using BLE GATT");
+        throw Exception("TCP server disabled for weak device or after crash");
+      }
+      
+      await _channel.invokeMethod('startTemporaryTcpServer', {
+        'durationSeconds': durationSeconds,
+      });
+      print("🛡️ [Native] Temporary TCP server started for ${durationSeconds}s");
+    } catch (e) {
+      print("❌ [Native] Temporary server start error: $e");
+      rethrow; // Пробрасываем ошибку для обработки в mesh_service
+    }
+  }
+
+  /// Останавливает временный TCP сервер
+  static Future<void> stopTemporaryTcpServer() async {
+    try {
+      await _channel.invokeMethod('stopTemporaryTcpServer');
+      print("🛑 [Native] Temporary TCP server stopped");
+    } catch (e) {
+      print("❌ [Native] Temporary server stop error: $e");
+    }
+  }
+
+  /// Получает очередь сообщений из bridge_queue
+  static Future<List<Map<String, dynamic>>> getQueuedMessages() async {
+    try {
+      final List<dynamic>? result = await _channel.invokeMethod('getQueuedMessages');
+      if (result == null) return [];
+      return result.map((item) => Map<String, dynamic>.from(item)).toList();
+    } catch (e) {
+      print("❌ [Native] Get queued messages error: $e");
+      return [];
     }
   }
 
@@ -221,6 +335,83 @@ class NativeMeshService {
       await _sonarChannel.invokeMethod('stopListening');
     } catch (e) {
       print("❌ [Native] Sonar Stop Error: $e");
+    }
+  }
+
+  // ==========================================
+  // 🛰️ ROUTER CAPTURE PROTOCOL METHODS
+  // ==========================================
+
+  static const MethodChannel _routerChannel = MethodChannel('memento/router');
+
+  /// Сканирует доступные Wi-Fi сети
+  static Future<List<Map<String, dynamic>>> scanWifiNetworks() async {
+    try {
+      final List<dynamic>? result = await _routerChannel.invokeMethod('scanWifiNetworks');
+      if (result == null) return [];
+      return result.map((item) => Map<String, dynamic>.from(item)).toList();
+    } catch (e) {
+      print("❌ [Native] Scan WiFi networks error: $e");
+      return [];
+    }
+  }
+
+  /// Подключается к роутеру по SSID и паролю
+  static Future<bool> connectToRouter(String ssid, String? password) async {
+    try {
+      final result = await _routerChannel.invokeMethod('connectToRouter', {
+        'ssid': ssid,
+        'password': password,
+      });
+      return result as bool? ?? false;
+    } catch (e) {
+      print("❌ [Native] Connect to router error: $e");
+      return false;
+    }
+  }
+
+  /// Отключается от текущего роутера
+  static Future<bool> disconnectFromRouter() async {
+    try {
+      final result = await _routerChannel.invokeMethod('disconnectFromRouter');
+      return result as bool? ?? false;
+    } catch (e) {
+      print("❌ [Native] Disconnect from router error: $e");
+      return false;
+    }
+  }
+
+  /// Получает локальный IP адрес устройства в сети роутера
+  static Future<String?> getLocalIpAddress() async {
+    try {
+      final result = await _routerChannel.invokeMethod('getLocalIpAddress');
+      return result as String?;
+    } catch (e) {
+      print("❌ [Native] Get local IP error: $e");
+      return null;
+    }
+  }
+
+  /// Проверяет доступность интернета через роутер
+  static Future<bool> checkInternetViaRouter() async {
+    try {
+      final result = await _routerChannel.invokeMethod('checkInternetViaRouter');
+      return result as bool? ?? false;
+    } catch (e) {
+      print("❌ [Native] Check internet via router error: $e");
+      return false;
+    }
+  }
+
+  /// Получает информацию о текущем подключенном роутере
+  static Future<Map<String, dynamic>?> getConnectedRouterInfo() async {
+    try {
+      final result = await _routerChannel.invokeMethod('getConnectedRouterInfo');
+      if (result == null) return null;
+      return Map<String, dynamic>.from(result);
+    } catch (e) {
+      print("❌ [Native] Get connected router info error: $e");
+      return null;
     }
   }
 }

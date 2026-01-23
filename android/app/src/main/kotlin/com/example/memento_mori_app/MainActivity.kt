@@ -35,6 +35,7 @@ class MainActivity : FlutterFragmentActivity() {
     private val CHANNEL_SONAR = "memento/sonar"
     private val CHANNEL_GOOGLE = "google_play_services"
     private val CHANNEL_HARDWARE_GUARD = "memento/hardware_guard"
+    private val CHANNEL_ROUTER = "memento/router"
 
     // --- Системные объекты ---
     private var p2pHelper: WifiP2pHelper? = null
@@ -45,6 +46,10 @@ class MainActivity : FlutterFragmentActivity() {
     private var p2pMethodChannel: MethodChannel? = null
     private var meshMethodChannel: MethodChannel? = null
     private var sonarMethodChannel: MethodChannel? = null
+    private var routerMethodChannel: MethodChannel? = null
+    private var routerHelper: RouterHelper? = null
+    private var gattServerHelper: GattServerHelper? = null
+    private var gattMethodChannel: MethodChannel? = null
 
     // --- Состояние микрофона и аналитика ---
     private var micMutex: AudioRecord? = null
@@ -78,6 +83,32 @@ class MainActivity : FlutterFragmentActivity() {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(messageReceiver, filter)
         }
+        
+        // 🔥 ПРОВЕРКА AUTOSTART ДЛЯ КИТАЙСКИХ УСТРОЙСТВ (Xiaomi/Poco)
+        checkAutostartIfNeeded()
+    }
+    
+    /**
+     * Проверяет и показывает диалог Autostart, если требуется
+     */
+    private fun checkAutostartIfNeeded() {
+        if (!AutostartHelper.requiresAutostartCheck()) {
+            return
+        }
+        
+        // Проверяем, показывали ли уже диалог (можно использовать SharedPreferences)
+        val prefs = getSharedPreferences("memento_prefs", Context.MODE_PRIVATE)
+        val autostartDialogShown = prefs.getBoolean("autostart_dialog_shown", false)
+        
+        if (!autostartDialogShown) {
+            // Показываем диалог только один раз
+            runOnUiThread {
+                AutostartHelper.showAutostartDialog(this) {
+                    AutostartHelper.openAutostartSettings(this)
+                    prefs.edit().putBoolean("autostart_dialog_shown", true).apply()
+                }
+            }
+        }
     }
 
     override fun configureFlutterEngine(@NonNull engine: FlutterEngine) {
@@ -94,14 +125,45 @@ class MainActivity : FlutterFragmentActivity() {
         p2pMethodChannel = MethodChannel(messenger, CHANNEL_P2P)
         sonarMethodChannel = MethodChannel(messenger, "memento/sonar")
         hardwareGuardChannel = MethodChannel(messenger, CHANNEL_HARDWARE_GUARD)
+        routerMethodChannel = MethodChannel(messenger, CHANNEL_ROUTER)
+        gattMethodChannel = MethodChannel(messenger, "memento/gatt_server")
         val securityChannel = MethodChannel(messenger, CHANNEL_SECURITY)
         val googleChannel = MethodChannel(messenger, CHANNEL_GOOGLE)
 
+        // Инициализация RouterHelper
+        routerHelper = RouterHelper(this)
+
+        // Инициализация GATT Server Helper
+        gattServerHelper = GattServerHelper(this, gattMethodChannel)
+
         // 3. Привязка нативного сервиса Mesh к каналу Wi-Fi Direct
         p2pHelper = WifiP2pHelper(this, this, p2pMethodChannel!!)
-        meshMethodChannel?.setMethodCallHandler(
-            NativeMeshService(this, manager, wifiP2pChannel!!, p2pHelper)
-        )
+        val nativeMeshService = NativeMeshService(this, manager, wifiP2pChannel!!, p2pHelper)
+        nativeMeshService.setGattServerHelper(gattServerHelper)
+        meshMethodChannel?.setMethodCallHandler(nativeMeshService)
+        
+        // GATT Server Method Channel
+        gattMethodChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "startGattServer" -> {
+                    val success = gattServerHelper?.startGattServer() ?: false
+                    result.success(success)
+                }
+                "stopGattServer" -> {
+                    gattServerHelper?.stopGattServer()
+                    result.success(true)
+                }
+                "isGattServerRunning" -> {
+                    val isRunning = gattServerHelper?.isRunning() ?: false
+                    result.success(isRunning)
+                }
+                "getConnectedDevicesCount" -> {
+                    val count = gattServerHelper?.getConnectedDevicesCount() ?: 0
+                    result.success(count)
+                }
+                else -> result.notImplemented()
+            }
+        }
 
         // 4. Запуск форензик-систем (Mic Detection & Anti-Hook)
         startMicDetection()
@@ -146,18 +208,40 @@ class MainActivity : FlutterFragmentActivity() {
         p2pMethodChannel?.setMethodCallHandler { call, result ->
             when (call.method) {
                 "startDiscovery" -> {
+                    // Проверяем состояние Wi-Fi Direct перед запуском
+                    val p2pHelper = p2pHelper
+                    if (p2pHelper?.isP2pEnabled() != true) {
+                        Log.w("P2P", "⚠️ Wi-Fi Direct is disabled. Requesting activation...")
+                        result.error("P2P_DISABLED", "Wi-Fi Direct is disabled. Please enable it in settings.", null)
+                        // Открываем настройки для пользователя
+                        p2pHelper?.requestP2pActivation()
+                        return@setMethodCallHandler
+                    }
+                    
                     // Используем нативный менеджер напрямую для надежности
                     manager.discoverPeers(wifiP2pChannel, object : WifiP2pManager.ActionListener {
                         override fun onSuccess() {
-                            Log.d("P2P", "Discovery started")
+                            Log.d("P2P", "✅ Discovery started")
                             result.success(true)
                         }
                         override fun onFailure(reason: Int) {
-                            Log.e("P2P", "Discovery failed: $reason")
-                            result.error("P2P_ERR", "Failed to start", reason)
+                            Log.e("P2P", "❌ Discovery failed: $reason")
+                            result.error("P2P_ERR", "Failed to start discovery", reason)
                         }
                     })
                 }
+            "checkP2pState" -> {
+                val isEnabled = p2pHelper?.isP2pEnabled() ?: false
+                result.success(mapOf("enabled" to isEnabled))
+            }
+            "checkDiscoveryState" -> {
+                val isActive = p2pHelper?.isDiscoveryActive() ?: false
+                result.success(mapOf("active" to isActive))
+            }
+            "requestP2pActivation" -> {
+                p2pHelper?.requestP2pActivation()
+                result.success(true)
+            }
                 "stopDiscovery" -> {
                     manager.stopPeerDiscovery(wifiP2pChannel, object : WifiP2pManager.ActionListener {
                         override fun onSuccess() { result.success(true) }
@@ -230,6 +314,46 @@ class MainActivity : FlutterFragmentActivity() {
                     } else result.error("ERR", "Null icon target", null)
                 }
                 else -> result.notImplemented()
+            }
+        }
+
+        // --- ROUTER CAPTURE PROTOCOL: Управление Wi-Fi роутерами ---
+        routerMethodChannel?.setMethodCallHandler { call, result ->
+            try {
+                when (call.method) {
+                    "scanWifiNetworks" -> {
+                        val networks = routerHelper?.scanWifiNetworks() ?: emptyList()
+                        result.success(networks)
+                    }
+                    "connectToRouter" -> {
+                        val ssid = call.argument<String>("ssid") ?: ""
+                        val password = call.argument<String>("password")
+                        val success = routerHelper?.connectToRouter(ssid, password) ?: false
+                        result.success(success)
+                    }
+                    "disconnectFromRouter" -> {
+                        val success = routerHelper?.disconnectFromRouter() ?: false
+                        result.success(success)
+                    }
+                    "getLocalIpAddress" -> {
+                        val ip = routerHelper?.getLocalIpAddress()
+                        result.success(ip)
+                    }
+                    "checkInternetViaRouter" -> {
+                        val hasInternet = routerHelper?.checkInternetViaRouter() ?: false
+                        result.success(hasInternet)
+                    }
+                    "getConnectedRouterInfo" -> {
+                        val info = routerHelper?.getConnectedRouterInfo()
+                        result.success(info)
+                    }
+                    else -> {
+                        result.notImplemented()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("RouterHelper", "Error handling method call: ${e.message}")
+                result.error("ROUTER_ERROR", e.message, null)
             }
         }
 
@@ -360,6 +484,10 @@ class MainActivity : FlutterFragmentActivity() {
         audioCallback?.let { am.unregisterAudioRecordingCallback(it) }
         try { unregisterReceiver(messageReceiver) } catch (_: Exception) {}
         micMutex?.let { try { it.stop(); it.release() } catch (_: Exception) {} }
+        
+        // 🔥 ОЧИСТКА P2P РЕСУРСОВ ДЛЯ КИТАЙСКИХ УСТРОЙСТВ
+        p2pHelper?.cleanup()
+        
         super.onDestroy()
     }
 }

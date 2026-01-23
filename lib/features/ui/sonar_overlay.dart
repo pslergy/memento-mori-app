@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:animate_do/animate_do.dart';
 
 import 'package:memento_mori_app/core/native_mesh_service.dart';
@@ -35,11 +34,25 @@ class SonarOverlay {
                 ),
               ),
               const SizedBox(height: 40),
-              Text("ACOUSTIC SIGNAL CAPTURED",
-                  style: GoogleFonts.russoOne(color: Colors.white, fontSize: 18, letterSpacing: 2)),
+              const Text(
+                "ACOUSTIC SIGNAL CAPTURED",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 2,
+                ),
+              ),
               const SizedBox(height: 10),
-              Text("IDENT: Nomad #${senderId.substring(0, 6)}",
-                  style: GoogleFonts.robotoMono(color: AppColors.sonarPurple, fontSize: 14)),
+              Text(
+                "IDENT: Nomad #${senderId.substring(0, 6)}",
+                style: const TextStyle(
+                  color: AppColors.sonarPurple,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 1,
+                ),
+              ),
               const SizedBox(height: 60),
 
               // Кнопки управления
@@ -90,7 +103,15 @@ class _TacticalBtn extends StatelessWidget {
           borderRadius: BorderRadius.circular(10),
           color: color.withOpacity(0.05),
         ),
-        child: Text(label, style: GoogleFonts.russoOne(color: color, fontSize: 10)),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: color,
+            fontSize: 10,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 1,
+          ),
+        ),
       ),
     );
   }

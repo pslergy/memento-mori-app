@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import '../../core/models/ad_packet.dart';
 
 class TacticalBanner extends StatelessWidget {
@@ -48,11 +47,12 @@ class TacticalBanner extends StatelessWidget {
                 children: [
                   const Icon(Icons.sensors_rounded, color: Colors.amberAccent, size: 20),
                   const SizedBox(width: 10),
-                  Text(
+                  const Text(
                     "LOCAL SIGNAL DETECTED",
-                    style: GoogleFonts.russoOne(
+                    style: TextStyle(
                       color: Colors.amberAccent,
                       fontSize: 12,
+                      fontWeight: FontWeight.bold,
                       letterSpacing: 1.5,
                     ),
                   ),
@@ -90,9 +90,10 @@ class TacticalBanner extends StatelessWidget {
               Text(
                 ad.title.toUpperCase(),
                 textAlign: TextAlign.left,
-                style: GoogleFonts.russoOne(
+                style: const TextStyle(
                   color: Colors.white,
                   fontSize: 20,
+                  fontWeight: FontWeight.bold,
                   letterSpacing: 1,
                 ),
               ),
@@ -124,7 +125,7 @@ class TacticalBanner extends StatelessWidget {
                 },
                 child: Text(
                   "ESTABLISH CONNECTION",
-                  style: GoogleFonts.russoOne(fontSize: 14),
+                  style: TextStyle(fontFamily: 'Orbitron', fontWeight: FontWeight.bold, fontSize: 14),
                 ),
               ),
               const SizedBox(height: 10),

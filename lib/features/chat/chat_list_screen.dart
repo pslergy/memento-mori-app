@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:animate_do/animate_do.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 import 'package:memento_mori_app/core/api_service.dart';
 import 'package:memento_mori_app/core/network_monitor.dart';
@@ -12,6 +12,7 @@ import 'package:memento_mori_app/core/ultrasonic_service.dart';
 import 'package:memento_mori_app/features/chat/conversation_screen.dart';
 import 'package:memento_mori_app/features/profile/profile_screen.dart';
 import 'package:memento_mori_app/features/chat/mesh_hybrid_screen.dart';
+import 'package:memento_mori_app/features/friends/friends_list_screen.dart';
 import '../../core/websocket_service.dart';
 
 class ChatListScreen extends StatefulWidget {
@@ -32,7 +33,7 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 4, vsync: this); // Добавили вкладку Friends
     _tabController.addListener(() { if (!_tabController.indexIsChanging) setState(() {}); });
 
     _loadChats();
@@ -55,7 +56,34 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
     setState(() => _isLoading = true);
 
     try {
-      final chats = await _apiService.getChats();
+      // Retry логика для Tecno/Xiaomi (более агрессивные оптимизации батареи)
+      List<dynamic> chats = [];
+      int retries = 0;
+      const maxRetries = 2;
+      
+      while (retries < maxRetries && chats.isEmpty) {
+        try {
+          chats = await _apiService.getChats();
+          if (chats.isNotEmpty) break; // Успешно загрузили
+        } catch (e) {
+          retries++;
+          if (retries < maxRetries) {
+            // Ждем перед повторной попыткой
+            await Future.delayed(Duration(seconds: retries * 2));
+          }
+        }
+      }
+      
+      // 🔥 ГАРАНТИЯ: Если список пустой - добавляем Beacon вручную
+      if (chats.isEmpty) {
+        chats = [{
+          'id': 'THE_BEACON_GLOBAL',
+          'name': 'THE BEACON (Global SOS)',
+          'type': 'GLOBAL',
+          'lastMessage': {'content': 'Mesh Active. Frequency secured.', 'createdAt': DateTime.now().toIso8601String()},
+        }];
+      }
+      
       if (mounted) {
         setState(() {
           _allChats = chats;
@@ -63,7 +91,18 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
         });
       }
     } catch (e) {
-      if (mounted) setState(() => _isLoading = false);
+      // 🔥 FALLBACK: Если все попытки провалились - показываем хотя бы Beacon
+      if (mounted) {
+        setState(() {
+          _allChats = [{
+            'id': 'THE_BEACON_GLOBAL',
+            'name': 'THE BEACON (Global SOS)',
+            'type': 'GLOBAL',
+            'lastMessage': {'content': 'Mesh Active. Frequency secured.', 'createdAt': DateTime.now().toIso8601String()},
+          }];
+          _isLoading = false;
+        });
+      }
     }
   }
 
@@ -90,11 +129,13 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
     final String shortId = myId.length > 6 ? myId.substring(myId.length - 6) : myId;
 
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text("🔊 EMITTING HANDSHAKE PULSE: Nomad #$shortId",
-            style: GoogleFonts.russoOne(fontSize: 10, color: Colors.purpleAccent)),
+      const SnackBar(
+        content: Text(
+          "🔊 EMITTING HANDSHAKE PULSE",
+          style: TextStyle(fontSize: 10, color: Colors.purpleAccent, fontWeight: FontWeight.bold),
+        ),
         backgroundColor: Colors.black,
-        duration: const Duration(seconds: 3),
+        duration: Duration(seconds: 3),
       ),
     );
 
@@ -107,7 +148,14 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        title: Text('GRID_COMMS', style: GoogleFonts.orbitron(letterSpacing: 2, fontWeight: FontWeight.bold, fontSize: 16)),
+        title: const Text(
+          'GRID_COMMS',
+          style: TextStyle(
+            letterSpacing: 2,
+            fontWeight: FontWeight.bold,
+            fontSize: 16,
+          ),
+        ),
         backgroundColor: Colors.black,
         elevation: 0,
         actions: [
@@ -129,11 +177,12 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
         bottom: TabBar(
           controller: _tabController,
           indicatorColor: Colors.redAccent,
-          labelStyle: GoogleFonts.russoOne(fontSize: 10, letterSpacing: 1),
-          tabs: const [
+          labelStyle: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1),
+          tabs: [
             Tab(text: "SIGNAL"),
             Tab(text: "SQUADS"),
             Tab(text: "NODES"),
+            Tab(text: "FRIENDS"),
           ],
         ),
       ),
@@ -147,6 +196,7 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
                 _buildGlobalTab(),
                 _buildChatList(_groupChats, "No squads detected in this sector."),
                 _buildChatList(_directChats, "No private links established."),
+                const FriendsListScreen(), // Вкладка Friends
               ],
             ),
           ),
@@ -177,15 +227,27 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
           ),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              _PulseDot(color: themeColor),
-              const SizedBox(width: 10),
-              Text(statusText, style: GoogleFonts.robotoMono(color: themeColor, fontSize: 10, fontWeight: FontWeight.bold)),
-              if (isMesh) ...[
-                const SizedBox(width: 15),
-                Text("|  RELAYS: ${mesh.nearbyNodes.length}", style: TextStyle(color: themeColor.withOpacity(0.5), fontSize: 9)),
-              ]
-            ],
+              children: [
+                _PulseDot(color: themeColor),
+                const SizedBox(width: 10),
+                Text(
+                  statusText,
+                  style: TextStyle(
+                    color: themeColor,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1,
+                    fontFamily: 'monospace',
+                  ),
+                ),
+                if (isMesh) ...[
+                  const SizedBox(width: 15),
+                  Text(
+                    "|  RELAYS: ${mesh.nearbyNodes.length}",
+                    style: TextStyle(color: themeColor.withOpacity(0.5), fontSize: 9),
+                  ),
+                ]
+              ],
           ),
         );
       },
@@ -210,7 +272,15 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
               children: [
                 const Icon(Icons.waves, color: Colors.white24, size: 12),
                 const SizedBox(width: 8),
-                Text("NEIGHBORHOOD FREQUENCIES", style: GoogleFonts.russoOne(color: Colors.white24, fontSize: 9, letterSpacing: 1)),
+                const Text(
+                  "NEIGHBORHOOD FREQUENCIES",
+                  style: TextStyle(
+                    color: Colors.white24,
+                    fontSize: 9,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1,
+                  ),
+                ),
               ],
             ),
           ),
@@ -239,7 +309,15 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
         ),
         child: ListTile(
           leading: Pulse(child: const Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 28), infinite: true),
-          title: Text("THE BEACON", style: GoogleFonts.russoOne(color: Colors.white, fontSize: 16, letterSpacing: 1)),
+          title: const Text(
+            "THE BEACON",
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1,
+            ),
+          ),
           subtitle: const Text("GLOBAL EMERGENCY CHANNEL // BROADCASTING", style: TextStyle(color: Colors.redAccent, fontSize: 8, fontWeight: FontWeight.bold)),
           trailing: const Icon(Icons.chevron_right, color: Colors.white24),
           onTap: () => _openChat('GLOBAL', 'THE BEACON', 'THE_BEACON_GLOBAL'),
@@ -250,7 +328,18 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
 
   Widget _buildChatList(List<dynamic> chats, String emptyMsg) {
     if (_isLoading) return const Center(child: CircularProgressIndicator(color: Colors.white));
-    if (chats.isEmpty) return Center(child: Text(emptyMsg, style: GoogleFonts.robotoMono(color: Colors.white10, fontSize: 12)));
+    if (chats.isEmpty) {
+      return Center(
+        child: Text(
+          emptyMsg,
+          style: const TextStyle(
+            color: Colors.white10,
+            fontSize: 12,
+            fontFamily: 'monospace',
+          ),
+        ),
+      );
+    }
 
     return ListView.separated(
       padding: const EdgeInsets.all(8),
@@ -272,8 +361,18 @@ class _ChatListScreenState extends State<ChatListScreen> with SingleTickerProvid
             backgroundColor: Colors.white.withOpacity(0.05),
             child: Icon(chat['type'] == 'GROUP' ? Icons.groups_3_outlined : Icons.person_outline, color: Colors.white38),
           ),
-          title: Text(title, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
-          subtitle: Text(sub, style: GoogleFonts.robotoMono(color: Colors.white24, fontSize: 9)),
+          title: Text(
+            title,
+            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14),
+          ),
+          subtitle: Text(
+            sub,
+            style: const TextStyle(
+              color: Colors.white24,
+              fontSize: 9,
+              fontFamily: 'monospace',
+            ),
+          ),
           onTap: () => _openChat(chat['type'] == 'DIRECT' ? chat['otherUser']['id'] : '', title, chat['id']),
         );
       },

@@ -72,3 +72,9 @@ config_local.dart
 # Backup files
 *.bak
 *.tmp
+
+# Backend folder (Morri)
+/Morri/
+
+# Markdown documentation files
+*.md

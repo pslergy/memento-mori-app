@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'package:animate_do/animate_do.dart';
 
 import '../theme/app_colors.dart';
@@ -22,8 +21,15 @@ class AuthGateScreen extends StatelessWidget {
               child: Icon(Icons.shield_outlined, size: 80, color: AppColors.gridCyan),
             ),
             const SizedBox(height: 30),
-            Text("GRID ACCESS",
-                style: GoogleFonts.orbitron(fontSize: 22, color: Colors.white, letterSpacing: 5)),
+            const Text(
+              "GRID ACCESS",
+              style: TextStyle(
+                fontSize: 22,
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 5,
+              ),
+            ),
             const SizedBox(height: 10),
             Text("Authorization required to establish uplink.",
                 textAlign: TextAlign.center,
@@ -70,21 +76,32 @@ class _AuthButton extends StatelessWidget {
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(15),
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-            border: Border.all(color: color.withOpacity(0.3)),
-            borderRadius: BorderRadius.circular(15),
-            color: color.withOpacity(0.05)
-        ),
-        child: Column(
-          children: [
-            Text(label, style: GoogleFonts.russoOne(color: color, fontSize: 14)),
-            Text(desc, style: TextStyle(color: AppColors.textDim, fontSize: 8)),
-          ],
-        ),
-      ),
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                  border: Border.all(color: color.withOpacity(0.3)),
+                  borderRadius: BorderRadius.circular(15),
+                  color: color.withOpacity(0.05)
+              ),
+              child: Column(
+                children: [
+                  Text(
+                    label,
+                    style: TextStyle(
+                      color: color,
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                  Text(
+                    desc,
+                    style: const TextStyle(color: AppColors.textDim, fontSize: 8),
+                  ),
+                ],
+              ),
+            ),
     );
   }
 }

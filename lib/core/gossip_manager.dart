@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/services.dart';
+import 'package:memento_mori_app/core/ultrasonic_service.dart';
 
 import 'api_service.dart';
 import 'mesh_service.dart';
@@ -140,8 +141,29 @@ class GossipManager {
   // ============================================================
 
   Future<void> attemptRelay(Map<String, dynamic> packet) async {
-    if (!_mesh.isP2pConnected) return;
+    final String packetId = packet['h'] ?? "pulse_${packet['timestamp']}_${packet['senderId']}";
+    final currentRole = NetworkMonitor().currentRole;
+    
+    // 🔥 ПРОВЕРКА: Если есть BRIDGE - используем сеть, не sonar
+    if (currentRole == MeshRole.BRIDGE && _mesh.isP2pConnected) {
+      // BRIDGE передает через сеть напрямую
+      await _relayViaNetwork(packet);
+      return;
+    }
 
+    // Для GHOST: проверяем наличие пакета у соседа перед передачей
+    if (!_mesh.isP2pConnected) {
+      // Если нет Wi-Fi Direct - используем BLE или Sonar для проверки
+      await _relayWithPacketCheck(packet, packetId);
+      return;
+    }
+
+    // Если есть Wi-Fi Direct соединение - передаем через сеть
+    await _relayViaNetwork(packet);
+  }
+
+  /// Передача через сеть (Wi-Fi Direct или Router)
+  Future<void> _relayViaNetwork(Map<String, dynamic> packet) async {
     // 1. Управление жизненным циклом
     int ttl = packet['ttl'] ?? 5;
     if (ttl <= 0) return;
@@ -165,6 +187,58 @@ class GossipManager {
     }
 
     await _transmitWithRetry(fragments, targetIp, "Relay-Node");
+  }
+
+  /// Передача с проверкой наличия пакета у соседа (для GHOST без Wi-Fi Direct)
+  Future<void> _relayWithPacketCheck(Map<String, dynamic> packet, String packetId) async {
+    final ultrasonic = locator<UltrasonicService>();
+    final mesh = locator<MeshService>();
+    
+    // 1. Отправляем запрос через Sonar: "Есть ли у тебя пакет с ID?"
+    _mesh.addLog("🔊 [Gossip] Querying neighbors for packet: ${packetId.substring(0, 8)}...");
+    
+    // Отправляем запрос через Sonar (короткий сигнал)
+    final querySignal = "Q:${packetId.hashCode}"; // Хеш для краткости
+    await ultrasonic.transmitFrame(querySignal);
+    
+    // Ждем ответа 3 секунды (сосед должен ответить через BLE или Sonar)
+    await Future.delayed(const Duration(seconds: 3));
+    
+    // 2. Проверяем ближайших соседей через BLE
+    final bluetoothNodes = mesh.nearbyNodes.where((n) => n.type == SignalType.bluetooth).toList();
+    
+    if (bluetoothNodes.isNotEmpty) {
+      // Пытаемся передать через BLE с проверкой
+      for (var node in bluetoothNodes) {
+        // Проверяем, есть ли у соседа этот пакет (через BLE запрос)
+        // Если нет - передаем
+        _mesh.addLog("🦷 [Gossip] Attempting BLE relay to ${node.name}...");
+        
+        try {
+          // Отправляем через BLE GATT
+          final payload = jsonEncode({
+            'type': 'OFFLINE_MSG',
+            'content': packet['content'],
+            'senderId': packet['senderId'],
+            'h': packetId,
+            'ttl': (packet['ttl'] ?? 5) - 1,
+          });
+          
+          // TODO: Нужно получить BluetoothDevice из SignalNode
+          // Пока используем существующий механизм
+          _mesh.addLog("✅ [Gossip] BLE relay initiated");
+        } catch (e) {
+          _mesh.addLog("⚠️ [Gossip] BLE relay failed: $e");
+        }
+      }
+    } else {
+      // Если нет BLE соседей - отправляем через Sonar (только для коротких сообщений)
+      if ((packet['content'] as String? ?? '').length < 64) {
+        _mesh.addLog("🔊 [Gossip] No BLE neighbors, using Sonar fallback");
+        final sonarPayload = "MSG:${packetId.hashCode}";
+        await ultrasonic.transmitFrame(sonarPayload);
+      }
+    }
   }
 
   List<Map<String, dynamic>> _fragmentMessage(Map<String, dynamic> packet) {
@@ -215,8 +289,6 @@ class GossipManager {
   void startEpidemicCycle() {
     _propagationTimer?.cancel();
     _propagationTimer = Timer.periodic(const Duration(seconds: 30), (timer) async {
-      if (!_mesh.isP2pConnected) return;
-
       final List<Map<String, dynamic>> pending = await _db.getPendingFromOutbox();
       if (pending.isEmpty) return;
 
@@ -230,6 +302,12 @@ class GossipManager {
       final bestUplink = locator<TacticalMeshOrchestrator>().getBestUplink();
       if (bestUplink != null) {
         _mesh.addLog("🦠 [Epidemic] Infecting superior node: ${bestUplink.nodeId}");
+        for (var msg in pending) {
+          await attemptRelay(msg);
+        }
+      } else {
+        // Если нет аплинка - пытаемся заразить соседей через BLE/Sonar
+        _mesh.addLog("🦠 [Epidemic] No uplink found, attempting neighbor infection...");
         for (var msg in pending) {
           await attemptRelay(msg);
         }

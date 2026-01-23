@@ -12,8 +12,8 @@ class TacticalShakeDetector {
 
   TacticalShakeDetector({
     required this.onShake,
-    this.shakeThresholdGravity = 2.7,
-    this.minimumShakeInterval = 1000,
+    this.shakeThresholdGravity = 4.0, // Увеличено с 2.7 до 4.0G для меньшей чувствительности
+    this.minimumShakeInterval = 1500, // Увеличено с 1000 до 1500ms для предотвращения ложных срабатываний
   });
 
   void start() {

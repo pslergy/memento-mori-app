@@ -2,7 +2,6 @@
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:nearby_connections/nearby_connections.dart';
-import 'package:permission_handler/permission_handler.dart';
 
 class GoogleRadarScreen extends StatefulWidget {
   final String myUsername;
@@ -18,23 +17,6 @@ class _GoogleRadarScreenState extends State<GoogleRadarScreen> {
   String? connectedEndpointId;
   List<String> logs = [];
   final TextEditingController _msgController = TextEditingController();
-
-  @override
-  void initState() {
-    super.initState();
-    _checkPermissions();
-  }
-
-  void _checkPermissions() async {
-    await [
-      Permission.location,
-      Permission.bluetooth,
-      Permission.bluetoothAdvertise,
-      Permission.bluetoothConnect,
-      Permission.bluetoothScan,
-      Permission.nearbyWifiDevices
-    ].request();
-  }
 
   void _startRadar() async {
     try {

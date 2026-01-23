@@ -8,6 +8,7 @@ import 'api_service.dart';
 import 'locator.dart';
 import 'mesh_service.dart';
 import 'models/signal_node.dart';
+import 'router/router_connection_service.dart';
 
 enum MeshRole { GHOST, BRIDGE }
 
@@ -46,6 +47,22 @@ class NetworkMonitor {
 
   // Все приватные методы должны быть в теле класса
   Future<void> _check() async {
+    // 1. Сначала проверяем роутер (если подключен)
+    final routerService = RouterConnectionService();
+    final connectedRouter = routerService.connectedRouter;
+    
+    if (connectedRouter != null && connectedRouter.hasInternet) {
+      // Роутер имеет интернет - мы BRIDGE
+      if (currentRole != MeshRole.BRIDGE) {
+        print("🛰️ [NET-TRANSITION] ROUTER -> ONLINE (BRIDGE MODE via Router)");
+        currentRole = MeshRole.BRIDGE;
+        _roleController.add(currentRole);
+        unawaited(locator<ApiService>().syncOutbox());
+      }
+      return; // Роутер работает, не проверяем прямой интернет
+    }
+
+    // 2. Проверяем прямой интернет (мобильный/проводной)
     try {
       final response = await _httpClient.get(Uri.parse(_pingUrl))
           .timeout(const Duration(seconds: 3));
