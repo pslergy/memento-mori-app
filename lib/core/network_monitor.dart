@@ -9,6 +9,7 @@ import 'locator.dart';
 import 'mesh_service.dart';
 import 'models/signal_node.dart';
 import 'router/router_connection_service.dart';
+import 'security_config.dart'; // 🔒 Certificate Pinning
 
 enum MeshRole { GHOST, BRIDGE }
 
@@ -27,8 +28,8 @@ class NetworkMonitor {
   Stream<MeshRole> get onRoleChanged => _roleController.stream;
 
   http.Client _createClient() {
-    final ioc = HttpClient();
-    ioc.badCertificateCallback = (cert, host, port) => true;
+    // 🔒 SECURITY FIX: Use centralized certificate validation
+    final ioc = createSecureHttpClient();
     ioc.connectionTimeout = const Duration(seconds: 5);
     return IOClient(ioc);
   }

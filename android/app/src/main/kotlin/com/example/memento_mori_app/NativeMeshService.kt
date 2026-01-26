@@ -98,6 +98,76 @@ class NativeMeshService(
             "forceReset" -> {
                 p2pHelper?.forceReset { result.success(true) }
             }
+            
+            // 🔥 АВТОМАТИЧЕСКОЕ УПРАВЛЕНИЕ WI-FI DIRECT ГРУППОЙ
+            "createGroup" -> {
+                val forceCreate = call.argument<Boolean>("forceCreate") ?: false
+                p2pHelper?.createGroup(forceCreate) { groupInfo ->
+                    uiHandler.post {
+                        if (groupInfo != null) {
+                            result.success(mapOf(
+                                "success" to true,
+                                "networkName" to groupInfo.networkName,
+                                "passphrase" to groupInfo.passphrase,
+                                "isGroupOwner" to groupInfo.isGroupOwner,
+                                "clientCount" to groupInfo.clientCount
+                            ))
+                        } else {
+                            result.success(mapOf("success" to false))
+                        }
+                    }
+                } ?: result.success(mapOf("success" to false))
+            }
+            
+            "removeGroup" -> {
+                p2pHelper?.removeGroup { success ->
+                    uiHandler.post {
+                        result.success(mapOf("success" to success))
+                    }
+                } ?: result.success(mapOf("success" to false))
+            }
+            
+            "getGroupInfo" -> {
+                p2pHelper?.getGroupInfo { groupInfo ->
+                    uiHandler.post {
+                        if (groupInfo != null) {
+                            result.success(mapOf(
+                                "exists" to true,
+                                "networkName" to groupInfo.networkName,
+                                "passphrase" to groupInfo.passphrase,
+                                "isGroupOwner" to groupInfo.isGroupOwner,
+                                "ownerAddress" to groupInfo.ownerAddress,
+                                "clientCount" to groupInfo.clientCount
+                            ))
+                        } else {
+                            result.success(mapOf("exists" to false))
+                        }
+                    }
+                } ?: result.success(mapOf("exists" to false))
+            }
+            
+            "ensureGroupExists" -> {
+                p2pHelper?.ensureGroupExists { groupInfo ->
+                    uiHandler.post {
+                        if (groupInfo != null) {
+                            result.success(mapOf(
+                                "success" to true,
+                                "networkName" to groupInfo.networkName,
+                                "passphrase" to groupInfo.passphrase,
+                                "isGroupOwner" to groupInfo.isGroupOwner,
+                                "clientCount" to groupInfo.clientCount
+                            ))
+                        } else {
+                            result.success(mapOf("success" to false))
+                        }
+                    }
+                } ?: result.success(mapOf("success" to false))
+            }
+            
+            "isGroupOwner" -> {
+                val isOwner = p2pHelper?.isCurrentlyGroupOwner() ?: false
+                result.success(mapOf("isGroupOwner" to isOwner))
+            }
 
             "canStartTcpServer" -> {
                 val canStart = DeviceDetector.canStartTcpServer(context)

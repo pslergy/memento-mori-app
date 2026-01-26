@@ -14,9 +14,15 @@ class NativeMeshService {
   // Канал для Акустического Сонара (Звук)
   static const MethodChannel _sonarChannel = MethodChannel('memento/sonar');
 
+  // 🔥 КРИТИЧНО: Канал для GATT Server
+  static const MethodChannel _gattChannel = MethodChannel('memento/gatt_server');
+
   // Широковещательный поток для входящих сообщений (Mesh)
   static final StreamController<Map<String, dynamic>> _messageController =
   StreamController<Map<String, dynamic>>.broadcast();
+  
+  // 🔥 КРИТИЧНО: Completer для ожидания onGattReady события
+  static Completer<bool>? _gattReadyCompleter;
 
   static Stream<Map<String, dynamic>> get messageStream => _messageController.stream;
 
@@ -58,6 +64,51 @@ class NativeMeshService {
             print("⚠️ [Native] Wi-Fi Direct is DISABLED. Please enable it in settings.");
           }
           break;
+          
+        // 🔥 АВТОМАТИЧЕСКОЕ УПРАВЛЕНИЕ WI-FI DIRECT ГРУППОЙ
+        case 'onGroupCreated':
+          final args = Map<String, dynamic>.from(call.arguments);
+          final networkName = args['networkName'] as String?;
+          final passphrase = args['passphrase'] as String?;
+          final isGroupOwner = args['isGroupOwner'] as bool? ?? false;
+          final clientCount = args['clientCount'] as int? ?? 0;
+          final reused = args['reused'] as bool? ?? false;
+          
+          print("✅ [Native] Wi-Fi Direct группа ${reused ? 'найдена' : 'создана'}:");
+          print("   📋 SSID: $networkName");
+          print("   📋 Passphrase: ${passphrase?.substring(0, passphrase.length > 4 ? 4 : passphrase.length)}...");
+          print("   📋 Владелец: ${isGroupOwner ? 'Мы' : 'Другое устройство'}");
+          print("   📋 Клиентов: $clientCount");
+          
+          // Уведомляем MeshService о созданной группе
+          try {
+            locator<MeshService>().onWifiDirectGroupCreated(
+              networkName: networkName,
+              passphrase: passphrase,
+              isGroupOwner: isGroupOwner,
+            );
+          } catch (e) {
+            print("⚠️ [Native] MeshService.onWifiDirectGroupCreated error: $e");
+          }
+          break;
+          
+        case 'onGroupCreationFailed':
+          final args = Map<String, dynamic>.from(call.arguments);
+          final error = args['error'] as String?;
+          final message = args['message'] as String?;
+          final code = args['code'] as int?;
+          
+          print("❌ [Native] Ошибка создания Wi-Fi Direct группы:");
+          print("   📋 Error: $error");
+          print("   📋 Message: $message");
+          if (code != null) print("   📋 Code: $code");
+          break;
+          
+        case 'onGroupRemoved':
+          final args = Map<String, dynamic>.from(call.arguments);
+          final success = args['success'] as bool? ?? false;
+          print("${success ? '✅' : '❌'} [Native] Wi-Fi Direct группа удалена: $success");
+          break;
 
         case 'onMessageReceived':
           try {
@@ -66,11 +117,32 @@ class NativeMeshService {
               'message': args['message']?.toString() ?? '',
               'senderIp': args['senderIp']?.toString() ?? '',
             };
-            print("📩 [Mesh-Packet] From ${incomingData['senderIp']}: ${incomingData['message']}");
+            
+            // 🔥 ЛОГИРОВАНИЕ: Детальная информация о приеме через TCP
+            print("📥 [BRIDGE] TCP: Received message from GHOST ${incomingData['senderIp']}");
+            final messagePreview = incomingData['message']!.length > 100 
+                ? incomingData['message']!.substring(0, 100) 
+                : incomingData['message']!;
+            print("   📋 Message preview: $messagePreview...");
+            print("   📋 Full message length: ${incomingData['message']!.length} bytes");
+            
+            // Пытаемся извлечь тип сообщения для логирования
+            try {
+              final messageJson = jsonDecode(incomingData['message']!);
+              final messageType = messageJson['type'] ?? 'UNKNOWN';
+              final messageId = messageJson['h'] ?? messageJson['id'] ?? 'unknown';
+              print("   📋 Message type: $messageType");
+              print("   📋 Message ID: ${messageId.toString().substring(0, messageId.toString().length > 8 ? 8 : messageId.toString().length)}...");
+            } catch (_) {
+              print("   ⚠️ Could not parse message JSON for logging");
+            }
+            
+            print("   📤 Forwarding to MeshService.processIncomingPacket()...");
             locator<MeshService>().processIncomingPacket(incomingData);
             _messageController.add(incomingData);
+            print("   ✅ TCP message processed successfully");
           } catch (e) {
-            print("❌ [NativeService] Mesh parse error: $e");
+            print("❌ [BRIDGE] TCP: Error processing incoming message: $e");
           }
           break;
 
@@ -93,6 +165,43 @@ class NativeMeshService {
           break;
         default:
           print("⚠️ Unknown Sonar method: ${call.method}");
+      }
+    });
+
+    // --- 🦷 Настройка канала GATT Server ---
+    _gattChannel.setMethodCallHandler((call) async {
+      print("🦷 [Native -> GATT] Incoming Method: ${call.method}");
+      switch (call.method) {
+        case 'onGattReady':
+          print("✅ [Native] GATT Server ready event received");
+          if (_gattReadyCompleter != null && !_gattReadyCompleter!.isCompleted) {
+            _gattReadyCompleter!.complete(true);
+            _gattReadyCompleter = null;
+            print("✅ [Native] GATT ready completer completed");
+          } else {
+            print("⚠️ [Native] GATT ready event received but no active completer");
+          }
+          break;
+        case 'onGattClientConnected':
+          final args = Map<String, dynamic>.from(call.arguments);
+          final deviceAddress = args['deviceAddress'] as String?;
+          print("✅ [Native] GATT client connected: $deviceAddress");
+          break;
+        case 'onGattClientDisconnected':
+          final args = Map<String, dynamic>.from(call.arguments);
+          final deviceAddress = args['deviceAddress'] as String?;
+          print("❌ [Native] GATT client disconnected: $deviceAddress");
+          break;
+        case 'onGattDataReceived':
+          final args = Map<String, dynamic>.from(call.arguments);
+          final deviceAddress = args['deviceAddress'] as String?;
+          final data = args['data'] as String?;
+          print("📥 [Native] GATT data received from $deviceAddress: ${data?.length ?? 0} bytes");
+          // Примечание: BluetoothService обрабатывает данные через свой собственный канал
+          // Этот handler здесь только для логирования
+          break;
+        default:
+          print("⚠️ Unknown GATT method: ${call.method}");
       }
     });
   }
@@ -231,6 +340,123 @@ class NativeMeshService {
       await _channel.invokeMethod('forceReset');
     } catch (e) {
       print("❌ Force Reset Error: $e");
+    }
+  }
+  
+  // ============================================================================
+  // 🔥 АВТОМАТИЧЕСКОЕ УПРАВЛЕНИЕ WI-FI DIRECT ГРУППОЙ
+  // ============================================================================
+  
+  /// Создает Wi-Fi Direct группу автоматически
+  /// [forceCreate] - если true, удалит существующую группу и создаст новую
+  /// Возвращает информацию о группе или null при ошибке
+  static Future<WifiDirectGroupInfo?> createWifiDirectGroup({bool forceCreate = false}) async {
+    try {
+      print("🚀 [Native] Создание Wi-Fi Direct группы (forceCreate: $forceCreate)...");
+      
+      final result = await _channel.invokeMethod('createGroup', {
+        'forceCreate': forceCreate,
+      });
+      
+      final Map<dynamic, dynamic> resultMap = Map<dynamic, dynamic>.from(result ?? {});
+      final success = resultMap['success'] as bool? ?? false;
+      
+      if (success) {
+        final info = WifiDirectGroupInfo(
+          networkName: resultMap['networkName'] as String?,
+          passphrase: resultMap['passphrase'] as String?,
+          isGroupOwner: resultMap['isGroupOwner'] as bool? ?? false,
+          clientCount: resultMap['clientCount'] as int? ?? 0,
+        );
+        
+        print("✅ [Native] Группа создана: ${info.networkName}");
+        return info;
+      } else {
+        print("❌ [Native] Не удалось создать группу");
+        return null;
+      }
+    } catch (e) {
+      print("❌ [Native] Create group error: $e");
+      return null;
+    }
+  }
+  
+  /// Удаляет Wi-Fi Direct группу
+  static Future<bool> removeWifiDirectGroup() async {
+    try {
+      print("🗑️ [Native] Удаление Wi-Fi Direct группы...");
+      
+      final result = await _channel.invokeMethod('removeGroup');
+      final Map<dynamic, dynamic> resultMap = Map<dynamic, dynamic>.from(result ?? {});
+      final success = resultMap['success'] as bool? ?? false;
+      
+      print("${success ? '✅' : '❌'} [Native] Группа удалена: $success");
+      return success;
+    } catch (e) {
+      print("❌ [Native] Remove group error: $e");
+      return false;
+    }
+  }
+  
+  /// Получает информацию о текущей Wi-Fi Direct группе
+  static Future<WifiDirectGroupInfo?> getWifiDirectGroupInfo() async {
+    try {
+      final result = await _channel.invokeMethod('getGroupInfo');
+      final Map<dynamic, dynamic> resultMap = Map<dynamic, dynamic>.from(result ?? {});
+      final exists = resultMap['exists'] as bool? ?? false;
+      
+      if (exists) {
+        return WifiDirectGroupInfo(
+          networkName: resultMap['networkName'] as String?,
+          passphrase: resultMap['passphrase'] as String?,
+          isGroupOwner: resultMap['isGroupOwner'] as bool? ?? false,
+          ownerAddress: resultMap['ownerAddress'] as String?,
+          clientCount: resultMap['clientCount'] as int? ?? 0,
+        );
+      }
+      
+      return null;
+    } catch (e) {
+      print("❌ [Native] Get group info error: $e");
+      return null;
+    }
+  }
+  
+  /// Автоматически создает группу если её нет
+  /// Идеально для автоматического mesh-режима
+  static Future<WifiDirectGroupInfo?> ensureWifiDirectGroupExists() async {
+    try {
+      print("🔍 [Native] Проверка/создание Wi-Fi Direct группы...");
+      
+      final result = await _channel.invokeMethod('ensureGroupExists');
+      final Map<dynamic, dynamic> resultMap = Map<dynamic, dynamic>.from(result ?? {});
+      final success = resultMap['success'] as bool? ?? false;
+      
+      if (success) {
+        return WifiDirectGroupInfo(
+          networkName: resultMap['networkName'] as String?,
+          passphrase: resultMap['passphrase'] as String?,
+          isGroupOwner: resultMap['isGroupOwner'] as bool? ?? false,
+          clientCount: resultMap['clientCount'] as int? ?? 0,
+        );
+      }
+      
+      return null;
+    } catch (e) {
+      print("❌ [Native] Ensure group exists error: $e");
+      return null;
+    }
+  }
+  
+  /// Проверяет, является ли устройство владельцем группы
+  static Future<bool> isWifiDirectGroupOwner() async {
+    try {
+      final result = await _channel.invokeMethod('isGroupOwner');
+      final Map<dynamic, dynamic> resultMap = Map<dynamic, dynamic>.from(result ?? {});
+      return resultMap['isGroupOwner'] as bool? ?? false;
+    } catch (e) {
+      print("❌ [Native] Is group owner check error: $e");
+      return false;
     }
   }
 
@@ -413,5 +639,122 @@ class NativeMeshService {
       print("❌ [Native] Get connected router info error: $e");
       return null;
     }
+  }
+
+  // ==========================================
+  // 🦷 GATT SERVER METHODS
+  // ==========================================
+
+  /// Запускает GATT server и ждет готовности (с Completer)
+  /// Возвращает true если сервер готов, false при ошибке или таймауте
+  static Future<bool> startGattServerAndWait({Duration timeout = const Duration(seconds: 25)}) async {
+    try {
+      print("🚀 [Native] Starting GATT server and waiting for ready...");
+      
+      // Проверяем, не запущен ли уже сервер
+      final isRunning = await isGattServerRunning();
+      if (isRunning) {
+        print("ℹ️ [Native] GATT server already running");
+        return true;
+      }
+      
+      // Создаем новый completer
+      if (_gattReadyCompleter != null && !_gattReadyCompleter!.isCompleted) {
+        print("⚠️ [Native] Previous GATT completer still active, completing it");
+        _gattReadyCompleter!.complete(false);
+      }
+      _gattReadyCompleter = Completer<bool>();
+      
+      // Запускаем сервер
+      final result = await _gattChannel.invokeMethod<bool>('startGattServer');
+      print("📡 [Native] startGattServer returned: $result");
+      
+      if (result != true) {
+        print("⚠️ [Native] Failed to start GATT server");
+        _gattReadyCompleter = null;
+        return false;
+      }
+      
+      // Ждем onGattReady события
+      print("⏳ [Native] Waiting for onGattReady event (timeout: ${timeout.inSeconds}s)...");
+      try {
+        final gattReady = await _gattReadyCompleter!.future.timeout(
+          timeout,
+          onTimeout: () {
+            print("⏱️ [Native] Timeout waiting for onGattReady (${timeout.inSeconds}s)");
+            if (_gattReadyCompleter != null && _gattReadyCompleter!.isCompleted) {
+              print("ℹ️ [Native] Completer already completed (late event)");
+              return true;
+            }
+            return false;
+          },
+        );
+        
+        print("✅ [Native] GATT server ready: $gattReady");
+        _gattReadyCompleter = null;
+        return gattReady;
+      } catch (e) {
+        if (_gattReadyCompleter != null && _gattReadyCompleter!.isCompleted) {
+          print("✅ [Native] Error occurred but completer completed (late event)");
+          _gattReadyCompleter = null;
+          return true;
+        }
+        print("❌ [Native] Error waiting for onGattReady: $e");
+        _gattReadyCompleter = null;
+        return false;
+      }
+    } catch (e) {
+      print("❌ [Native] Error starting GATT server: $e");
+      _gattReadyCompleter = null;
+      return false;
+    }
+  }
+
+  /// Останавливает GATT server
+  static Future<void> stopGattServer() async {
+    try {
+      await _gattChannel.invokeMethod('stopGattServer');
+      print("🛑 [Native] GATT server stopped");
+      // Отменяем completer если он активен
+      if (_gattReadyCompleter != null && !_gattReadyCompleter!.isCompleted) {
+        _gattReadyCompleter!.complete(false);
+        _gattReadyCompleter = null;
+      }
+    } catch (e) {
+      print("❌ [Native] Error stopping GATT server: $e");
+    }
+  }
+
+  /// Проверяет, запущен ли GATT server
+  static Future<bool> isGattServerRunning() async {
+    try {
+      final result = await _gattChannel.invokeMethod<bool>('isGattServerRunning');
+      return result ?? false;
+    } catch (e) {
+      print("❌ [Native] Error checking GATT server state: $e");
+      return false;
+    }
+  }
+}
+
+/// Информация о Wi-Fi Direct группе
+class WifiDirectGroupInfo {
+  final String? networkName;
+  final String? passphrase;
+  final bool isGroupOwner;
+  final String? ownerAddress;
+  final int clientCount;
+  
+  WifiDirectGroupInfo({
+    this.networkName,
+    this.passphrase,
+    this.isGroupOwner = false,
+    this.ownerAddress,
+    this.clientCount = 0,
+  });
+  
+  @override
+  String toString() {
+    return 'WifiDirectGroupInfo(networkName: $networkName, isOwner: $isGroupOwner, clients: $clientCount)';
   }
 }

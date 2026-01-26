@@ -18,8 +18,10 @@ import 'gossip_manager.dart';
 import 'local_db_service.dart';
 import 'router/router_discovery_service.dart';
 import 'router/router_connection_service.dart';
+import 'repeater_service.dart';
+import 'ghost_transfer_manager.dart';
+import 'message_sync_service.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 enum NodeRole { GHOST, RELAY, BRIDGE }
@@ -113,6 +115,10 @@ extension MeshNetworkStarter on TacticalMeshOrchestrator {
     // 2️⃣ Старт Wi-Fi Direct / P2P
     _mesh.startDiscovery(SignalType.wifiDirect);
     _log("📡 Wi-Fi Direct discovery started");
+    
+    // 2.5️⃣ 🔥 АВТОМАТИЧЕСКОЕ СОЗДАНИЕ WI-FI DIRECT ГРУППЫ (для BRIDGE)
+    // Запускаем асинхронно, чтобы не блокировать остальную инициализацию
+    unawaited(_autoCreateWifiDirectGroupIfNeeded());
 
     // 3️⃣ Старт BLE (Control Plane)
     _startBLE();
@@ -141,9 +147,62 @@ extension MeshNetworkStarter on TacticalMeshOrchestrator {
     // 5️⃣ Start biological heartbeat
     startBiologicalHeartbeat();
     _log("💓 Biological heartbeat active");
+    
+    // 6️⃣ 🔥 Start message sync service (BRIDGE only)
+    // Периодически проверяет новые сообщения и отправляет их подключенным устройствам
+    if (NetworkMonitor().currentRole == MeshRole.BRIDGE) {
+      _messageSync.start();
+      _log("🔄 Message sync service started (BRIDGE mode)");
+    }
 
     // 6️⃣ Старт отслеживания батареи
     _listenBattery();
+    
+    // 7️⃣ 🔥 REPEATER/REPAIR SERVICE - автоматическая ретрансляция и восстановление
+    _startRepeaterService();
+    
+    // 8️⃣ 🔥 GHOST TRANSFER MANAGER - оптимизированная очередь передачи
+    _startGhostTransferManager();
+  }
+  
+  /// 🔥 Запуск Ghost Transfer Manager
+  void _startGhostTransferManager() {
+    try {
+      final transferManager = locator<GhostTransferManager>();
+      
+      if (!transferManager.isRunning) {
+        transferManager.start();
+        
+        // Загружаем сообщения из outbox
+        unawaited(transferManager.loadFromOutbox());
+        
+        _log("👻 [TRANSFER-MGR] Ghost Transfer Manager started");
+        _log("   📋 Max parallel transfers: ${GhostTransferManager.MAX_PARALLEL_TRANSFERS}");
+        _log("   📋 Max queue per BRIDGE: ${GhostTransferManager.MAX_QUEUE_PER_BRIDGE}");
+      } else {
+        _log("ℹ️ [TRANSFER-MGR] Already running");
+      }
+    } catch (e) {
+      _log("⚠️ [TRANSFER-MGR] Failed to start: $e");
+    }
+  }
+  
+  /// 🔥 Запуск Repeater/Repair Service
+  void _startRepeaterService() {
+    try {
+      final repeater = locator<RepeaterService>();
+      
+      if (!repeater.isRunning) {
+        repeater.start();
+        _log("🔄 [REPEATER] Service started");
+        _log("   📋 Max connections: ${RepeaterService.MAX_CONCURRENT_CONNECTIONS}");
+        _log("   📋 Repair interval: ${RepeaterService.REPAIR_INTERVAL_SECONDS}s");
+      } else {
+        _log("ℹ️ [REPEATER] Service already running");
+      }
+    } catch (e) {
+      _log("⚠️ [REPEATER] Failed to start: $e");
+    }
   }
 
   /// 🔹 Запрос разрешения на микрофон (Just-in-time)
@@ -190,11 +249,13 @@ extension MeshNetworkStarter on TacticalMeshOrchestrator {
       _log("📡 [ADV] BLE Pulse: '$tacticalName' (length: ${tacticalName.length})");
       await _bt.startAdvertising(tacticalName);
       
-      // 🔥 ШАГ 2.1: Сканирование начинается параллельно или сразу после генерации токена на BRIDGE
-      // 🔥 ШАГ 3: Синхронизация - сканирование начинается через 0.5s после генерации токена BRIDGE
-      // Даем время BRIDGE обновить advertising с токеном (0.5s задержка на обновление + буфер)
-      _log("⏳ [GHOST] Waiting 0.5s before scan to allow BRIDGE token update...");
-      await Future.delayed(const Duration(milliseconds: 500));
+      // 🔥 КРИТИЧНО: Синхронизация - GHOST сканирует ПОСЛЕ обновления advertising на BRIDGE
+      // BRIDGE последовательность: GATT (500ms) → Token (0ms) → Advertising (500ms) → Стабилизация (2000ms)
+      // Итого: минимум 3 секунды для полной инициализации BRIDGE
+      // GHOST ждет 2 секунды перед сканированием, чтобы BRIDGE успел обновить advertising с токеном
+      _log("⏳ [GHOST] Waiting 2s before scan to allow BRIDGE initialization (GATT + Token + Advertising)...");
+      _log("   💡 BRIDGE needs time to: 1) Start GATT server, 2) Generate token, 3) Update advertising");
+      await Future.delayed(const Duration(milliseconds: 2000));
       
       // 🔥 ШАГ 2.1: Сканировать не менее 3-5 секунд, сохранять все scanResult
       // Для GHOST с сообщениями - сканируем дольше (30 секунд), без сообщений - 8 секунд
@@ -219,15 +280,57 @@ extension MeshNetworkStarter on TacticalMeshOrchestrator {
         _log("🛑 [GHOST] Advertising stopped");
       }
     } else {
-      // 🟣 BRIDGE: Только рекламируем, НЕ сканируем (пассивно ждем подключений)
-      _log("🌉 [BRIDGE] Starting advertising only (no scan - passive mode)");
-      _log("📡 [ADV] BLE Pulse: '$tacticalName' (length: ${tacticalName.length})");
+      // 🟣 BRIDGE: НЕ рекламируем здесь! 
+      // 🔥 FIX: emitInternetMagnetWave() вызовет startAdvertising() с правильным токеном
+      // Если вызвать startAdvertising() здесь с коротким именем (M_0_0_df78),
+      // то manufacturerData будет без токена, и GHOST не сможет подключиться!
+      _log("🌉 [BRIDGE] Skipping _startBLE() advertising - will be handled by emitInternetMagnetWave()");
+      _log("   💡 emitInternetMagnetWave() will call startAdvertising() with proper BRIDGE_TOKEN");
+      _log("   💡 This prevents race condition between short name (M_0_0_df78) and full name (M_0_0_BRIDGE_TOKEN)");
       
-      await _bt.startAdvertising(tacticalName);
-      _log("✅ [BRIDGE] Advertising active - waiting for GATT connections (passive mode)");
+      // BRIDGE advertising управляется ТОЛЬКО через emitInternetMagnetWave()
+      // Это гарантирует, что токен ВСЕГДА присутствует в manufacturerData
+    }
+  }
+  
+  /// 🔥 АВТОМАТИЧЕСКОЕ СОЗДАНИЕ WI-FI DIRECT ГРУППЫ ДЛЯ BRIDGE
+  /// Создает группу автоматически если устройство является BRIDGE
+  Future<void> _autoCreateWifiDirectGroupIfNeeded() async {
+    final currentRole = NetworkMonitor().currentRole;
+    
+    if (currentRole != MeshRole.BRIDGE) {
+      _log("ℹ️ [WiFi-Direct] Не BRIDGE, пропускаем создание группы");
+      return;
+    }
+    
+    _log("🚀 [WiFi-Direct] BRIDGE обнаружен, создаем Wi-Fi Direct группу...");
+    
+    try {
+      // Небольшая задержка для стабилизации
+      await Future.delayed(const Duration(milliseconds: 500));
       
-      // BRIDGE не останавливает advertising - работает постоянно в пассивном режиме
-      // Остановка происходит только при смене роли или остановке сервиса
+      final groupInfo = await NativeMeshService.ensureWifiDirectGroupExists();
+      
+      if (groupInfo != null) {
+        _log("✅ [WiFi-Direct] Группа готова для приема клиентов:");
+        _log("   📋 SSID: ${groupInfo.networkName}");
+        _log("   📋 Passphrase: ${groupInfo.passphrase?.substring(0, (groupInfo.passphrase?.length ?? 0) > 4 ? 4 : (groupInfo.passphrase?.length ?? 0))}...");
+        _log("   📋 Владелец: ${groupInfo.isGroupOwner ? 'Мы' : 'Другое устройство'}");
+        _log("   📋 Клиентов: ${groupInfo.clientCount}");
+        
+        // Уведомляем MeshService о созданной группе
+        _mesh.onWifiDirectGroupCreated(
+          networkName: groupInfo.networkName,
+          passphrase: groupInfo.passphrase,
+          isGroupOwner: groupInfo.isGroupOwner,
+        );
+      } else {
+        _log("⚠️ [WiFi-Direct] Не удалось создать группу (fallback: BLE GATT)");
+        _log("   💡 GHOST устройства будут использовать BLE GATT для подключения");
+      }
+    } catch (e) {
+      _log("❌ [WiFi-Direct] Ошибка создания группы: $e");
+      _log("   💡 Fallback: BLE GATT будет использоваться вместо Wi-Fi Direct");
     }
   }
 }
@@ -245,6 +348,7 @@ class TacticalMeshOrchestrator {
   final UltrasonicService _sonar = locator<UltrasonicService>();
   final GossipManager _gossip = locator<GossipManager>();
   final ReversePathRegistry reversePath = ReversePathRegistry();
+  final MessageSyncService _messageSync = MessageSyncService();
 
   final Map<String, RouteInfo> _routingTable = {};
   int _myHopsToInternet = 255;
@@ -560,16 +664,24 @@ class TacticalMeshOrchestrator {
         final batchId = entry.key;
         final messages = entry.value;
 
-        _log("📤 [Bridge] Processing batch $batchId (${messages.length} messages)");
+        _log("📤 [BRIDGE] Processing batch $batchId (${messages.length} messages)");
 
         // Парсим и сохраняем сообщения
         for (var msgData in messages) {
+          String messageId = 'unknown';
           try {
             final messageJson = jsonDecode(msgData['message']?.toString() ?? '{}');
             final chatId = messageJson['chatId']?.toString() ?? 'THE_BEACON_GLOBAL';
             final content = messageJson['content']?.toString() ?? '';
             final senderId = messageJson['senderId']?.toString() ?? 'UNKNOWN';
             final timestamp = messageJson['timestamp'] ?? DateTime.now().millisecondsSinceEpoch;
+            messageId = (messageJson['h'] ?? messageJson['id'] ?? 'unknown').toString();
+            
+            _log("   📥 [BRIDGE] Processing message from queue:");
+            _log("      📋 Message ID: ${messageId.length > 8 ? messageId.substring(0, 8) : messageId}...");
+            _log("      📋 Sender: ${senderId.length > 8 ? senderId.substring(0, 8) : senderId}...");
+            _log("      📋 Chat ID: $chatId");
+            _log("      📋 Content length: ${content.length} bytes");
 
             // Сохраняем в локальную БД
             final chatMessage = ChatMessage(
@@ -579,10 +691,14 @@ class TacticalMeshOrchestrator {
               createdAt: DateTime.fromMillisecondsSinceEpoch(timestamp as int),
               status: 'MESH_RELAY',
             );
+            
+            _log("      💾 Saving message to local database...");
 
             await db.saveMessage(chatMessage, chatId);
+            _log("      ✅ Message saved to local database (chat: $chatId)");
           } catch (e) {
-            _log("⚠️ [Bridge] Failed to process message: $e");
+            _log("      ❌ [BRIDGE] Failed to process message: $e");
+            _log("      📋 Message ID: ${messageId.length > 8 ? messageId.substring(0, 8) : messageId}...");
           }
         }
 
@@ -591,8 +707,9 @@ class TacticalMeshOrchestrator {
       }
 
       // Отправляем в облако через syncOutbox
+      _log("📤 [BRIDGE] Syncing processed messages to cloud...");
       await api.syncOutbox();
-      _log("✅ [Bridge] Queue processed and synced to cloud");
+      _log("✅ [BRIDGE] Queue processed and synced to cloud successfully");
 
     } catch (e) {
       _log("❌ [Bridge] Queue processing error: $e");
@@ -619,7 +736,11 @@ class TacticalMeshOrchestrator {
 
   void startBiologicalHeartbeat() {
     _heartbeatTimer?.cancel();
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 30), (timer) async {
+    // 🔥 MAC RANDOMIZATION FIX: Увеличено с 30s до 60s
+    // Каждый heartbeat вызывает emitInternetMagnetWave() который ротирует токен
+    // Ротация токена вызывает перезапуск advertising, что на Android меняет MAC
+    // 60s даёт GHOST больше времени для connect после обнаружения BRIDGE
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 60), (timer) async {
       // 1. Рассылаем пульс (градиент маршрутизации)
       _broadcastRoutingPulse();
 

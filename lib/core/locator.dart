@@ -10,6 +10,8 @@ import 'gossip_manager.dart';
 import 'bluetooth_service.dart'; // 🔥 Не забудь импорт!
 import 'discovery_context_service.dart'; // 🔥 Discovery Context Service
 import 'connection_stabilizer.dart'; // 🔥 Connection Stabilizer
+import 'repeater_service.dart'; // 🔥 Repeater/Repair Service
+import 'ghost_transfer_manager.dart'; // 🔥 Оптимизированный Ghost Transfer Manager
 
 
 final GetIt locator = GetIt.instance;
@@ -30,6 +32,12 @@ void setupLocator() {
   
   // 🔥 Connection Stabilizer - локальный менеджер для стабилизации подключений
   locator.registerLazySingleton(() => ConnectionStabilizer());
+  
+  // 🔥 Repeater/Repair Service - автоматическая ретрансляция и восстановление соединений
+  locator.registerLazySingleton(() => RepeaterService());
+  
+  // 🔥 Ghost Transfer Manager - оптимизированная очередь передачи сообщений
+  locator.registerLazySingleton(() => GhostTransferManager());
 
   // Оркестратор регистрируем ПОСЛЕДНИМ
   locator.registerLazySingleton(() => TacticalMeshOrchestrator());

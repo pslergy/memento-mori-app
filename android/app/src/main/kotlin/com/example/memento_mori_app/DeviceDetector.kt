@@ -11,7 +11,7 @@ object DeviceDetector {
     private const val TAG = "DeviceDetector"
     
     enum class DeviceBrand {
-        XIAOMI, POCO, TECNO, INFINIX, OTHER
+        XIAOMI, POCO, TECNO, INFINIX, HUAWEI, HONOR, OPPO, VIVO, REALME, OTHER
     }
     
     enum class FirmwareType {
@@ -41,6 +41,11 @@ object DeviceDetector {
             manufacturer.contains("poco") || brand.contains("poco") -> DeviceBrand.POCO
             manufacturer.contains("tecno") || brand.contains("tecno") -> DeviceBrand.TECNO
             manufacturer.contains("infinix") || brand.contains("infinix") -> DeviceBrand.INFINIX
+            manufacturer.contains("huawei") || brand.contains("huawei") -> DeviceBrand.HUAWEI
+            manufacturer.contains("honor") || brand.contains("honor") -> DeviceBrand.HONOR
+            manufacturer.contains("oppo") || brand.contains("oppo") -> DeviceBrand.OPPO
+            manufacturer.contains("vivo") || brand.contains("vivo") -> DeviceBrand.VIVO
+            manufacturer.contains("realme") || brand.contains("realme") -> DeviceBrand.REALME
             else -> DeviceBrand.OTHER
         }
         
@@ -84,7 +89,27 @@ object DeviceDetector {
      */
     fun isChineseDevice(): Boolean {
         val info = detectDevice()
-        return info.brand in listOf(DeviceBrand.XIAOMI, DeviceBrand.POCO, DeviceBrand.TECNO, DeviceBrand.INFINIX)
+        return info.brand in listOf(
+            DeviceBrand.XIAOMI, DeviceBrand.POCO, DeviceBrand.TECNO, DeviceBrand.INFINIX,
+            DeviceBrand.HUAWEI, DeviceBrand.HONOR, DeviceBrand.OPPO, DeviceBrand.VIVO, DeviceBrand.REALME
+        )
+    }
+    
+    /**
+     * Проверяет, требуется ли native BLE advertising (flutter_ble_peripheral не работает)
+     * На Huawei/Honor flutter_ble_peripheral часто fail'ится
+     */
+    fun requiresNativeBleAdvertising(): Boolean {
+        val info = detectDevice()
+        return info.brand in listOf(DeviceBrand.HUAWEI, DeviceBrand.HONOR)
+    }
+    
+    /**
+     * Проверяет, требуется ли минимальный advertising data (ограничения BLE стека)
+     */
+    fun requiresMinimalAdvertising(): Boolean {
+        val info = detectDevice()
+        return info.brand in listOf(DeviceBrand.HUAWEI, DeviceBrand.HONOR, DeviceBrand.OPPO, DeviceBrand.VIVO)
     }
     
     /**
@@ -119,11 +144,13 @@ object DeviceDetector {
     
     /**
      * Проверяет, является ли устройство слабым/сомнительным
-     * Слабые устройства: Xiaomi, Poco, Tecno, Infinix
+     * Слабые устройства: Xiaomi, Poco, Tecno, Infinix (но НЕ Huawei!)
      * На таких устройствах не поднимаем TCP сервер, сразу используем BLE GATT
+     * Huawei/Honor имеют проблемы с BLE advertising, но TCP работает хорошо
      */
     fun isWeakDevice(): Boolean {
         val info = detectDevice()
+        // Huawei/Honor НЕ слабые - у них хороший TCP, но плохой BLE advertising
         return info.brand in listOf(DeviceBrand.XIAOMI, DeviceBrand.POCO, DeviceBrand.TECNO, DeviceBrand.INFINIX)
     }
     

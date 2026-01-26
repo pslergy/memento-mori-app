@@ -9,6 +9,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 import 'package:memento_mori_app/core/storage_service.dart';
 import 'package:memento_mori_app/core/ultrasonic_service.dart';
+import 'package:memento_mori_app/core/security_config.dart'; // 🔒 SECURITY FIX
 import 'package:synchronized/synchronized.dart';
 
 
@@ -85,22 +86,20 @@ class ApiService {
 
 
 
-  static void init() {
+  static Future<void> init() async {
     print("🚀 [ApiService] Initializing Network Systems...");
+    
+    // 🔒 SECURITY FIX: Load cached TOFU fingerprint on startup
+    await SecurityConfig.loadCachedFingerprint();
+    
     NetworkMonitor().start();
     NativeMeshService.init();
   }
 
   IOClient _createHttpClient() {
     final httpClient = HttpClient()
-      ..badCertificateCallback = (cert, host, port) {
-        // 🔒 SECURITY: Verify certificate instead of accepting all
-        // Only accept certificates for our domain
-        return cert.subject.contains('memento-mori.app') || 
-               cert.subject.contains('89.125.131.63') ||
-               host.contains('memento-mori.app') ||
-               host.contains('89.125.131.63');
-      };
+      // 🔒 SECURITY FIX: Use proper certificate pinning from SecurityConfig
+      ..badCertificateCallback = SecurityConfig.validateCertificate;
     httpClient.connectionTimeout = const Duration(seconds: 10);
     if (_useTor) {
       httpClient.findProxy = (uri) => _torProxy;
@@ -617,8 +616,22 @@ class ApiService {
     }
   }
 
+  // 🔒 SECURITY FIX: Mask sensitive data in logs
+  String _maskSensitive(String? value) {
+    if (value == null || value.length < 8) return '***';
+    return '${value.substring(0, 4)}...${value.substring(value.length - 4)}';
+  }
+  
   void _log(String msg) {
     print("📡 [API-Service] $msg");
+  }
+  
+  void _logSecure(String msg, {String? sensitiveValue}) {
+    if (sensitiveValue != null) {
+      print("📡 [API-Service] $msg: ${_maskSensitive(sensitiveValue)}");
+    } else {
+      print("📡 [API-Service] $msg");
+    }
   }
 
   /// ПРОТОКОЛ ЛЕГАЛИЗАЦИИ (LANDING PASS)
@@ -630,7 +643,7 @@ class ApiService {
     final email = await Vault.read('user_email');
     final pass = await Vault.read('landing_pass');
 
-    _log("🧬 Initiating Identity Legalization for Nomad: $ghostId");
+    _logSecure("🧬 Initiating Identity Legalization for Nomad", sensitiveValue: ghostId);
 
     try {
       // 2. Отправляем "Посадочный талон" на сервер

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:typed_data';
+import 'dart:convert';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'models/uplink_candidate.dart';
 
@@ -47,11 +48,11 @@ class DiscoveryContextService {
   }
   
   /// Пометить BRIDGE как запрещенный для GATT (cooldown)
-  void markBridgeAsGattForbidden(String bridgeId, {Duration cooldown = const Duration(minutes: 5)}) {
+  void markBridgeAsGattForbidden(String bridgeId, {Duration cooldown = const Duration(seconds: 30)}) {
     final candidate = _candidates[bridgeId];
     if (candidate != null && candidate.isBridge) {
       candidate.gattForbiddenUntil = DateTime.now().add(cooldown);
-      print("🚫 [DiscoveryContext] BRIDGE $bridgeId marked as GATT forbidden until ${candidate.gattForbiddenUntil}");
+      print("🚫 [DiscoveryContext] BRIDGE $bridgeId marked as GATT forbidden until ${candidate.gattForbiddenUntil} (cooldown: ${cooldown.inSeconds}s)");
     }
   }
   
@@ -118,6 +119,24 @@ class DiscoveryContextService {
         }
       }
       
+      // 🔥 КРИТИЧНО: Fallback - извлекаем token из manufacturerData (для Huawei где localName пустое)
+      if (extractedToken == null && convertedManufacturerData != null) {
+        final mfData = convertedManufacturerData[0xFFFF];
+        if (mfData != null && mfData.length > 2 && mfData[0] == 0x42 && mfData[1] == 0x52) {
+          // "BR" = BRIDGE, следующие байты = token (может быть обрезан)
+          try {
+            final tokenBytes = mfData.sublist(2); // Пропускаем "BR"
+            final tokenFromMf = utf8.decode(tokenBytes);
+            if (tokenFromMf.isNotEmpty && tokenFromMf.length >= 4) {
+              extractedToken = tokenFromMf;
+              print("✅ [DiscoveryContext] Token extracted from manufacturerData: ${tokenFromMf.length > 8 ? tokenFromMf.substring(0, 8) : tokenFromMf}... (length: ${tokenFromMf.length}, may be truncated)");
+            }
+          } catch (e) {
+            print("⚠️ [DiscoveryContext] Failed to decode token from manufacturerData: $e");
+          }
+        }
+      }
+      
       // Создаём или обновляем кандидата
       final candidate = UplinkCandidate.fromBleScan(
         mac: mac,
@@ -127,7 +146,7 @@ class DiscoveryContextService {
         serviceUuids: scanResult.advertisementData.serviceUuids
             .map((u) => u.toString())
             .toList(),
-        bridgeToken: extractedToken, // Передаем извлеченный token
+        bridgeToken: extractedToken, // Передаем извлеченный token (из name или manufacturerData)
       );
       
       _updateCandidate(candidate, "BLE");

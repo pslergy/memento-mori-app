@@ -11,10 +11,8 @@ import 'package:memento_mori_app/core/native_mesh_service.dart';
 import 'package:memento_mori_app/core/models/signal_node.dart';
 import 'package:memento_mori_app/core/network_monitor.dart';
 import 'package:memento_mori_app/core/ultrasonic_service.dart';
-import 'package:memento_mori_app/core/api_service.dart';
 
-import 'package:memento_mori_app/ghost_input/ghost_controller.dart';
-import 'package:memento_mori_app/ghost_input/ghost_keyboard.dart';
+// Убрали ghost_keyboard и api_service - пузырь для сообщений удалён
 
 import '../theme/app_colors.dart';
 
@@ -29,11 +27,8 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
   final MeshService _meshService = locator<MeshService>();
   final UltrasonicService _sonarService = locator<UltrasonicService>();
   final ScrollController _logScrollController = ScrollController();
-  final GhostController _ghostController = GhostController();
 
   late AnimationController _radarController;
-
-  bool _isKeyboardVisible = false;
   final List<String> _terminalLogs = [];
   StreamSubscription? _logSubscription;
   StreamSubscription? _sonarSubscription;
@@ -66,7 +61,6 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
     _radarController.dispose();
     _logSubscription?.cancel();
     _sonarSubscription?.cancel();
-    _ghostController.dispose();
     super.dispose();
   }
 
@@ -99,17 +93,7 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
     });
   }
 
-  void _handleFlare() async {
-    if (_isAcousticTransmitting) return;
-    setState(() => _isAcousticTransmitting = true);
-
-    final myId = locator<ApiService>().currentUserId;
-    _meshService.addLog("🔊 Emitting acoustic flare for auto-link...");
-
-    await _sonarService.transmitFrame("LNK:$myId");
-
-    if (mounted) setState(() => _isAcousticTransmitting = false);
-  }
+  // Удалён _handleFlare() - пузырь для сообщений удалён, кнопка FLARE больше не нужна
 
   @override
   Widget build(BuildContext context) {
@@ -119,19 +103,16 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
     return Scaffold(
       backgroundColor: Colors.black,
       body: SafeArea( // 🛡️ Защита от вырезов камеры
-        child: SingleChildScrollView( // 🔥 Защита от переполнения (Overflow)
-          child: Column(
-            children: [
-              _buildTopHUD(isLinked),
-              const SizedBox(height: 10),
-              // Оборачиваем радар и список в контейнер с увеличенной высотой для консоли
-              SizedBox(
-                height: MediaQuery.of(context).size.height * 0.75, // Увеличили до 75% для большей консоли
-                child: _buildMainContent(mesh),
-              ),
-              _buildBottomControls(),
-            ],
-          ),
+        child: Column(
+          children: [
+            _buildTopHUD(isLinked),
+            const SizedBox(height: 10),
+            // Оборачиваем радар и список в контейнер с увеличенной высотой для консоли
+            Expanded(
+              child: _buildMainContent(mesh),
+            ),
+            // Убрали _buildBottomControls() - пузырь для сообщений удалён
+          ],
         ),
       ),
     );
@@ -216,9 +197,9 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
         // Центральная тактическая кнопка
         _buildActionCenter(),
         const SizedBox(height: 10),
-        // Увеличили консоль - теперь она занимает больше места
+        // Увеличили консоль - теперь она занимает больше места (flex: 5 вместо 3)
         Expanded(
-          flex: 3, // Увеличили flex для консоли
+          flex: 5, // Увеличили flex для консоли (было 3)
           child: _buildMiniTerminal(),
         ),
       ],
@@ -384,42 +365,7 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
     }
   }
 
-  Widget _buildBottomControls() {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: const BoxDecoration(color: Color(0xFF0A0A0A)),
-      child: Row(
-        children: [
-          // Кнопка Сонара
-          _ProtocolButton(
-            icon: Icons.record_voice_over,
-            label: "FLARE",
-            color: Colors.purpleAccent,
-            onTap: _handleFlare,
-            isActive: _isAcousticTransmitting,
-          ),
-          const SizedBox(width: 15),
-          // Поле ввода сигнала
-          Expanded(
-            child: GestureDetector(
-              onTap: () => setState(() => _isKeyboardVisible = !_isKeyboardVisible),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
-                decoration: BoxDecoration(color: const Color(0xFF1A1A1A), borderRadius: BorderRadius.circular(30)),
-                child: AnimatedBuilder(
-                  animation: _ghostController,
-                  builder: (context, _) => Text(
-                    _ghostController.value.isEmpty ? "Emit signal..." : _ghostController.value,
-                    style: TextStyle(color: _ghostController.value.isEmpty ? Colors.white10 : Colors.white),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+  // Удалён _buildBottomControls() - пузырь для сообщений больше не нужен
 
   void _showSystemSettings() {
     showModalBottomSheet(
@@ -510,37 +456,7 @@ class _AllyCard extends StatelessWidget {
   }
 }
 
-class _ProtocolButton extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final Color color;
-  final VoidCallback onTap;
-  final bool isActive;
-
-  const _ProtocolButton({required this.icon, required this.label, required this.color, required this.onTap, this.isActive = false});
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Column(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-                color: isActive ? color : color.withOpacity(0.1),
-                shape: BoxShape.circle,
-                border: Border.all(color: color.withOpacity(0.5))
-            ),
-            child: Icon(icon, color: isActive ? Colors.black : color, size: 20),
-          ),
-          const SizedBox(height: 4),
-          Text(label, style: TextStyle(fontFamily: 'Orbitron', fontWeight: FontWeight.bold, color: color, fontSize: 8)),
-        ],
-      ),
-    );
-  }
-}
+// Удалён класс _ProtocolButton - пузырь для сообщений удалён
 
 /// 🎨 Крутой эффект радиолокационного сканирования
 class _RadarPainter extends CustomPainter {

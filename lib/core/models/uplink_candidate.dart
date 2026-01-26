@@ -230,32 +230,39 @@ class UplinkCandidate {
           hops = 0;
           
           // 🔥 КРИТИЧНО: Извлекаем token из manufacturerData (для Huawei где localName пустое)
-          // Формат: [0x42, 0x52, ...token_bytes]
+          // Формат: [0x42, 0x52, ...token_bytes] = "BR" + token (первые 18 байт токена)
+          // Токен может быть обрезан из-за ограничения manufacturerData (до 18 байт)
           if (mfData.length > 2) {
-            final tokenBytes = mfData.sublist(2);
+            final tokenBytes = mfData.sublist(2); // Пропускаем первые 2 байта ("BR")
             try {
               // Декодируем token как UTF-8
               final extractedTokenFromMf = utf8.decode(tokenBytes);
+              print("🔍 [UplinkCandidate] Decoded manufacturerData: ${extractedTokenFromMf.length} chars, raw: ${extractedTokenFromMf}");
+              
+              // 🔥 КРИТИЧНО: Токен в manufacturerData обрезан (максимум 18 байт)
+              // Это префикс полного токена, но его достаточно для идентификации BRIDGE
               if (extractedTokenFromMf.isNotEmpty && extractedTokenFromMf.length >= 4) {
-                // Минимальная длина token - 4 символа
                 extractedToken = extractedTokenFromMf;
-                bridgeToken = extractedTokenFromMf; // Сохраняем token из manufacturerData
-                print("✅ [UplinkCandidate] Token extracted from manufacturerData: ${extractedTokenFromMf.length > 8 ? extractedTokenFromMf.substring(0, 8) : extractedTokenFromMf}...");
-                confidence = 0.9; // Высокая уверенность если есть token
+                bridgeToken = extractedTokenFromMf; // Сохраняем обрезанный токен из manufacturerData
+                print("✅ [UplinkCandidate] Token prefix extracted from manufacturerData: ${extractedTokenFromMf.length > 8 ? extractedTokenFromMf.substring(0, 8) : extractedTokenFromMf}... (length: ${extractedTokenFromMf.length}, note: may be truncated)");
+                confidence = 0.85; // Высокая уверенность если есть token (даже обрезанный)
               } else {
                 // Если token слишком короткий, используем как logical ID
                 logicalId = tokenBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join('');
                 peerId = logicalId; // Используем logical ID вместо MAC
                 confidence = 0.6; // Средняя уверенность для manufacturerData без token
+                print("⚠️ [UplinkCandidate] Token too short (${extractedTokenFromMf.length} chars), using as logical ID");
               }
             } catch (e) {
               // Если не удалось декодировать как UTF-8, используем как logical ID
               logicalId = tokenBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join('');
               peerId = logicalId;
               confidence = 0.6;
+              print("⚠️ [UplinkCandidate] Failed to decode token from manufacturerData: $e");
             }
           } else {
             confidence = 0.6; // Средняя уверенность для manufacturerData без token
+            print("⚠️ [UplinkCandidate] manufacturerData too short (${mfData.length} bytes), no token");
           }
         } else if (mfData[0] == 0x47 && mfData[1] == 0x48) {
           // "GH" = GHOST

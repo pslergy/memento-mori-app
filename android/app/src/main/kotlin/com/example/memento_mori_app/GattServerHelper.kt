@@ -15,6 +15,9 @@ import android.os.Looper
 import android.util.Log
 import io.flutter.plugin.common.MethodChannel
 import java.util.UUID
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class GattServerHelper(
     private val context: Context,
@@ -34,9 +37,57 @@ class GattServerHelper(
     // Handler для выполнения вызовов MethodChannel на главном потоке
     private val mainHandler = Handler(Looper.getMainLooper())
     
+    // 🔥 FIX: Track pending onGattReady callback to cancel on stop
+    private var onGattReadyRunnable: Runnable? = null
+    private var gattServerGeneration: Int = 0  // Track server restarts for race condition prevention
+    
+    // 🔥 LENGTH-PREFIXED FRAMING: Буферы для сборки сообщений из чанков
+    // Формат: [4 bytes: payload length (Big-Endian)][N bytes: JSON payload]
+    private data class MessageBuffer(
+        val buffer: ByteArrayOutputStream = ByteArrayOutputStream(),
+        var expectedLength: Int = -1,  // -1 = ещё не прочитан header
+        var lastChunkTime: Long = System.currentTimeMillis()
+    )
+    
+    // Map: deviceAddress -> MessageBuffer
+    private val deviceBuffers = mutableMapOf<String, MessageBuffer>()
+    
+    // Timeout для очистки буфера (30 секунд)
+    private val BUFFER_TIMEOUT_MS = 30_000L
+    
+    // Периодическая очистка зависших буферов
+    private val bufferCleanupRunnable = object : Runnable {
+        override fun run() {
+            cleanupStaleBuffers()
+            mainHandler.postDelayed(this, 10_000) // Каждые 10 секунд
+        }
+    }
+    
     private val gattServerCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             super.onConnectionStateChange(device, status, newState)
+            
+            // 🔥 DETAILED LOGGING: Log ALL connection state changes
+            val stateStr = when (newState) {
+                BluetoothProfile.STATE_CONNECTED -> "CONNECTED"
+                BluetoothProfile.STATE_CONNECTING -> "CONNECTING"
+                BluetoothProfile.STATE_DISCONNECTED -> "DISCONNECTED"
+                BluetoothProfile.STATE_DISCONNECTING -> "DISCONNECTING"
+                else -> "UNKNOWN($newState)"
+            }
+            val statusStr = when (status) {
+                BluetoothGatt.GATT_SUCCESS -> "SUCCESS"
+                133 -> "GATT_ERROR_133" // Infamous Android BLE error
+                else -> "STATUS_$status"
+            }
+            
+            Log.d(TAG, "🔔 [GATT-SERVER] Connection state change:")
+            Log.d(TAG, "   📋 Device: ${device.address}")
+            Log.d(TAG, "   📋 Device name: ${device.name ?: "Unknown"}")
+            Log.d(TAG, "   📋 New state: $stateStr")
+            Log.d(TAG, "   📋 Status: $statusStr")
+            Log.d(TAG, "   📋 Server running: $isServerRunning")
+            Log.d(TAG, "   📋 Connected devices: ${connectedDevices.size}")
             
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
@@ -51,9 +102,16 @@ class GattServerHelper(
                         ))
                     }
                 }
+                BluetoothProfile.STATE_CONNECTING -> {
+                    // 🔥 NEW: Log connection attempts
+                    Log.d(TAG, "🔄 [GATT-SERVER] Device CONNECTING: ${device.address}")
+                }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.d(TAG, "❌ [GATT-SERVER] Device disconnected: ${device.address}")
                     connectedDevices.remove(device)
+                    
+                    // 🔥 Очищаем буфер для отключившегося устройства
+                    clearBufferForDevice(device.address)
                     
                     // Уведомляем Flutter об отключении (на главном потоке)
                     mainHandler.post {
@@ -76,23 +134,15 @@ class GattServerHelper(
         ) {
             super.onCharacteristicWriteRequest(device, requestId, characteristic, preparedWrite, responseNeeded, offset, value)
             
-            Log.d(TAG, "📥 [GATT-SERVER] Write request from ${device.address}, size: ${value?.size ?: 0}")
+            val chunkSize = value?.size ?: 0
+            Log.d(TAG, "📥 [GATT-SERVER] Write request from ${device.address}, size: $chunkSize")
             
-            if (characteristic.uuid == CHAR_UUID && value != null) {
+            if (characteristic.uuid == CHAR_UUID && value != null && value.isNotEmpty()) {
                 try {
-                    // Отправляем данные в Flutter для обработки
-                    val dataString = String(value, Charsets.UTF_8)
-                    Log.d(TAG, "📦 [GATT-SERVER] Received data: ${dataString.take(100)}...")
+                    // 🔥 LENGTH-PREFIXED FRAMING: Накапливаем чанки в буфер
+                    processIncomingChunk(device.address, value)
                     
-                    // Уведомляем Flutter на главном потоке
-                    mainHandler.post {
-                        resultChannel?.invokeMethod("onGattDataReceived", mapOf(
-                            "deviceAddress" to device.address,
-                            "data" to dataString
-                        ))
-                    }
-                    
-                    // Отправляем успешный ответ
+                    // BLE-level ACK (hardware confirmation, NOT app-level)
                     if (responseNeeded && gattServer != null) {
                         gattServer?.sendResponse(
                             device,
@@ -105,7 +155,6 @@ class GattServerHelper(
                 } catch (e: Exception) {
                     Log.e(TAG, "❌ [GATT-SERVER] Error processing write request: $e")
                     
-                    // Отправляем ошибку
                     if (responseNeeded && gattServer != null) {
                         gattServer?.sendResponse(
                             device,
@@ -156,16 +205,40 @@ class GattServerHelper(
             super.onServiceAdded(status, service)
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "✅ [GATT-SERVER] Service added successfully")
-                // Уведомляем Flutter о готовности GATT сервера (на главном потоке)
-                mainHandler.post {
+                
+                // 🔥 FIX: Cancel any previous pending onGattReady callback (prevents race condition)
+                onGattReadyRunnable?.let { 
+                    mainHandler.removeCallbacks(it)
+                    Log.d(TAG, "🛑 [GATT-SERVER] Cancelled previous pending onGattReady callback")
+                }
+                
+                // Capture current generation to detect stale callbacks
+                val currentGeneration = gattServerGeneration
+                
+                // 🔥 КРИТИЧНО: Добавляем задержку перед отправкой onGattReady
+                // Это дает время BLE стеку полностью инициализировать сервер
+                // Критично для Huawei/Xiaomi/Tecno устройств
+                onGattReadyRunnable = Runnable {
                     try {
-                        Log.d(TAG, "📤 [GATT-SERVER] Sending onGattReady event to Flutter...")
-                        resultChannel?.invokeMethod("onGattReady", null)
-                        Log.d(TAG, "✅ [GATT-SERVER] onGattReady event sent successfully")
+                        // 🔥 FIX: Check if this callback is still valid (same generation)
+                        if (currentGeneration != gattServerGeneration) {
+                            Log.w(TAG, "⚠️ [GATT-SERVER] Ignoring stale onGattReady callback (gen $currentGeneration vs current $gattServerGeneration)")
+                            return@Runnable
+                        }
+                        
+                        if (!isServerRunning) {
+                            Log.w(TAG, "⚠️ [GATT-SERVER] Server stopped before onGattReady could be sent")
+                            return@Runnable
+                        }
+                        
+                        Log.d(TAG, "📤 [GATT-SERVER] Sending onGattReady event to Flutter (gen: $currentGeneration, after 500ms delay)...")
+                        resultChannel?.invokeMethod("onGattReady", mapOf("generation" to currentGeneration))
+                        Log.d(TAG, "✅ [GATT-SERVER] onGattReady event sent successfully (gen: $currentGeneration)")
                     } catch (e: Exception) {
                         Log.e(TAG, "❌ [GATT-SERVER] Error sending onGattReady event: $e", e)
                     }
                 }
+                mainHandler.postDelayed(onGattReadyRunnable!!, 500) // Задержка 500ms для стабилизации BLE стека
             } else {
                 Log.e(TAG, "❌ [GATT-SERVER] Failed to add service: $status")
                 // Не отправляем событие при ошибке - FSM будет ждать таймаут
@@ -178,6 +251,10 @@ class GattServerHelper(
             Log.w(TAG, "⚠️ [GATT-SERVER] Server already running")
             return true
         }
+        
+        // 🔥 FIX: Increment generation to invalidate any stale callbacks from previous start attempts
+        gattServerGeneration++
+        Log.d(TAG, "🔢 [GATT-SERVER] Starting with generation: $gattServerGeneration")
         
         val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         bluetoothAdapter = bluetoothManager?.adapter
@@ -203,15 +280,23 @@ class GattServerHelper(
             // Создаем сервис
             val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
             
-            // Создаем характеристику с правами на запись и чтение
+            // Создаем характеристику с правами на запись, чтение и notify
             val characteristic = BluetoothGattCharacteristic(
                 CHAR_UUID,
                 BluetoothGattCharacteristic.PROPERTY_READ or
                 BluetoothGattCharacteristic.PROPERTY_WRITE or
-                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE or
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY,
                 BluetoothGattCharacteristic.PERMISSION_READ or
                 BluetoothGattCharacteristic.PERMISSION_WRITE
             )
+            
+            // Добавляем дескриптор для notify (обязательно для notify)
+            val descriptor = android.bluetooth.BluetoothGattDescriptor(
+                UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"), // Client Characteristic Configuration Descriptor
+                android.bluetooth.BluetoothGattDescriptor.PERMISSION_READ or android.bluetooth.BluetoothGattDescriptor.PERMISSION_WRITE
+            )
+            characteristic.addDescriptor(descriptor)
             
             // Добавляем характеристику в сервис
             service.addCharacteristic(characteristic)
@@ -221,6 +306,7 @@ class GattServerHelper(
             
             if (success) {
                 isServerRunning = true
+                startBufferCleanup() // 🔥 Запускаем периодическую очистку буферов
                 Log.d(TAG, "✅ [GATT-SERVER] GATT server started successfully")
                 Log.d(TAG, "⏳ [GATT-SERVER] Waiting for onServiceAdded callback...")
                 // onServiceAdded будет вызван асинхронно через BluetoothGattServerCallback
@@ -246,11 +332,23 @@ class GattServerHelper(
         }
         
         try {
+            // 🔥 FIX: Cancel pending onGattReady callback to prevent race condition
+            // This is CRITICAL - without this, old callbacks can complete new completers
+            onGattReadyRunnable?.let { 
+                mainHandler.removeCallbacks(it) 
+                Log.d(TAG, "🛑 [GATT-SERVER] Cancelled pending onGattReady callback on stop")
+            }
+            onGattReadyRunnable = null
+            
+            // Increment generation to invalidate any callbacks that might still be in flight
+            gattServerGeneration++
+            
+            stopBufferCleanup() // 🔥 Останавливаем периодическую очистку и очищаем буферы
             connectedDevices.clear()
             gattServer?.close()
             gattServer = null
             isServerRunning = false
-            Log.d(TAG, "🛑 [GATT-SERVER] GATT server stopped")
+            Log.d(TAG, "🛑 [GATT-SERVER] GATT server stopped (next gen: $gattServerGeneration)")
         } catch (e: Exception) {
             Log.e(TAG, "❌ [GATT-SERVER] Error stopping server: $e", e)
         }
@@ -259,4 +357,325 @@ class GattServerHelper(
     fun isRunning(): Boolean = isServerRunning
     
     fun getConnectedDevicesCount(): Int = connectedDevices.size
+    
+    /**
+     * 🔒 SECURITY FIX #4: Check if any GATT clients are connected
+     * Used by NativeBleAdvertiser to avoid disrupting active connections
+     */
+    fun hasConnectedClients(): Boolean = connectedDevices.isNotEmpty()
+    
+    /**
+     * 🔥 DIAGNOSTIC: Get detailed GATT server status
+     * Returns a map with all relevant status information
+     */
+    fun getDetailedStatus(): Map<String, Any> {
+        val status = mutableMapOf<String, Any>(
+            "isRunning" to isServerRunning,
+            "connectedDevicesCount" to connectedDevices.size,
+            "connectedDevices" to connectedDevices.map { it.address },
+            "hasGattServer" to (gattServer != null),
+            "hasBluetoothAdapter" to (bluetoothAdapter != null),
+            "generation" to gattServerGeneration,
+            "pendingBuffers" to deviceBuffers.size
+        )
+        
+        // Log the status
+        Log.d(TAG, "📊 [GATT-SERVER] Detailed status:")
+        status.forEach { (key, value) -> Log.d(TAG, "   📋 $key: $value") }
+        
+        return status
+    }
+    
+    /**
+     * 🔥 DIAGNOSTIC: Log current GATT server status (call periodically)
+     */
+    fun logStatus() {
+        Log.d(TAG, "📊 [GATT-SERVER] STATUS CHECK:")
+        Log.d(TAG, "   📋 isRunning: $isServerRunning")
+        Log.d(TAG, "   📋 gattServer: ${gattServer != null}")
+        Log.d(TAG, "   📋 connectedDevices: ${connectedDevices.size}")
+        Log.d(TAG, "   📋 generation: $gattServerGeneration")
+        
+        if (connectedDevices.isNotEmpty()) {
+            Log.d(TAG, "   📋 Connected device addresses:")
+            connectedDevices.forEach { device ->
+                Log.d(TAG, "      - ${device.address} (${device.name ?: "Unknown"})")
+            }
+        }
+    }
+    
+    /**
+     * 🔥 APP-LEVEL ACK: Отправляет подтверждение успешной обработки сообщения
+     * 
+     * Примечание: Текущая архитектура BLE GATT имеет ограничение - GHOST отключается
+     * сразу после отправки. Для полноценного bidirectional ACK нужна подписка на notify.
+     * 
+     * MVP: Логируем ACK и отправляем через notify если устройство ещё подключено.
+     * В будущем: GHOST должен подписаться на notify и ждать ACK перед disconnect.
+     */
+    fun sendAppAck(deviceAddress: String, messageId: String, timestamp: Long): Boolean {
+        Log.d(TAG, "📤 [ACK] Attempting to send app-level ACK to $deviceAddress")
+        Log.d(TAG, "   📋 Message ID: $messageId")
+        Log.d(TAG, "   📋 Timestamp: $timestamp")
+        
+        // Проверяем, подключено ли устройство
+        val device = connectedDevices.find { it.address == deviceAddress }
+        if (device == null) {
+            Log.w(TAG, "⚠️ [ACK] Device $deviceAddress not connected - ACK cannot be delivered")
+            Log.w(TAG, "   💡 GHOST disconnected before ACK could be sent")
+            Log.w(TAG, "   💡 Message was processed successfully on BRIDGE side")
+            // Возвращаем true т.к. сообщение обработано, просто ACK не доставлен
+            // GHOST должен использовать timeout-based confirmation
+            return true
+        }
+        
+        // TODO: Для полноценного ACK добавить notify характеристику
+        // Сейчас просто логируем что ACK был бы отправлен
+        Log.d(TAG, "✅ [ACK] Device still connected - ACK would be sent via notify")
+        Log.d(TAG, "   📋 Note: Full ACK implementation requires notify characteristic")
+        
+        return true
+    }
+    
+    // =======================================================================
+    // 🔥 LENGTH-PREFIXED FRAMING: Сборка сообщений из чанков
+    // Формат: [4 bytes: payload length (Big-Endian)][N bytes: JSON payload]
+    // =======================================================================
+    
+    /**
+     * Обрабатывает входящий чанк данных от устройства.
+     * Накапливает чанки в буфер, пока не соберётся полное сообщение.
+     */
+    private fun processIncomingChunk(deviceAddress: String, chunk: ByteArray) {
+        // Получаем или создаём буфер для устройства
+        val msgBuffer = deviceBuffers.getOrPut(deviceAddress) { MessageBuffer() }
+        msgBuffer.lastChunkTime = System.currentTimeMillis()
+        
+        // Добавляем чанк в буфер
+        msgBuffer.buffer.write(chunk)
+        
+        val currentSize = msgBuffer.buffer.size()
+        Log.d(TAG, "📦 [FRAMING] Chunk received: ${chunk.size} bytes, buffer: $currentSize bytes (device: ${deviceAddress.takeLast(8)})")
+        
+        // Пытаемся извлечь полные сообщения из буфера
+        while (tryExtractMessage(deviceAddress, msgBuffer)) {
+            // Цикл продолжается, пока есть полные сообщения для извлечения
+        }
+    }
+    
+    /**
+     * Пытается извлечь полное сообщение из буфера.
+     * @return true если сообщение извлечено, false если данных недостаточно
+     */
+    private fun tryExtractMessage(deviceAddress: String, msgBuffer: MessageBuffer): Boolean {
+        val bufferData = msgBuffer.buffer.toByteArray()
+        val bufferSize = bufferData.size
+        
+        // 1. Если ещё не прочитали header (нужно минимум 4 байта)
+        if (msgBuffer.expectedLength < 0) {
+            if (bufferSize < 4) {
+                Log.d(TAG, "📦 [FRAMING] Waiting for length header (have: $bufferSize, need: 4)")
+                return false
+            }
+            
+            // Читаем 4-байтный length header (Big-Endian)
+            val lengthHeader = ByteBuffer.wrap(bufferData, 0, 4)
+                .order(ByteOrder.BIG_ENDIAN)
+                .getInt()
+            
+            // Валидация: длина должна быть разумной (1 байт - 1 MB)
+            if (lengthHeader <= 0 || lengthHeader > 1_000_000) {
+                Log.e(TAG, "❌ [FRAMING] Invalid length header: $lengthHeader - resetting buffer")
+                // Пытаемся найти следующий валидный frame, сдвигаясь на 1 байт
+                resetBufferWithOffset(deviceAddress, msgBuffer, 1)
+                return bufferSize > 4 // Продолжаем только если есть данные
+            }
+            
+            msgBuffer.expectedLength = lengthHeader
+            Log.d(TAG, "📦 [FRAMING] Length header: $lengthHeader bytes expected (device: ${deviceAddress.takeLast(8)})")
+        }
+        
+        // 2. Проверяем, есть ли полное сообщение (header + payload)
+        val totalExpected = 4 + msgBuffer.expectedLength // 4 bytes header + payload
+        if (bufferSize < totalExpected) {
+            Log.d(TAG, "📦 [FRAMING] Buffer: $bufferSize / $totalExpected bytes (waiting...)")
+            return false
+        }
+        
+        // 3. 🎉 Полное сообщение собрано! Извлекаем payload
+        val payload = bufferData.copyOfRange(4, totalExpected)
+        val jsonString = String(payload, Charsets.UTF_8)
+        
+        Log.d(TAG, "✅ [FRAMING] Complete message: ${msgBuffer.expectedLength} bytes")
+        Log.d(TAG, "📦 [FRAMING] JSON preview: ${jsonString.take(100)}...")
+        
+        // 4. Отправляем полное сообщение во Flutter
+        mainHandler.post {
+            resultChannel?.invokeMethod("onGattDataReceived", mapOf(
+                "deviceAddress" to deviceAddress,
+                "data" to jsonString,
+                "isComplete" to true  // 🔥 Флаг: сообщение полностью собрано
+            ))
+        }
+        
+        // 5. Удаляем обработанное сообщение из буфера, оставляем остаток
+        val remaining = bufferData.copyOfRange(totalExpected, bufferSize)
+        msgBuffer.buffer.reset()
+        if (remaining.isNotEmpty()) {
+            msgBuffer.buffer.write(remaining)
+            Log.d(TAG, "📦 [FRAMING] ${remaining.size} bytes remaining in buffer for next message")
+        }
+        msgBuffer.expectedLength = -1 // Сбрасываем для следующего сообщения
+        
+        return remaining.size >= 4 // Продолжаем, если может быть ещё одно сообщение
+    }
+    
+    /**
+     * Сбрасывает буфер со сдвигом (для поиска следующего валидного frame)
+     */
+    private fun resetBufferWithOffset(deviceAddress: String, msgBuffer: MessageBuffer, offset: Int) {
+        val bufferData = msgBuffer.buffer.toByteArray()
+        msgBuffer.buffer.reset()
+        msgBuffer.expectedLength = -1
+        
+        if (offset < bufferData.size) {
+            msgBuffer.buffer.write(bufferData.copyOfRange(offset, bufferData.size))
+            Log.w(TAG, "⚠️ [FRAMING] Buffer reset with ${bufferData.size - offset} bytes remaining")
+        } else {
+            Log.w(TAG, "⚠️ [FRAMING] Buffer completely cleared for ${deviceAddress.takeLast(8)}")
+        }
+    }
+    
+    /**
+     * Очищает зависшие буферы (timeout)
+     */
+    private fun cleanupStaleBuffers() {
+        val now = System.currentTimeMillis()
+        val staleDevices = deviceBuffers.filter { (_, buffer) ->
+            now - buffer.lastChunkTime > BUFFER_TIMEOUT_MS
+        }.keys.toList()
+        
+        for (deviceAddr in staleDevices) {
+            val buffer = deviceBuffers[deviceAddr]
+            if (buffer != null && buffer.buffer.size() > 0) {
+                Log.w(TAG, "⏱️ [FRAMING] Timeout: clearing stale buffer for ${deviceAddr.takeLast(8)} (${buffer.buffer.size()} bytes lost)")
+            }
+            deviceBuffers.remove(deviceAddr)
+        }
+    }
+    
+    /**
+     * Очищает буфер для конкретного устройства (вызывается при disconnect)
+     */
+    fun clearBufferForDevice(deviceAddress: String) {
+        val buffer = deviceBuffers.remove(deviceAddress)
+        if (buffer != null && buffer.buffer.size() > 0) {
+            Log.w(TAG, "🧹 [FRAMING] Cleared buffer for ${deviceAddress.takeLast(8)} on disconnect (${buffer.buffer.size()} bytes)")
+        }
+    }
+    
+    /**
+     * Запускает периодическую очистку буферов
+     */
+    fun startBufferCleanup() {
+        mainHandler.postDelayed(bufferCleanupRunnable, 10_000)
+    }
+    
+    /**
+     * Останавливает периодическую очистку
+     */
+    fun stopBufferCleanup() {
+        mainHandler.removeCallbacks(bufferCleanupRunnable)
+        deviceBuffers.clear()
+    }
+    
+    /**
+     * Отправляет сообщение подключенному GATT клиенту через notify
+     * Используется BRIDGE для отправки сообщений GHOST устройствам
+     */
+    fun sendMessageToClient(deviceAddress: String, messageJson: String): Boolean {
+        Log.d(TAG, "📤 [GATT-SERVER] Sending message to client: $deviceAddress")
+        Log.d(TAG, "   📋 Message length: ${messageJson.length} bytes")
+        
+        // Проверяем, подключено ли устройство
+        val device = connectedDevices.find { it.address == deviceAddress }
+        if (device == null) {
+            Log.w(TAG, "⚠️ [GATT-SERVER] Device $deviceAddress not connected")
+            return false
+        }
+        
+        // Находим характеристику
+        val service = gattServer?.getService(SERVICE_UUID)
+        val characteristic = service?.getCharacteristic(CHAR_UUID)
+        
+        if (characteristic == null) {
+            Log.e(TAG, "❌ [GATT-SERVER] Characteristic not found")
+            return false
+        }
+        
+        try {
+            // 🔥 LENGTH-PREFIXED FRAMING: Добавляем 4-байтный header с длиной
+            val messageBytes = messageJson.toByteArray(Charsets.UTF_8)
+            val lengthHeader = ByteBuffer.allocate(4)
+                .order(ByteOrder.BIG_ENDIAN)
+                .putInt(messageBytes.size)
+                .array()
+            
+            // Объединяем header + payload
+            val framedMessage = lengthHeader + messageBytes
+            
+            // Разбиваем на чанки по 20 байт (BLE MTU ограничение)
+            val chunkSize = 20
+            var offset = 0
+            
+            while (offset < framedMessage.size) {
+                val chunk = framedMessage.copyOfRange(
+                    offset,
+                    minOf(offset + chunkSize, framedMessage.size)
+                )
+                
+                // Устанавливаем значение характеристики
+                characteristic.value = chunk
+                
+                // Отправляем через notify (если клиент подписан) или write
+                val success = gattServer?.notifyCharacteristicChanged(
+                    device,
+                    characteristic,
+                    false // no confirmation needed
+                ) ?: false
+                
+                if (!success) {
+                    Log.w(TAG, "⚠️ [GATT-SERVER] Failed to notify chunk at offset $offset")
+                    // Пробуем через write как fallback
+                    gattServer?.sendResponse(
+                        device,
+                        0, // requestId (not used for notify)
+                        BluetoothGatt.GATT_SUCCESS,
+                        offset,
+                        chunk
+                    )
+                }
+                
+                offset += chunkSize
+                
+                // Небольшая задержка между чанками для стабильности
+                if (offset < framedMessage.size) {
+                    Thread.sleep(10)
+                }
+            }
+            
+            Log.d(TAG, "✅ [GATT-SERVER] Message sent successfully to $deviceAddress")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ [GATT-SERVER] Error sending message: ${e.message}", e)
+            return false
+        }
+    }
+    
+    /**
+     * Получает список MAC адресов подключенных GATT клиентов
+     */
+    fun getConnectedDevicesAddresses(): List<String> {
+        return connectedDevices.map { it.address }.toList()
+    }
 }

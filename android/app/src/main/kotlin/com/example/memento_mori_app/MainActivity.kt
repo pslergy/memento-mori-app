@@ -50,6 +50,10 @@ class MainActivity : FlutterFragmentActivity() {
     private var routerHelper: RouterHelper? = null
     private var gattServerHelper: GattServerHelper? = null
     private var gattMethodChannel: MethodChannel? = null
+    
+    // 🔥 Native BLE Advertiser для Huawei/Honor
+    private var nativeBleAdvertiser: NativeBleAdvertiser? = null
+    private var nativeAdvMethodChannel: MethodChannel? = null
 
     // --- Состояние микрофона и аналитика ---
     private var micMutex: AudioRecord? = null
@@ -160,6 +164,82 @@ class MainActivity : FlutterFragmentActivity() {
                 "getConnectedDevicesCount" -> {
                     val count = gattServerHelper?.getConnectedDevicesCount() ?: 0
                     result.success(count)
+                }
+                "getGattServerStatus" -> {
+                    // 🔥 DIAGNOSTIC: Get detailed GATT server status
+                    val status = gattServerHelper?.getDetailedStatus() ?: mapOf(
+                        "isRunning" to false,
+                        "error" to "gattServerHelper is null"
+                    )
+                    gattServerHelper?.logStatus() // Also log to Android logcat
+                    result.success(status)
+                }
+                "sendAppAck" -> {
+                    // 🔥 APP-LEVEL ACK: Отправляем подтверждение обработки сообщения на GHOST
+                    val deviceAddress = call.argument<String>("deviceAddress") ?: ""
+                    val messageId = call.argument<String>("messageId") ?: ""
+                    val timestamp = call.argument<Long>("timestamp") ?: System.currentTimeMillis()
+                    
+                    Log.d("GATT_SERVER", "📤 [ACK] Sending app-level ACK to $deviceAddress for message $messageId")
+                    
+                    // Отправляем ACK через GATT notify (если устройство ещё подключено)
+                    val success = gattServerHelper?.sendAppAck(deviceAddress, messageId, timestamp) ?: false
+                    result.success(success)
+                }
+                "sendMessageToClient" -> {
+                    // 🔥 SEND MESSAGE: Отправляем сообщение подключенному GATT клиенту
+                    val deviceAddress = call.argument<String>("deviceAddress") ?: ""
+                    val message = call.argument<String>("message") ?: ""
+                    
+                    Log.d("GATT_SERVER", "📤 [MESSAGE] Sending message to client: $deviceAddress")
+                    Log.d("GATT_SERVER", "   📋 Message length: ${message.length} bytes")
+                    
+                    val success = gattServerHelper?.sendMessageToClient(deviceAddress, message) ?: false
+                    result.success(success)
+                }
+                else -> result.notImplemented()
+            }
+        }
+        
+        // 🔥 Native BLE Advertiser для Huawei/Honor
+        nativeAdvMethodChannel = MethodChannel(messenger, "memento/native_ble_advertiser")
+        nativeBleAdvertiser = NativeBleAdvertiser(this, nativeAdvMethodChannel)
+        
+        // 🔒 SECURITY FIX #4: Pass GattServerHelper to NativeBleAdvertiser
+        // This allows advertiser to check for connected GATT clients before cycling strategies
+        nativeBleAdvertiser?.setGattServerHelper(gattServerHelper)
+        
+        nativeAdvMethodChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "startAdvertising" -> {
+                    val localName = call.argument<String>("localName") ?: ""
+                    val manufacturerData = call.argument<ByteArray>("manufacturerData") ?: byteArrayOf()
+                    val success = nativeBleAdvertiser?.startAdvertising(localName, manufacturerData) ?: false
+                    result.success(success)
+                }
+                "stopAdvertising" -> {
+                    nativeBleAdvertiser?.stopAdvertising()
+                    result.success(true)
+                }
+                "isAdvertising" -> {
+                    val isActive = nativeBleAdvertiser?.isAdvertising() ?: false
+                    result.success(isActive)
+                }
+                "requiresNativeAdvertising" -> {
+                    // Проверяем, требуется ли native advertising для этого устройства
+                    val requires = DeviceDetector.requiresNativeBleAdvertising()
+                    result.success(requires)
+                }
+                "getDeviceInfo" -> {
+                    val info = DeviceDetector.detectDevice()
+                    result.success(mapOf(
+                        "brand" to info.brand.name,
+                        "firmware" to info.firmware.name,
+                        "manufacturer" to info.manufacturer,
+                        "model" to info.model,
+                        "requiresNativeAdvertising" to DeviceDetector.requiresNativeBleAdvertising(),
+                        "requiresMinimalAdvertising" to DeviceDetector.requiresMinimalAdvertising()
+                    ))
                 }
                 else -> result.notImplemented()
             }
@@ -487,6 +567,9 @@ class MainActivity : FlutterFragmentActivity() {
         
         // 🔥 ОЧИСТКА P2P РЕСУРСОВ ДЛЯ КИТАЙСКИХ УСТРОЙСТВ
         p2pHelper?.cleanup()
+        
+        // 🔥 ОЧИСТКА NATIVE BLE ADVERTISER
+        nativeBleAdvertiser?.cleanup()
         
         super.onDestroy()
     }

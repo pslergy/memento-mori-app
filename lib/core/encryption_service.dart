@@ -1,14 +1,54 @@
 import 'dart:typed_data'; // 🔥 ОБЯЗАТЕЛЬНО ДЛЯ Uint8List
 import 'dart:math' as math;
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'dart:convert';
 
 class EncryptionService {
   final _algorithm = AesGcm.with256bits();
+  
+  // 🔒 SECURITY FIX: Secure storage for user-specific salt
+  static const _secureStorage = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+  );
+  
+  // 🔒 SECURITY FIX: Cache user salt in memory for performance
+  static String? _cachedUserSalt;
+  
+  // 🔒 SECURITY FIX: PBKDF2 iterations - OWASP recommendation for HMAC-SHA256
+  static const int _pbkdf2Iterations = 100000;
 
-  // Генерируем уникальный ключ для конкретного чата
+  /// 🔒 SECURITY FIX: Generate or retrieve user-specific salt
+  /// Each user has a unique salt stored in secure storage
+  Future<String> _getUserSalt() async {
+    if (_cachedUserSalt != null) return _cachedUserSalt!;
+    
+    String? salt = await _secureStorage.read(key: 'user_encryption_salt');
+    
+    if (salt == null) {
+      // Generate new cryptographically secure salt (32 bytes = 256 bits)
+      final random = math.Random.secure();
+      final saltBytes = Uint8List(32);
+      for (int i = 0; i < 32; i++) {
+        saltBytes[i] = random.nextInt(256);
+      }
+      salt = base64.encode(saltBytes);
+      
+      // Store salt securely
+      await _secureStorage.write(key: 'user_encryption_salt', value: salt);
+      print("🔐 [Security] New user encryption salt generated");
+    }
+    
+    _cachedUserSalt = salt;
+    return salt;
+  }
+
+  /// 🔒 SECURITY FIX: Per-user key derivation instead of hardcoded key
+  /// Generates unique key for each chat using user-specific salt
   Future<SecretKey> getChatKey(String chatId) async {
-    const String systemSeed = "memento_mori_v1_tactical_seed_2024";
+    // 🔒 Get user-specific salt (unique per device/user)
+    final userSalt = await _getUserSalt();
+    
     String derivationId = chatId;
 
     if (chatId == "GLOBAL" || chatId == "THE_BEACON_GLOBAL") {
@@ -17,28 +57,37 @@ class EncryptionService {
       derivationId = "TACTICAL_MESH_LINK_V1";
     }
 
-    // Вместо простого Sha256, мы используем итеративное хеширование.
-    // Это стандарт для защиты Master Key.
+    // 🔒 SECURITY FIX: PBKDF2 with 100,000 iterations (OWASP recommendation)
     final pbkdf2 = Pbkdf2(
       macAlgorithm: Hmac.sha256(),
-      iterations: 1000, // Количество итераций для "растягивания" ключа
+      iterations: _pbkdf2Iterations,
       bits: 256,
     );
 
+    // 🔒 Derive key using user salt + chat ID
     final secretKey = await pbkdf2.deriveKey(
-      secretKey: SecretKey(utf8.encode(systemSeed)),
-      nonce: utf8.encode(derivationId), // Используем ID чата как соль (salt)
+      secretKey: SecretKey(base64.decode(userSalt)),
+      nonce: utf8.encode(derivationId),
     );
 
     return secretKey;
   }
 
-
-  // Метод для системных ключей
+  /// 🔒 SECURITY FIX: System key now uses user-specific derivation
   Future<SecretKey> getSystemKey() async {
-    final bytes = utf8.encode("memento_mori_ultra_safe_mesh_key_2024");
-    final hash = await Sha256().hash(bytes);
-    return SecretKey(hash.bytes);
+    final userSalt = await _getUserSalt();
+    
+    // 🔒 Derive system key from user salt with different context
+    final pbkdf2 = Pbkdf2(
+      macAlgorithm: Hmac.sha256(),
+      iterations: _pbkdf2Iterations,
+      bits: 256,
+    );
+    
+    return await pbkdf2.deriveKey(
+      secretKey: SecretKey(base64.decode(userSalt)),
+      nonce: utf8.encode('MEMENTO_MORI_SYSTEM_KEY_V2'),
+    );
   }
 
   // Шифрование данных
@@ -140,11 +189,25 @@ class EncryptionService {
     }
   }
 
-  /// Создает уникальный "Посадочный талон" для легализации оффлайн-аккаунта
+  /// 🔒 SECURITY FIX: Landing pass now uses user-specific salt
+  /// Creates unique "Landing Pass" for offline account legalization
   Future<String> generateLandingPass(String email, String ghostId) async {
-    final bytes = utf8.encode(email + ghostId + "memento_mori_salt_2024");
-    final hash = await Sha256().hash(bytes);
-    return base64.encode(hash.bytes);
+    final userSalt = await _getUserSalt();
+    
+    // 🔒 Use PBKDF2 for landing pass derivation
+    final pbkdf2 = Pbkdf2(
+      macAlgorithm: Hmac.sha256(),
+      iterations: _pbkdf2Iterations,
+      bits: 256,
+    );
+    
+    final key = await pbkdf2.deriveKey(
+      secretKey: SecretKey(base64.decode(userSalt)),
+      nonce: utf8.encode('$email:$ghostId:LANDING_PASS_V2'),
+    );
+    
+    final keyBytes = await key.extractBytes();
+    return base64.encode(keyBytes);
   }
 
   // 🔥 Метод для "затирания" конфиденциальных данных в памяти

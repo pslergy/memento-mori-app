@@ -1,24 +1,21 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:animate_do/animate_do.dart';
-import 'package:http/io_client.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/api_service.dart';
-import '../../core/encryption_service.dart';
 import '../../core/locator.dart';
 import '../../core/network_monitor.dart';
-import '../../core/storage_service.dart';
 
 import '../../ghost_input/ghost_controller.dart';
 import '../../ghost_input/ghost_keyboard.dart';
 import '../theme/app_colors.dart';
+import '../ui/terminal_style.dart';
 import 'recovery_phrase_screen.dart';
-import 'survival_guide_screen.dart';
+import 'onboarding_tutorial_screen.dart';
+import 'validation_helper.dart';
 
 class RegistrationScreen extends StatefulWidget {
   const RegistrationScreen({super.key});
@@ -37,11 +34,21 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   bool? _isUsernameAvailable;
   Timer? _debounce;
   bool _isLoading = false;
+  String? _currentError;
+  int _registrationStep = 0; // 0: input, 1: date, 2: finalize, 3: processing
+  
+  // Validation states
+  String? _usernameError;
+  String? _emailError;
+  String? _passwordError;
+  String? _passwordStrength;
 
   @override
   void initState() {
     super.initState();
     _usernameGhost.addListener(_onUsernameChanged);
+    _emailGhost.addListener(_onEmailChanged);
+    _passwordGhost.addListener(_onPasswordChanged);
   }
 
   @override
@@ -55,9 +62,31 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   }
 
   void _onUsernameChanged() {
+    // Validate locally first
+    setState(() {
+      _usernameError = ValidationHelper.validateUsername(_usernameGhost.value);
+    });
+    
     if (_debounce?.isActive ?? false) _debounce!.cancel();
     _debounce = Timer(const Duration(milliseconds: 500), () {
-      _checkUsername(_usernameGhost.value);
+      if (_usernameError == null) {
+        _checkUsername(_usernameGhost.value);
+      }
+    });
+  }
+  
+  void _onEmailChanged() {
+    setState(() {
+      _emailError = ValidationHelper.validateEmail(_emailGhost.value);
+    });
+  }
+  
+  void _onPasswordChanged() {
+    setState(() {
+      _passwordError = ValidationHelper.validatePassword(_passwordGhost.value);
+      _passwordStrength = _passwordGhost.value.isNotEmpty
+          ? ValidationHelper.getPasswordStrength(_passwordGhost.value)
+          : null;
     });
   }
 
@@ -69,7 +98,6 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
     setState(() => _isUsernameChecking = true);
     try {
-      final api = locator<ApiService>();
       // Используем метод из ApiService для проверки (нужно добавить его туда)
       final response = await _apiService_CheckUsername(username);
       setState(() => _isUsernameAvailable = response);
@@ -98,6 +126,12 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
   // 👻 КЕЙС 1: Оффлайн регистрация (Ghost Mode)
   Future<void> _initGhostProtocol() async {
+    setState(() {
+      _isLoading = true;
+      _registrationStep = 3; // Processing
+      _currentError = null;
+    });
+
     try {
       final api = locator<ApiService>();
       final String username = _usernameGhost.value.trim();
@@ -105,10 +139,35 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
       // Создаем локальную личность и Landing Pass
       await api.initGhostMode(username, email);
+      
+      // Show success message
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const TerminalText(
+              'Ghost ID created successfully! Legalize it when internet is available.',
+              color: Colors.white,
+            ),
+            backgroundColor: Colors.greenAccent.withOpacity(0.2),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
 
       _finalizeAndNavigate(null); // Фраза восстановления в оффлайне не генерится сервером
     } catch (e) {
-      _showError("Identity formation failed: $e");
+      setState(() {
+        _currentError = _getUserFriendlyError(e);
+      });
+      _showErrorDialog(
+        title: "Ghost Identity Creation Failed",
+        message: _getUserFriendlyError(e),
+        solution: "Check your internet connection or try again later.",
+        onRetry: () {
+          setState(() => _currentError = null);
+          _initGhostProtocol();
+        },
+      );
     } finally {
       setState(() => _isLoading = false);
     }
@@ -116,6 +175,12 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
   // 🌐 КЕЙС 2: Облачная регистрация
   Future<void> _performCloudRegistration() async {
+    setState(() {
+      _isLoading = true;
+      _registrationStep = 3; // Processing
+      _currentError = null;
+    });
+
     try {
       final api = locator<ApiService>();
       final response = await api.register(
@@ -128,11 +193,116 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
       _finalizeAndNavigate(response['recoveryPhrase']);
     } catch (e) {
       // Если во время регистрации инет пропал — фолбек на Ghost
-      print("📡 Uplink lost during registration. Falling back to Ghost...");
-      await _initGhostProtocol();
+      final errorMsg = e.toString().toLowerCase();
+      if (errorMsg.contains('network') || errorMsg.contains('timeout') || errorMsg.contains('connection')) {
+        // Network error - fallback to Ghost
+        setState(() {
+          _currentError = "Internet connection lost. Switching to Ghost Mode...";
+        });
+        
+        // Show informative dialog
+        if (mounted) {
+          showDialog(
+            context: context,
+            barrierDismissible: false,
+            builder: (context) => AlertDialog(
+              backgroundColor: const Color(0xFF0D0D0D),
+              title: const TerminalTitle('Connection Lost', color: Colors.orangeAccent),
+              content: const Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TerminalText(
+                    'Internet connection was lost during registration.',
+                    color: Colors.white70,
+                  ),
+                  SizedBox(height: 12),
+                  TerminalText(
+                    'Switching to Ghost Mode...',
+                    color: Colors.greenAccent,
+                    fontWeight: FontWeight.bold,
+                  ),
+                  SizedBox(height: 12),
+                  TerminalText(
+                    'Your Ghost ID will be created locally. You can legalize it later when internet is available.',
+                    color: Colors.white54,
+                    fontSize: 11,
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+        
+        await Future.delayed(const Duration(seconds: 2));
+        if (mounted) Navigator.pop(context); // Close dialog
+        
+        await _initGhostProtocol();
+      } else {
+        // Other error - show dialog
+        setState(() {
+          _currentError = _getUserFriendlyError(e);
+        });
+        _showErrorDialog(
+          title: "Registration Failed",
+          message: _getUserFriendlyError(e),
+          solution: _getErrorSolution(e),
+          onRetry: () {
+            setState(() => _currentError = null);
+            _performCloudRegistration();
+          },
+        );
+      }
     } finally {
       setState(() => _isLoading = false);
     }
+  }
+
+  String _getUserFriendlyError(dynamic error) {
+    final errorStr = error.toString().toLowerCase();
+    if (errorStr.contains('network') || errorStr.contains('timeout')) {
+      return "Network connection failed";
+    } else if (errorStr.contains('username') || errorStr.contains('taken')) {
+      return "Username is already taken";
+    } else if (errorStr.contains('email')) {
+      return "Invalid email address";
+    } else if (errorStr.contains('password')) {
+      return "Password is too weak";
+    } else {
+      return "Registration failed. Please try again.";
+    }
+  }
+
+  String? _getErrorSolution(dynamic error) {
+    final errorStr = error.toString().toLowerCase();
+    if (errorStr.contains('network') || errorStr.contains('timeout')) {
+      return "Check your internet connection and try again.";
+    } else if (errorStr.contains('username') || errorStr.contains('taken')) {
+      return "Choose a different username.";
+    } else if (errorStr.contains('email')) {
+      return "Enter a valid email address.";
+    } else if (errorStr.contains('password')) {
+      return "Use at least 8 characters with letters and numbers.";
+    }
+    return null;
+  }
+
+  void _showErrorDialog({
+    required String title,
+    required String message,
+    String? solution,
+    VoidCallback? onRetry,
+  }) {
+    showDialog(
+      context: context,
+      builder: (_) => TerminalErrorDialog(
+        title: title,
+        message: message,
+        solution: solution,
+        onRetry: onRetry,
+        onDismiss: () => Navigator.pop(context),
+      ),
+    );
   }
 
   void _finalizeAndNavigate(String? phrase) async {
@@ -146,8 +316,11 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         MaterialPageRoute(builder: (_) => RecoveryPhraseScreen(phrase: phrase, isFlow: true)),
       );
     } else {
+      // Ghost mode - show tutorial then survival guide
       Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const SurvivalGuideScreen()),
+        MaterialPageRoute(
+          builder: (_) => const OnboardingTutorialScreen(),
+        ),
       );
     }
   }
@@ -186,10 +359,24 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   }
 
   Widget _buildStep1() {
+    final bool isOffline = NetworkMonitor().currentRole == MeshRole.GHOST;
+    
     return _buildPageWrapper(
       title: "INITIALIZE IDENTITY",
       desc: "Choose your callsign and secure your communication link.",
       children: [
+        // Mode indicator
+        TerminalInfoBox(
+          title: isOffline ? "👻 GHOST MODE" : "🌐 CLOUD MODE",
+          content: isOffline
+              ? "Offline operation, mesh network, legalization later when internet is available."
+              : "Full synchronization, cloud storage, immediate identity verification.",
+          icon: isOffline ? Icons.wifi_off : Icons.cloud_done,
+          color: isOffline ? AppColors.stealthOrange : AppColors.cloudGreen,
+        ),
+        const SizedBox(height: 24),
+        
+        // Username
         _buildGhostInput(
           controller: _usernameGhost,
           hint: "Tactical Callsign (Username)",
@@ -197,14 +384,26 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
           suffix: _buildUsernameIndicator(),
           onTap: () => _showKeyboard(_usernameGhost, "CALLSIGN"),
         ),
+        if (_usernameError != null) ...[
+          const SizedBox(height: 4),
+          TerminalText(_usernameError!, color: Colors.redAccent, fontSize: 11),
+        ],
         const SizedBox(height: 16),
+        
+        // Email
         _buildGhostInput(
           controller: _emailGhost,
           hint: "Email (For future legalization)",
           icon: Icons.alternate_email,
           onTap: () => _showKeyboard(_emailGhost, "SECURE EMAIL"),
         ),
+        if (_emailError != null) ...[
+          const SizedBox(height: 4),
+          TerminalText(_emailError!, color: Colors.redAccent, fontSize: 11),
+        ],
         const SizedBox(height: 16),
+        
+        // Password
         _buildGhostInput(
           controller: _passwordGhost,
           hint: "Security Cipher (Password)",
@@ -212,9 +411,42 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
           isPassword: true,
           onTap: () => _showKeyboard(_passwordGhost, "CIPHER"),
         ),
+        if (_passwordError != null) ...[
+          const SizedBox(height: 4),
+          TerminalText(_passwordError!, color: Colors.redAccent, fontSize: 11),
+        ],
+        if (_passwordStrength != null && _passwordGhost.value.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              TerminalText(
+                "Strength: ",
+                color: Colors.white54,
+                fontSize: 11,
+              ),
+              TerminalText(
+                _passwordStrength!,
+                color: ValidationHelper.getPasswordStrengthColor(_passwordGhost.value),
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+              ),
+            ],
+          ),
+        ],
       ],
       onNext: () {
-        if (_usernameGhost.value.length < 3) return _showError("Callsign too short");
+        // Validate all fields
+        _usernameError = ValidationHelper.validateUsername(_usernameGhost.value);
+        _emailError = ValidationHelper.validateEmail(_emailGhost.value);
+        _passwordError = ValidationHelper.validatePassword(_passwordGhost.value);
+        
+        setState(() {});
+        
+        if (_usernameError != null || _emailError != null || _passwordError != null) {
+          _showError("Please fix the errors above");
+          return;
+        }
+        
         _pageController.nextPage(duration: const Duration(milliseconds: 400), curve: Curves.easeInOut);
       },
     );
@@ -243,30 +475,53 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   }
 
   Widget _buildStep3() {
+    final bool isOffline = NetworkMonitor().currentRole == MeshRole.GHOST;
+    
     return _buildPageWrapper(
       title: "FINALIZE",
       desc: "Your data will be encrypted and stored in the local grid.",
       isLast: true,
       children: [
-        Center(
-          child: Pulse(
-            infinite: true,
-            child: Container(
-              padding: const EdgeInsets.all(30),
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                border: Border.all(color: AppColors.gridCyan.withOpacity(0.2), width: 2),
+        if (_isLoading && _registrationStep == 3) ...[
+          // Progress indicator during registration
+          TerminalProgressBar(
+            currentStep: _registrationStep,
+            totalSteps: 3,
+            stepLabels: [
+              "Initializing mesh network...",
+              "Creating identity...",
+              "Synchronizing...",
+            ],
+          ),
+          const SizedBox(height: 24),
+          const TerminalLoadingIndicator(
+            message: "Processing",
+            color: Colors.greenAccent,
+          ),
+        ] else ...[
+          Center(
+            child: Pulse(
+              infinite: true,
+              child: Container(
+                padding: const EdgeInsets.all(30),
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(color: AppColors.gridCyan.withOpacity(0.2), width: 2),
+                ),
+                child: const Icon(Icons.shield_outlined, color: AppColors.gridCyan, size: 50),
               ),
-              child: const Icon(Icons.shield_outlined, color: AppColors.gridCyan, size: 50),
             ),
           ),
-        ),
-        const SizedBox(height: 30),
-        Text(
-          "By starting, you establish a Ghost Identity.\nThis process is irreversible in offline mode.",
-          textAlign: TextAlign.center,
-          style: const TextStyle(color: AppColors.textDim, fontSize: 10),
-        ),
+          const SizedBox(height: 30),
+          TerminalInfoBox(
+            title: isOffline ? "GHOST MODE" : "CLOUD MODE",
+            content: isOffline
+                ? "You're registering offline. Your identity will be created locally. You can legalize it later when internet is available."
+                : "You're registering with cloud sync. Your identity will be synced to the cloud.",
+            icon: isOffline ? Icons.wifi_off : Icons.cloud_done,
+            color: isOffline ? AppColors.stealthOrange : AppColors.cloudGreen,
+          ),
+        ],
       ],
       onNext: _handleFinalStep,
     );
@@ -282,34 +537,48 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         children: [
           const SizedBox(height: 20),
           FadeInDown(
-            child: Text(
-              title,
-              style: const TextStyle(
-                fontSize: 20,
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 2,
-              ),
-            ),
+            child: TerminalTitle(title),
           ),
           const SizedBox(height: 8),
-          FadeInDown(delay: const Duration(milliseconds: 100), child: Text(desc, style: TextStyle(color: AppColors.textDim, fontSize: 12))),
+          FadeInDown(
+            delay: const Duration(milliseconds: 100),
+            child: TerminalSubtitle(desc),
+          ),
           const SizedBox(height: 40),
           ...children,
+          if (_currentError != null) ...[
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.redAccent.withOpacity(0.1),
+                border: Border.all(color: Colors.redAccent.withOpacity(0.3)),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: TerminalText(
+                _currentError!,
+                color: Colors.redAccent,
+              ),
+            ),
+          ],
           const SizedBox(height: 40),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.white,
+              backgroundColor: Colors.greenAccent,
               foregroundColor: Colors.black,
               padding: const EdgeInsets.symmetric(vertical: 18),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             ),
             onPressed: _isLoading ? null : onNext,
             child: _isLoading
-                ? const CupertinoActivityIndicator(color: Colors.black)
-                : Text(
+                ? const TerminalLoadingIndicator(
+                    message: "Processing",
+                    color: Colors.black,
+                  )
+                : TerminalText(
                     isLast ? "START" : "CONTINUE",
-                    style: const TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2),
+                    color: Colors.black,
+                    fontWeight: FontWeight.bold,
                   ),
           ),
         ],
@@ -394,7 +663,12 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   }
 
   void _showError(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), backgroundColor: AppColors.warningRed));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: TerminalText(msg, color: Colors.white),
+        backgroundColor: AppColors.warningRed,
+      ),
+    );
   }
 
   // Заглушка для проверки (реализуй в ApiService)

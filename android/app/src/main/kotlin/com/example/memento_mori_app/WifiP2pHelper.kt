@@ -46,6 +46,13 @@ class WifiP2pHelper(
     
     // Флаги для управления постоянными locks (не только во время discovery)
     private var isServiceActive = false // Приложение активно или Foreground Service работает
+    
+    // 🔥 АВТОМАТИЧЕСКОЕ СОЗДАНИЕ WI-FI DIRECT ГРУППЫ
+    private var isGroupOwner = false      // Мы владелец группы?
+    private var isGroupCreating = false   // Группа создается?
+    private var currentGroupName: String? = null  // Имя текущей группы
+    private var groupCreationRetries = 0  // Количество попыток создания группы
+    private val MAX_GROUP_RETRIES = 3     // Максимум попыток
 
     init {
         intentFilter.addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
@@ -604,6 +611,344 @@ class WifiP2pHelper(
     private fun runOnMain(block: () -> Unit) {
         activity.runOnUiThread { block() }
     }
+    
+    // ============================================================================
+    // 🔥 АВТОМАТИЧЕСКОЕ УПРАВЛЕНИЕ WI-FI DIRECT ГРУППОЙ
+    // ============================================================================
+    
+    /**
+     * Генерирует уникальное имя для Wi-Fi Direct группы
+     * Формат: MESH_<userId_short>_<timestamp_short>
+     */
+    private fun generateGroupName(): String {
+        val timestamp = (System.currentTimeMillis() / 1000) % 10000 // Последние 4 цифры timestamp
+        val random = (Math.random() * 1000).toInt()
+        return "MESH_${timestamp}_$random"
+    }
+    
+    /**
+     * Проверяет, есть ли существующая Wi-Fi Direct группа
+     * @param callback Вызывается с информацией о группе (или null если группы нет)
+     */
+    @SuppressLint("MissingPermission")
+    fun checkExistingGroup(callback: (GroupInfo?) -> Unit) {
+        if (!ensureP2pInitialized()) {
+            Log.e("P2P", "❌ [GROUP] P2P не инициализирован")
+            callback(null)
+            return
+        }
+        
+        Log.d("P2P", "🔍 [GROUP] Проверяем существующую группу...")
+        
+        manager?.requestGroupInfo(channel) { group ->
+            if (group != null) {
+                val info = GroupInfo(
+                    networkName = group.networkName,
+                    passphrase = group.passphrase,
+                    isGroupOwner = group.isGroupOwner,
+                    ownerAddress = group.owner?.deviceAddress,
+                    clientCount = group.clientList?.size ?: 0
+                )
+                Log.d("P2P", "✅ [GROUP] Найдена группа: ${info.networkName}")
+                Log.d("P2P", "   📋 Владелец: ${if (info.isGroupOwner) "Мы" else info.ownerAddress}")
+                Log.d("P2P", "   📋 Клиентов: ${info.clientCount}")
+                Log.d("P2P", "   📋 Passphrase: ${info.passphrase?.take(4)}...")
+                
+                isGroupOwner = info.isGroupOwner
+                currentGroupName = info.networkName
+                callback(info)
+            } else {
+                Log.d("P2P", "ℹ️ [GROUP] Активная группа не найдена")
+                isGroupOwner = false
+                currentGroupName = null
+                callback(null)
+            }
+        }
+    }
+    
+    /**
+     * Создает Wi-Fi Direct группу автоматически
+     * ВАЖНО: Проверяет существующую группу перед созданием
+     * 
+     * @param forceCreate Если true - удалит существующую группу и создаст новую
+     * @param callback Вызывается с результатом (GroupInfo или null при ошибке)
+     */
+    @SuppressLint("MissingPermission")
+    fun createGroup(forceCreate: Boolean = false, callback: (GroupInfo?) -> Unit) {
+        if (!ensureP2pInitialized()) {
+            Log.e("P2P", "❌ [GROUP] P2P не инициализирован для создания группы")
+            runOnMain {
+                methodChannel.invokeMethod("onGroupCreationFailed", mapOf(
+                    "error" to "P2P_NOT_INITIALIZED",
+                    "message" to "Wi-Fi P2P не инициализирован"
+                ))
+            }
+            callback(null)
+            return
+        }
+        
+        if (!isP2pEnabled) {
+            Log.w("P2P", "⚠️ [GROUP] Wi-Fi Direct выключен")
+            runOnMain {
+                methodChannel.invokeMethod("onGroupCreationFailed", mapOf(
+                    "error" to "P2P_DISABLED",
+                    "message" to "Wi-Fi Direct выключен. Включите в настройках."
+                ))
+            }
+            callback(null)
+            return
+        }
+        
+        if (isGroupCreating) {
+            Log.w("P2P", "⚠️ [GROUP] Создание группы уже в процессе")
+            callback(null)
+            return
+        }
+        
+        Log.d("P2P", "🚀 [GROUP] Начинаем создание Wi-Fi Direct группы...")
+        Log.d("P2P", "   📋 forceCreate: $forceCreate")
+        
+        // Сначала проверяем существующую группу
+        checkExistingGroup { existingGroup ->
+            if (existingGroup != null && !forceCreate) {
+                // Группа уже есть и мы не хотим её пересоздавать
+                Log.d("P2P", "✅ [GROUP] Используем существующую группу: ${existingGroup.networkName}")
+                
+                if (existingGroup.isGroupOwner) {
+                    // Мы владелец - отлично!
+                    runOnMain {
+                        methodChannel.invokeMethod("onGroupCreated", mapOf(
+                            "networkName" to existingGroup.networkName,
+                            "passphrase" to existingGroup.passphrase,
+                            "isGroupOwner" to existingGroup.isGroupOwner,
+                            "clientCount" to existingGroup.clientCount,
+                            "reused" to true
+                        ))
+                    }
+                    callback(existingGroup)
+                } else {
+                    // Мы клиент в чужой группе - возможно нужно создать свою
+                    Log.d("P2P", "ℹ️ [GROUP] Мы клиент в чужой группе, пропускаем создание")
+                    callback(existingGroup)
+                }
+                return@checkExistingGroup
+            }
+            
+            // Нужно создать новую группу
+            if (existingGroup != null && forceCreate) {
+                // Удаляем старую группу перед созданием новой
+                Log.d("P2P", "🗑️ [GROUP] Удаляем существующую группу перед созданием новой...")
+                removeGroup { removed ->
+                    if (removed) {
+                        // Небольшая задержка для стабилизации
+                        scope.launch {
+                            delay(500)
+                            createNewGroup(callback)
+                        }
+                    } else {
+                        Log.e("P2P", "❌ [GROUP] Не удалось удалить старую группу")
+                        callback(null)
+                    }
+                }
+            } else {
+                // Создаем новую группу
+                createNewGroup(callback)
+            }
+        }
+    }
+    
+    /**
+     * Внутренний метод создания новой группы
+     */
+    @SuppressLint("MissingPermission")
+    private fun createNewGroup(callback: (GroupInfo?) -> Unit) {
+        isGroupCreating = true
+        val groupName = generateGroupName()
+        
+        Log.d("P2P", "📡 [GROUP] Создаем группу: $groupName")
+        Log.d("P2P", "   📋 Устройство: ${deviceInfo.brand} ${deviceInfo.model}")
+        
+        // 🔥 ФИКС ДЛЯ КИТАЙСКИХ УСТРОЙСТВ: Захватываем locks перед созданием группы
+        acquireMulticastLock()
+        acquireWifiLock()
+        
+        manager?.createGroup(channel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d("P2P", "✅ [GROUP] Команда создания группы успешна, ждем подтверждения...")
+                
+                // Группа создается асинхронно, ждем обновления через колбек
+                // Проверяем информацию о группе через небольшую задержку
+                scope.launch {
+                    delay(1000) // Даем время на создание группы
+                    
+                    manager?.requestGroupInfo(channel) { group ->
+                        isGroupCreating = false
+                        groupCreationRetries = 0
+                        
+                        if (group != null) {
+                            val info = GroupInfo(
+                                networkName = group.networkName,
+                                passphrase = group.passphrase,
+                                isGroupOwner = group.isGroupOwner,
+                                ownerAddress = group.owner?.deviceAddress,
+                                clientCount = group.clientList?.size ?: 0
+                            )
+                            
+                            isGroupOwner = true
+                            currentGroupName = info.networkName
+                            
+                            Log.d("P2P", "✅ [GROUP] Группа создана успешно!")
+                            Log.d("P2P", "   📋 SSID: ${info.networkName}")
+                            Log.d("P2P", "   📋 Passphrase: ${info.passphrase}")
+                            Log.d("P2P", "   📋 Владелец: ${info.ownerAddress}")
+                            
+                            runOnMain {
+                                methodChannel.invokeMethod("onGroupCreated", mapOf(
+                                    "networkName" to info.networkName,
+                                    "passphrase" to info.passphrase,
+                                    "isGroupOwner" to info.isGroupOwner,
+                                    "clientCount" to info.clientCount,
+                                    "reused" to false
+                                ))
+                            }
+                            callback(info)
+                        } else {
+                            Log.e("P2P", "❌ [GROUP] Группа создана, но информация не получена")
+                            runOnMain {
+                                methodChannel.invokeMethod("onGroupCreationFailed", mapOf(
+                                    "error" to "GROUP_INFO_UNAVAILABLE",
+                                    "message" to "Группа создана, но информация недоступна"
+                                ))
+                            }
+                            callback(null)
+                        }
+                    }
+                }
+            }
+            
+            override fun onFailure(reason: Int) {
+                isGroupCreating = false
+                val errorMsg = when (reason) {
+                    WifiP2pManager.P2P_UNSUPPORTED -> "Wi-Fi Direct не поддерживается"
+                    WifiP2pManager.BUSY -> "Wi-Fi P2P занят"
+                    WifiP2pManager.ERROR -> "Внутренняя ошибка Wi-Fi P2P"
+                    else -> "Неизвестная ошибка: $reason"
+                }
+                
+                Log.e("P2P", "❌ [GROUP] Ошибка создания группы: $errorMsg (code: $reason)")
+                
+                // Retry логика для BUSY состояния
+                if (reason == WifiP2pManager.BUSY && groupCreationRetries < MAX_GROUP_RETRIES) {
+                    groupCreationRetries++
+                    Log.d("P2P", "🔄 [GROUP] Повторная попытка ${groupCreationRetries}/$MAX_GROUP_RETRIES через 2 секунды...")
+                    
+                    scope.launch {
+                        delay(2000)
+                        createNewGroup(callback)
+                    }
+                    return
+                }
+                
+                groupCreationRetries = 0
+                releaseMulticastLock()
+                
+                runOnMain {
+                    methodChannel.invokeMethod("onGroupCreationFailed", mapOf(
+                        "error" to "CREATE_FAILED",
+                        "code" to reason,
+                        "message" to errorMsg
+                    ))
+                }
+                callback(null)
+            }
+        })
+    }
+    
+    /**
+     * Удаляет текущую Wi-Fi Direct группу
+     */
+    @SuppressLint("MissingPermission")
+    fun removeGroup(callback: (Boolean) -> Unit) {
+        if (!ensureP2pInitialized()) {
+            Log.e("P2P", "❌ [GROUP] P2P не инициализирован для удаления группы")
+            callback(false)
+            return
+        }
+        
+        Log.d("P2P", "🗑️ [GROUP] Удаляем Wi-Fi Direct группу...")
+        
+        manager?.removeGroup(channel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d("P2P", "✅ [GROUP] Группа удалена")
+                isGroupOwner = false
+                currentGroupName = null
+                
+                runOnMain {
+                    methodChannel.invokeMethod("onGroupRemoved", mapOf("success" to true))
+                }
+                callback(true)
+            }
+            
+            override fun onFailure(reason: Int) {
+                // Если ошибка = "нет группы для удаления" - это нормально
+                val errorMsg = when (reason) {
+                    WifiP2pManager.P2P_UNSUPPORTED -> "Wi-Fi Direct не поддерживается"
+                    WifiP2pManager.BUSY -> "Wi-Fi P2P занят"
+                    WifiP2pManager.ERROR -> "Группа не найдена или уже удалена"
+                    else -> "Неизвестная ошибка: $reason"
+                }
+                
+                Log.w("P2P", "⚠️ [GROUP] Ошибка удаления группы: $errorMsg")
+                isGroupOwner = false
+                currentGroupName = null
+                
+                // Считаем успехом если группы нет (ERROR = 0 обычно означает "нечего удалять")
+                val success = reason == WifiP2pManager.ERROR || reason == 0
+                callback(success)
+            }
+        })
+    }
+    
+    /**
+     * Получает информацию о текущей группе
+     */
+    @SuppressLint("MissingPermission")
+    fun getGroupInfo(callback: (GroupInfo?) -> Unit) {
+        checkExistingGroup(callback)
+    }
+    
+    /**
+     * Автоматически создает группу если её нет
+     * Идеально для автоматического mesh-режима
+     */
+    fun ensureGroupExists(callback: (GroupInfo?) -> Unit) {
+        createGroup(forceCreate = false, callback = callback)
+    }
+    
+    /**
+     * Проверяет, является ли устройство владельцем группы
+     */
+    fun isCurrentlyGroupOwner(): Boolean {
+        return isGroupOwner
+    }
+    
+    /**
+     * Получает имя текущей группы
+     */
+    fun getCurrentGroupName(): String? {
+        return currentGroupName
+    }
+    
+    /**
+     * Данные о Wi-Fi Direct группе
+     */
+    data class GroupInfo(
+        val networkName: String?,
+        val passphrase: String?,
+        val isGroupOwner: Boolean,
+        val ownerAddress: String?,
+        val clientCount: Int
+    )
     
     /**
      * Очистка ресурсов при уничтожении

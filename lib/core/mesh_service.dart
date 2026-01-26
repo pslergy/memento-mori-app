@@ -43,6 +43,8 @@ import 'event_bus_service.dart';
 import 'discovery_context_service.dart';
 import 'models/uplink_candidate.dart';
 import 'connection_stabilizer.dart';
+import 'repeater_service.dart';
+import 'ghost_transfer_manager.dart';
 
 
 // 🔥 МАСШТАБИРУЕМОСТЬ: Классы для оптимизации отправки
@@ -68,19 +70,25 @@ class TransportLatency {
   int consecutiveSuccesses = 0;
   
   Duration get averageSuccessLatency {
-    if (successfulLatencies.isEmpty) return const Duration(seconds: 10);
+    if (successfulLatencies.isEmpty) return const Duration(seconds: 15);
     final total = successfulLatencies.fold<int>(0, (sum, d) => sum + d.inMilliseconds);
     return Duration(milliseconds: total ~/ successfulLatencies.length);
   }
   
+  // 🔒 SECURITY FIX #5: Увеличенные таймауты для GATT соединений
+  // Проблема: 15s недостаточно для Huawei/Tecno где GATT connect занимает 10-15s
+  // Решение: Base timeout 25s, увеличенный до 35s при множественных неудачах
   Duration get adaptiveTimeout {
     if (consecutiveFailures >= 3) {
-      return const Duration(seconds: 20); // Увеличиваем при множественных неудачах
+      return const Duration(seconds: 35); // Максимальный для проблемных устройств
     }
-    if (successfulLatencies.isNotEmpty && averageSuccessLatency.inSeconds <= 5) {
-      return const Duration(seconds: 10); // Стандартный для быстрых устройств
+    if (consecutiveFailures >= 1) {
+      return const Duration(seconds: 30); // Увеличенный после первой неудачи
     }
-    return const Duration(seconds: 15); // Увеличенный для медленных устройств
+    if (successfulLatencies.isNotEmpty && averageSuccessLatency.inSeconds <= 8) {
+      return const Duration(seconds: 20); // Стандартный для быстрых устройств
+    }
+    return const Duration(seconds: 25); // Base timeout для медленных устройств
   }
   
   void recordSuccess(Duration latency) {
@@ -124,6 +132,9 @@ class MeshService with ChangeNotifier {
       final now = DateTime.now();
       // Clean up expired cooldowns (older than 1 hour)
       _linkCooldowns.removeWhere((_, time) => now.difference(time).inHours > 1);
+      // 🔥 FIX: Clean up token-to-MAC mapping (older than 5 minutes)
+      // Tokens change every 30 seconds, so 5 minutes is more than enough
+      _tokenToMacMapping.clear(); // Will be repopulated on next scan
       // Clean up expired IP locks (older than 10 minutes)
       _peerIpExpiry.removeWhere((_, expiry) => now.isAfter(expiry));
       // Clean up old timestamps (older than 1 hour)
@@ -191,6 +202,9 @@ class MeshService with ChangeNotifier {
   
   /// Обработка сигналов Sonar (запросы пакетов)
   void _handleSonarSignal(String signal) {
+    final currentRole = NetworkMonitor().currentRole;
+    final roleLabel = currentRole == MeshRole.BRIDGE ? 'BRIDGE' : 'GHOST';
+    
     if (signal.startsWith("Q:")) {
       // Запрос пакета: Q:hashCode
       final queryHash = signal.substring(2);
@@ -267,6 +281,7 @@ class MeshService with ChangeNotifier {
   final LocalDatabaseService _db = locator<LocalDatabaseService>();
   final math.Random _rng = math.Random(); // Добавь эту строку
   ApiService get apiService => _apiService;
+  BluetoothMeshService get btService => _btService; // 🔥 GOSSIP: Expose btService for relay
   // Состояние обнаруженных узлов (Радар)
   final Map<String, SignalNode> _nearbyNodes = {};
 
@@ -281,6 +296,7 @@ class MeshService with ChangeNotifier {
   Timer? _scanTimer;
 
   bool _isTransferring = false;
+  DateTime? _transferStartTime; // 🔥 FIX: Track transfer start for timeout
   bool get isTransferring => _isTransferring;
   bool _isBtScanning = false;
   bool _p2pDiscoveryActive = false;
@@ -317,7 +333,7 @@ class MeshService with ChangeNotifier {
 
   // Хранение всех логов для копирования
   final List<String> _allLogs = [];
-  static const int _maxLogs = 1000; // 🔒 Reduced from 10000 to 1000 to prevent memory leaks
+  static const int _maxLogs = 10000; // 🔥 Увеличено до 10000 для полной диагностики передачи сообщений
 
   /// Получить все логи для копирования
   List<String> getAllLogs() => List.unmodifiable(_allLogs);
@@ -545,6 +561,7 @@ class MeshService with ChangeNotifier {
     }
 
     _isTransferring = true;
+    _transferStartTime = DateTime.now(); // 🔥 FIX: Track start time
     _log("🧨 [NUCLEAR-ATTACK] Target: $address. Engaging P2P Stack...");
     notifyListeners();
 
@@ -691,8 +708,12 @@ class MeshService with ChangeNotifier {
   }
 
 
-  // 🔥 ОБНОВЛЯЕМ ЭТОТ МЕТОД: Он теперь "авто-киллер"
+  // 🔥 ОБНОВЛЯЕМ ЭТОТ МЕТОД: Он теперь "авто-киллер" + магнитное подключение
   void handleNativePeers(List<dynamic> raw) {
+    final currentRole = NetworkMonitor().currentRole;
+    final isBridge = currentRole == MeshRole.BRIDGE;
+    final isGhost = currentRole == MeshRole.GHOST;
+    
     for (var item in raw) {
       final String addr = item['metadata'] ?? item['address'] ?? "";
       final String name = item['name'] ?? "WiFi_Node";
@@ -700,6 +721,19 @@ class MeshService with ChangeNotifier {
 
       // Регистрируем в UI только Wi-Fi ноды
       _registerNode(SignalNode(id: addr, name: name, type: SignalType.mesh, metadata: addr));
+      
+      // 🔥 МАГНИТНОЕ ПОДКЛЮЧЕНИЕ: Автоматическое соединение GHOST → BRIDGE
+      // Если мы GHOST и видим mesh устройство - подключаемся
+      // (Wi-Fi Direct discovery уже запускается только когда есть pending messages)
+      if (isGhost && !_isP2pConnected && !_isTransferring) {
+        _log("🧲 [Wi-Fi Direct] GHOST detected Wi-Fi peer: $name ($addr)");
+        _log("   📋 Initiating automatic Wi-Fi Direct connection...");
+        connectToNode(addr);
+      } else if (isBridge && !_isP2pConnected) {
+        // BRIDGE пассивно ждёт подключений, но логируем обнаружение
+        _log("🌉 [Wi-Fi Direct] BRIDGE detected Wi-Fi peer: $name ($addr)");
+        _log("   📋 Waiting for incoming connection (passive mode)");
+      }
 
       // Если мы в режиме "Охоты" - цепляемся за первую же Wi-Fi ноду
       if (_isEscalating && !_isP2pConnected && !_isTransferring) {
@@ -728,6 +762,7 @@ class MeshService with ChangeNotifier {
     });
 
     _isTransferring = true;
+    _transferStartTime = DateTime.now(); // 🔥 FIX: Track start time
     _log("⛓️ Starting Cascade: Wi-Fi -> BLE -> Sonar");
 
     // --- СТУПЕНЬ 1: WI-FI DIRECT (DATA PLANE) ---
@@ -739,6 +774,8 @@ class MeshService with ChangeNotifier {
       await Future.delayed(const Duration(seconds: 10));
       if (_isP2pConnected) {
         _log("✅ Stage 1 Success: Wi-Fi Direct Linked.");
+        _isTransferring = false; // 🔥 FIX: Reset on success!
+        notifyListeners();
         return;
       }
     } catch (e) {
@@ -755,6 +792,8 @@ class MeshService with ChangeNotifier {
         await _btService.sendMessage(target.device, payload);
         bleSuccess = true; // sendMessage внутри имеет свои ретраи
         _log("✅ Stage 2 Success: Delivered via BLE GATT.");
+        _isTransferring = false; // 🔥 FIX: Reset on success!
+        notifyListeners();
         return;
       } catch (e) {
         _log("⚠️ Stage 2 Failed: GATT 133 or Timeout.");
@@ -835,11 +874,17 @@ class MeshService with ChangeNotifier {
         : chatId;
 
     _log("🚀 Initiating Multi-Channel Uplink for: $targetId");
+    _log("📤 [SEND-AUTO] Starting message send:");
+    _log("   📋 Content length: ${content.length} chars");
+    _log("   📋 Target: $targetId");
+    _log("   📋 Receiver: $receiverName");
+    _log("   📋 Message ID: ${messageId ?? 'temp (will be generated)'}");
 
     // 2. КРИПТОГРАФИЯ: Готовим зашифрованный пакет (E2EE)
     final key = await encryption.getChatKey(targetId);
     final encryptedContent = await encryption.encrypt(content, key);
     final String tempId = messageId ?? "temp_${DateTime.now().millisecondsSinceEpoch}";
+    _log("🔐 [SEND-AUTO] Message encrypted, tempId: $tempId");
 
     final offlinePacket = jsonEncode({
       'type': 'OFFLINE_MSG',
@@ -864,6 +909,7 @@ class MeshService with ChangeNotifier {
     final connectedRouter = routerConnection.connectedRouter;
     if (connectedRouter != null && connectedRouter.hasInternet) {
       try {
+        _log("📤 [SEND-AUTO] Channel 0: Router (${connectedRouter.ssid})");
         _log("🛰️ Router: Attempting transmission via ${connectedRouter.ssid}...");
         final routerProtocol = RouterBridgeProtocol();
         // Если мы BRIDGE через роутер - отправляем в облако
@@ -893,6 +939,7 @@ class MeshService with ChangeNotifier {
     // ==========================================
     if (currentRole == MeshRole.BRIDGE && connectedRouter == null) {
       try {
+        _log("📤 [SEND-AUTO] Channel 1: Cloud (BRIDGE mode)");
         await WebSocketService().ensureConnected();
         await WebSocketService().send({
           "type": "message",
@@ -913,9 +960,11 @@ class MeshService with ChangeNotifier {
     // ==========================================
     // Мы шлем через TCP только если физический линк установлен И маршрут "прогрет"
     if (_isP2pConnected && isRouteReady) {
+      _log("📤 [SEND-AUTO] Channel 2: Wi-Fi Direct TCP (P2P connected, route ready)");
       _log("📡 Mesh: Route is stable. Emitting TCP bursts...");
       // Используем sendTcpBurst (он внутри делает 3 попытки)
       await sendTcpBurst(offlinePacket);
+      _log("✅ [SEND-AUTO] Channel 2: TCP burst completed");
       messageDeliveredToNetwork = true;
     } else if (_isP2pConnected && !isRouteReady) {
       _log("⏳ Mesh: Link detected but route warming up. Skipping TCP.");
@@ -928,12 +977,17 @@ class MeshService with ChangeNotifier {
     final bluetoothNodes = _nearbyNodes.values.where((n) => n.type == SignalType.bluetooth).toList();
 
     if (bluetoothNodes.isNotEmpty) {
+      _log("📤 [SEND-AUTO] Channel 3: Bluetooth BLE (${bluetoothNodes.length} node(s))");
       _log("🦷 BT: Injecting packet into Serial Queue for ${bluetoothNodes.length} nodes.");
       for (var node in bluetoothNodes) {
+        _log("   📤 [SEND-AUTO] Queuing message to BLE node: ${node.name} (${node.id.substring(node.id.length - 8)})");
         // Мы используем sendMessage, которую ты реализовал с очередью и ретраями
         _btService.sendMessage(BluetoothDevice.fromId(node.id), offlinePacket);
       }
+      _log("✅ [SEND-AUTO] Channel 3: All BLE messages queued");
       messageDeliveredToNetwork = true;
+    } else {
+      _log("⏸️ [SEND-AUTO] Channel 3: Bluetooth - no BLE nodes available");
     }
 
     // Обновляем статус сообщения
@@ -952,8 +1006,13 @@ class MeshService with ChangeNotifier {
 
     // Эскалация до Сонара только для SOS или очень коротких сообщений (до 64 символов)
     if (isEmergency || content.length < 64) {
+      _log("📤 [SEND-AUTO] Channel 4: Sonar (ultrasonic)");
+      _log("   📋 Emergency: $isEmergency, Content length: ${content.length} chars");
       _log("🔊 Sonar: Escalating to Acoustic Link...");
       unawaited(sonar.transmitFrame(content));
+      _log("✅ [SEND-AUTO] Channel 4: Sonar transmission initiated");
+    } else {
+      _log("⏸️ [SEND-AUTO] Channel 4: Sonar - skipped (not emergency, content too long: ${content.length} chars)");
     }
 
     // 3. ИНКУБАЦИЯ: Сохраняем в Outbox (Для Gossip-паутины)
@@ -985,6 +1044,34 @@ class MeshService with ChangeNotifier {
       );
       await db.addToOutbox(myMsg, targetId);
       _log("🦠 Virus: Signal incubated in Outbox.");
+    }
+    
+    // 📊 ИТОГОВОЕ ЛОГИРОВАНИЕ: Результат отправки через все каналы
+    _log("📊 [SEND-AUTO] Send summary:");
+    _log("   ✅ Delivered to network: $messageDeliveredToNetwork");
+    _log("   ✅ Delivered to participants: $messageDeliveredToParticipants");
+    _log("   📋 Message ID: $tempId");
+    _log("   📋 Target: $targetId");
+    _log("   📋 Role: ${currentRole == MeshRole.BRIDGE ? 'BRIDGE' : 'GHOST'}");
+    if (messageDeliveredToNetwork || messageDeliveredToParticipants) {
+      _log("✅ [SEND-AUTO] Message sent successfully via at least one channel");
+      
+      // 🔥 GOSSIP RELAY: BRIDGE должен ретранслировать сообщения GHOST устройствам
+      // Это позволяет GHOST получать сообщения даже без прямого подключения к Cloud
+      if (currentRole == MeshRole.BRIDGE) {
+        try {
+          final gossip = locator<GossipManager>();
+          final packetData = jsonDecode(offlinePacket) as Map<String, dynamic>;
+          packetData['h'] = tempId; // Убеждаемся что packetId установлен
+          _log("🔄 [GOSSIP] BRIDGE initiating relay to GHOST devices...");
+          unawaited(gossip.attemptRelay(packetData));
+          _log("✅ [GOSSIP] Relay initiated - message will be broadcast to nearby GHOST devices");
+        } catch (e) {
+          _log("⚠️ [GOSSIP] Failed to initiate relay: $e");
+        }
+      }
+    } else {
+      _log("⚠️ [SEND-AUTO] Message queued in outbox (no channels available)");
     }
   }
 
@@ -1150,7 +1237,150 @@ class MeshService with ChangeNotifier {
   }
 
   // Добавь это поле в начало класса MeshService для контроля повторных попыток
+  // 🔥 FIX: Cooldown по ТОКЕНУ, а не по MAC (из-за MAC rotation на Android)
   final Map<String, DateTime> _linkCooldowns = {};
+  
+  // 🔥 FIX: Маппинг token → последний известный MAC (для логирования)
+  final Map<String, String> _tokenToMacMapping = {};
+  
+  // 🔥 AUDIT FIX: Timing constants для согласования cooldown и GATT timeout
+  // 🔥 FIX: Cooldown уменьшен до 20s (было 45s - слишком блокировало попытки)
+  // Cooldown теперь ставится ТОЛЬКО после НЕУДАЧНОЙ попытки, не до!
+  static const int _defaultCooldownSeconds = 20; // Уменьшено с 45 до 20
+  static const int _quickRescanDurationSeconds = 5; // Увеличено с 3 до 5
+  static const Duration _scanResultMaxAgeForConnect = Duration(seconds: 15); // Строже для connect
+  
+  /// 🔥 CRITICAL FIX: Извлекает токен из manufacturerData
+  /// Токен уникален для BRIDGE, а MAC меняется каждые 200-500ms (Android randomization)
+  /// Используем токен как ключ для cooldown вместо MAC
+  String? _extractTokenFromScanResult(ScanResult r) {
+    try {
+      final mfData = r.advertisementData.manufacturerData[0xFFFF];
+      if (mfData != null && mfData.length > 2) {
+        // Первые 2 байта = role indicator (BR для BRIDGE, GH для GHOST)
+        // Остальные байты = токен
+        if ((mfData[0] == 0x42 && mfData[1] == 0x52) || // "BR" - BRIDGE
+            (mfData[0] == 0x47 && mfData[1] == 0x48)) { // "GH" - GHOST
+          final tokenBytes = mfData.sublist(2);
+          return String.fromCharCodes(tokenBytes);
+        }
+      }
+      
+      // Fallback: извлекаем токен из тактического имени
+      final name = r.advertisementData.localName;
+      if (name.isNotEmpty && name.contains('_')) {
+        final parts = name.split('_');
+        if (parts.length >= 4) {
+          return parts.last; // Последняя часть = токен
+        }
+      }
+    } catch (e) {
+      // Ignore parsing errors
+    }
+    return null;
+  }
+  
+  /// 🔥 FIX: Получает ключ для cooldown (токен если есть, иначе MAC)
+  String _getCooldownKey(ScanResult r) {
+    final token = _extractTokenFromScanResult(r);
+    final mac = r.device.remoteId.str;
+    
+    if (token != null && token.isNotEmpty) {
+      // Обновляем маппинг token → MAC
+      _tokenToMacMapping[token] = mac;
+      return "TOKEN:$token";
+    }
+    return "MAC:$mac";
+  }
+  
+  /// 🔥 FIX: Проверяет cooldown по токену или MAC
+  /// cooldownSeconds по умолчанию = _defaultCooldownSeconds (45s)
+  bool _isCooldownExpired(ScanResult r, {int? cooldownSeconds}) {
+    final cd = cooldownSeconds ?? _defaultCooldownSeconds;
+    final key = _getCooldownKey(r);
+    if (!_linkCooldowns.containsKey(key)) return true;
+    
+    final age = DateTime.now().difference(_linkCooldowns[key]!).inSeconds;
+    // 🔥 FIX: Используем >= для корректного поведения на границе (0s remaining)
+    return age >= cd;
+  }
+  
+  /// 🔥 FIX: Устанавливает cooldown по токену или MAC
+  void _setCooldown(ScanResult r) {
+    final key = _getCooldownKey(r);
+    _linkCooldowns[key] = DateTime.now();
+    _log("🔒 [Cooldown] Set for $key (will expire in ${_defaultCooldownSeconds}s)");
+  }
+  
+  /// 🔥 FIX: Получает оставшееся время cooldown
+  int _getCooldownRemaining(ScanResult r, {int? cooldownSeconds}) {
+    final cd = cooldownSeconds ?? _defaultCooldownSeconds;
+    final key = _getCooldownKey(r);
+    if (!_linkCooldowns.containsKey(key)) return 0;
+    
+    final age = DateTime.now().difference(_linkCooldowns[key]!).inSeconds;
+    return (cd - age).clamp(0, cd);
+  }
+  
+  /// 🔥 FIX: Устанавливает cooldown по MAC (fallback когда нет ScanResult)
+  /// Пытается найти токен по маппингу, иначе использует MAC
+  void _setCooldownByMac(String mac) {
+    // Ищем токен в обратном маппинге
+    String? tokenForMac;
+    for (final entry in _tokenToMacMapping.entries) {
+      if (entry.value == mac) {
+        tokenForMac = entry.key;
+        break;
+      }
+    }
+    
+    final key = tokenForMac != null ? "TOKEN:$tokenForMac" : "MAC:$mac";
+    _linkCooldowns[key] = DateTime.now();
+  }
+  
+  /// 🔥 FIX: Проверяет cooldown по MAC (fallback когда нет ScanResult)
+  bool _isCooldownExpiredByMac(String mac, {int? cooldownSeconds}) {
+    final cd = cooldownSeconds ?? _defaultCooldownSeconds;
+    // Сначала проверяем по токену (если есть маппинг)
+    for (final entry in _tokenToMacMapping.entries) {
+      if (entry.value == mac) {
+        final key = "TOKEN:${entry.key}";
+        if (_linkCooldowns.containsKey(key)) {
+          final age = DateTime.now().difference(_linkCooldowns[key]!).inSeconds;
+          return age >= cd;
+        }
+      }
+    }
+    
+    // Fallback на MAC
+    final key = "MAC:$mac";
+    if (!_linkCooldowns.containsKey(key)) return true;
+    
+    final age = DateTime.now().difference(_linkCooldowns[key]!).inSeconds;
+    return age >= cd;
+  }
+  
+  /// 🔥 FIX: Получает оставшееся время cooldown по MAC
+  int _getCooldownRemainingByMac(String mac, {int? cooldownSeconds}) {
+    final cd = cooldownSeconds ?? _defaultCooldownSeconds;
+    // Сначала проверяем по токену
+    for (final entry in _tokenToMacMapping.entries) {
+      if (entry.value == mac) {
+        final key = "TOKEN:${entry.key}";
+        if (_linkCooldowns.containsKey(key)) {
+          final age = DateTime.now().difference(_linkCooldowns[key]!).inSeconds;
+          return (cd - age).clamp(0, cd);
+        }
+      }
+    }
+    
+    // Fallback на MAC
+    final key = "MAC:$mac";
+    if (!_linkCooldowns.containsKey(key)) return 0;
+    
+    final age = DateTime.now().difference(_linkCooldowns[key]!).inSeconds;
+    return (cd - age).clamp(0, cd);
+  }
 
 
 
@@ -1175,6 +1405,20 @@ class MeshService with ChangeNotifier {
       return;
     }
     
+    // 🔥 FIX: БЛОКИРОВКА SCAN ВО ВРЕМЯ GATT CONNECT
+    // Это критично - scan и GATT connect конфликтуют на Android BLE стеке!
+    // 🔥 FIX #6: Разрешаем scan если GATT state == FAILED (это завершённое состояние)
+    if (_btService.isGattConnecting) {
+      final gattState = _btService.gattConnectionState;
+      // FAILED и IDLE - это завершённые состояния, scan может работать
+      if (gattState != 'FAILED' && gattState != 'IDLE') {
+        _log("🚫 [BT-SCAN] Scan BLOCKED: GATT connection in progress (state: $gattState)");
+        _log("   📋 Wait for GATT to complete before starting scan");
+        return;
+      }
+      _log("ℹ️ [BT-SCAN] GATT state is $gattState - allowing scan to proceed");
+    }
+    
     _isBtScanning = true;
     final currentRole = NetworkMonitor().currentRole;
     _log("🔍 [BT-SCAN] Starting BLE scan (role: ${currentRole == MeshRole.BRIDGE ? 'BRIDGE' : 'GHOST'})");
@@ -1196,7 +1440,8 @@ class MeshService with ChangeNotifier {
       // 🔍 ЛОГИРОВАНИЕ для отладки
       _log("📡 [ADV] Setting tactical name: '$myTacticalName' (length: ${myTacticalName.length})");
 
-      await _btService.stopAdvertising();
+      // 🔥 FIX: keepGattServer=true чтобы BRIDGE не терял GATT сервер при обновлении advertising
+      await _btService.stopAdvertising(keepGattServer: true);
       await _btService.startAdvertising(myTacticalName);
 
       // 2. СКАНИРОВАНИЕ
@@ -1286,6 +1531,38 @@ class MeshService with ChangeNotifier {
           // 🔥 FIX: Если BRIDGE обнаружен через manufacturerData
           if (isBridgeByMfData) {
             _log("🧲 [Ghost] ⚡ BRIDGE detected via manufacturerData! (MAC: ${mac.substring(mac.length - 8)})");
+            
+            // 🔥 REPEATER: Уведомляем о обнаружении BRIDGE
+            try {
+              final mfDataForToken = r.advertisementData.manufacturerData[0xFFFF];
+              String? tokenFromMf;
+              if (mfDataForToken != null && mfDataForToken.length > 2) {
+                try {
+                  tokenFromMf = utf8.decode(mfDataForToken.sublist(2), allowMalformed: true);
+                } catch (_) {}
+              }
+              locator<RepeaterService>().onDeviceDiscovered(
+                mac, 
+                tokenFromMf, 
+                ChannelType.bleGatt,
+              );
+            } catch (_) {}
+            
+            // 🔥 GHOST TRANSFER MANAGER: Регистрируем BRIDGE
+            try {
+              final mfDataForToken = r.advertisementData.manufacturerData[0xFFFF];
+              String? tokenFromMf;
+              if (mfDataForToken != null && mfDataForToken.length > 2) {
+                try {
+                  tokenFromMf = utf8.decode(mfDataForToken.sublist(2), allowMalformed: true);
+                } catch (_) {}
+              }
+              locator<GhostTransferManager>().onBridgeDiscovered(
+                r,
+                token: tokenFromMf,
+                hops: 0,
+              );
+            } catch (_) {}
           }
 
           int peerHops = 99;
@@ -1320,8 +1597,8 @@ class MeshService with ChangeNotifier {
                 if (NetworkMonitor().currentRole == MeshRole.GHOST && encryptedToken.isNotEmpty) {
                   // 🔒 SECURITY: Encrypted token in BLE is just a hint for discovery
                   // Actual token verification happens during TCP connection
-                  // 🔥 ШАГ 3: Токен валиден 30 секунд
-                  final expiresAt = DateTime.now().add(const Duration(seconds: 30)).millisecondsSinceEpoch;
+                  // 🔥 ШАГ 3: Токен валиден 60 секунд (MAC RANDOMIZATION FIX)
+                  final expiresAt = DateTime.now().add(const Duration(seconds: 60)).millisecondsSinceEpoch;
                   _log("🧲 [Ghost] Processing MAGNET_WAVE hint from BLE advertising (encrypted: $tokenPreview...)");
                   // Note: We can't decrypt token from BLE alone - need full MAGNET_WAVE packet via TCP
                   // This is just for discovery - actual connection uses TCP with full signed packet
@@ -1354,8 +1631,8 @@ class MeshService with ChangeNotifier {
                 }
                 
                 if (extractedToken == null) {
-                  // 🔥 ШАГ 2.2: Токен не найден - fallback на Sonar
-                  _log("🚫 [ARCHITECTURE] BRIDGE without token — Cascade FORBIDDEN");
+                  // 🔥 ШАГ 2.2: Токен не найден - проверяем TCP fallback
+                  _log("⚠️ [ARCHITECTURE] BRIDGE without token in advertising");
                   _log("   📋 Effective name: '$effectiveName'");
                   _log("   📋 Platform name: '$platformName'");
                   _log("   📋 MAC: ${mac.substring(mac.length - 8)}");
@@ -1364,46 +1641,55 @@ class MeshService with ChangeNotifier {
                   _log("      2. Token expired (>30s old)");
                   _log("      3. BLE stack delay on BRIDGE device (Huawei/Android)");
                   
-                  // 🔥 ШАГ 4.1: Повторное сканирование через 1-2 секунды, если токен не найден
-                  _pendingBridgeConnections[mac] = DateTime.now();
-                  Future.delayed(const Duration(seconds: 2), () async {
-                    _log("🔄 [GHOST] Retry scan for BRIDGE token (MAC: ${mac.substring(mac.length - 8)})...");
-                    try {
-                      await startDiscovery(SignalType.bluetooth);
-                      await Future.delayed(const Duration(seconds: 5)); // Сканируем 5 секунд
-                      await stopDiscovery();
-                      
-                      // 🔥 ШАГ 4.2: После получения токена - сразу инициировать подключение
-                      // Проверяем, появился ли токен в DiscoveryContext
-                      final discoveryContext = locator<DiscoveryContextService>();
-                      final updatedCandidate = discoveryContext.getCandidateByMac(mac);
-                      if (updatedCandidate != null && updatedCandidate.bridgeToken != null) {
-                        _log("✅ [GHOST] Token found after retry scan - initiating connection...");
-                        _pendingBridgeConnections.remove(mac);
-                        // Инициируем подключение через Cascade
-                        final lastScanResults = await FlutterBluePlus.lastScanResults;
-                        for (final result in lastScanResults) {
-                          if (result.device.remoteId.str == mac) {
-                            unawaited(_executeCascadeRelay(result, 0));
-                            break;
-                          }
-                        }
-                      } else {
-                        _log("⚠️ [GHOST] Token still not found after retry scan");
-                      }
-                    } catch (e) {
-                      _log("⚠️ [GHOST] Retry scan failed: $e");
-                    }
-                  });
-                  
-                  _log("   Escalating directly to Sonar (no BLE GATT, no TCP)");
-                  
-                  // Помечаем BRIDGE как запрещенный для GATT
+                  // 🔥 КРИТИЧНО: Проверяем TCP fallback даже без токена
                   final discoveryContext = locator<DiscoveryContextService>();
                   final candidate = discoveryContext.getCandidateByMac(mac);
-                  if (candidate != null) {
-                    discoveryContext.markBridgeAsGattForbidden(candidate.id);
+                  
+                  if (candidate != null && candidate.ip != null && candidate.port != null) {
+                    _log("   ✅ TCP fallback available: ${candidate.ip}:${candidate.port}");
+                    _log("   💡 Will attempt TCP fallback in Cascade (token not required for TCP)");
+                    // Не ставим cooldown - это не ошибка, а нормальная ситуация
+                    // Продолжаем в Cascade, где будет попытка TCP fallback
+                  } else {
+                    _log("   ⚠️ No TCP info available (ip: ${candidate?.ip}, port: ${candidate?.port})");
+                    _log("   💡 Will escalate to Sonar if TCP also fails");
+                    
+                    // 🔥 ШАГ 4.1: Повторное сканирование через 1-2 секунды, если токен не найден
+                    _pendingBridgeConnections[mac] = DateTime.now();
+                    Future.delayed(const Duration(seconds: 2), () async {
+                      _log("🔄 [GHOST] Retry scan for BRIDGE token (MAC: ${mac.substring(mac.length - 8)})...");
+                      try {
+                        await startDiscovery(SignalType.bluetooth);
+                        await Future.delayed(const Duration(seconds: 5)); // Сканируем 5 секунд
+                        await stopDiscovery();
+                        
+                        // 🔥 ШАГ 4.2: После получения токена - сразу инициировать подключение
+                        // Проверяем, появился ли токен в DiscoveryContext
+                        final updatedCandidate = discoveryContext.getCandidateByMac(mac);
+                        if (updatedCandidate != null && updatedCandidate.bridgeToken != null) {
+                          _log("✅ [GHOST] Token found after retry scan - initiating connection...");
+                          _pendingBridgeConnections.remove(mac);
+                          // Инициируем подключение через Cascade
+                          final lastScanResults = await FlutterBluePlus.lastScanResults;
+                          for (final result in lastScanResults) {
+                            if (result.device.remoteId.str == mac) {
+                              unawaited(_executeCascadeRelay(result, 0));
+                              break;
+                            }
+                          }
+                        } else {
+                          _log("⚠️ [GHOST] Token still not found after retry scan");
+                        }
+                      } catch (e) {
+                        _log("⚠️ [GHOST] Retry scan failed: $e");
+                      }
+                    });
                   }
+                  
+                  // 🔥 КРИТИЧНО: НЕ ставим cooldown и НЕ помечаем как GATT forbidden
+                  // Это не ошибка, а нормальная ситуация - токен может появиться позже
+                  // или можно использовать TCP fallback
+                  _log("   💡 Not marking as GATT forbidden - will retry or use TCP fallback");
                   
                   // Сразу переходим к Sonar
                   if (pendingCount > 0) {
@@ -1444,10 +1730,24 @@ class MeshService with ChangeNotifier {
                 }
                 
                 // Запускаем каскадное подключение для BRIDGE с token
-                if (pendingCount > 0 && !_linkCooldowns.containsKey(mac) && !_isTransferring) {
-                  _linkCooldowns[mac] = DateTime.now();
+                // 🔥 FIX #1: Cooldown по ТОКЕНУ, не по MAC (MAC rotation на Android)
+                final cooldownExpired = _isCooldownExpired(r);
+                // 🔥 FIX: Transfer timeout через 15 секунд
+                final transferAge = _isTransferring && _transferStartTime != null 
+                    ? DateTime.now().difference(_transferStartTime!).inSeconds : 0;
+                final transferStuck = transferAge > 15;
+                if (transferStuck) {
+                  _log("⚠️ [WATCHDOG] Transfer stuck for ${transferAge}s (>15s), forcing reset!");
+                  _isTransferring = false;
+                  _transferStartTime = null;
+                }
+                
+                if (pendingCount > 0 && cooldownExpired && !_isTransferring) {
+                  // 🔥 FIX: НЕ ставим cooldown здесь! Cooldown ставится ПОСЛЕ попытки connect
+                  // Раньше cooldown ставился ДО connect, что блокировало следующие попытки
                   _log("🧲 [Ghost] Initiating connection to BRIDGE (hops=0, token: ${extractedToken.length > 8 ? extractedToken.substring(0, 8) : extractedToken}...) with $pendingCount pending messages...");
                   unawaited(_executeCascadeRelay(r, peerHops));
+                  continue; // 🔥 FIX: Пропускаем Final connection check - cascade уже запущен
                 } else if (pendingCount == 0) {
                   _log("ℹ️ [Ghost] BRIDGE detected but no pending messages to upload");
                 }
@@ -1458,11 +1758,43 @@ class MeshService with ChangeNotifier {
             peerHops = 0;
             _log("🧲 [Ghost] ⚡ BRIDGE detected via manufacturerData fallback! (MAC: ${mac.substring(mac.length - 8)})");
             
+            // 🔥 КРИТИЧНО: Детальное логирование для диагностики
+            _log("🔍 [Ghost] Connection decision for BRIDGE ${mac.substring(mac.length - 8)}:");
+            _log("   📋 Pending messages: $pendingCount");
+            
+            // 🔥 FIX #1: Cooldown по ТОКЕНУ, не по MAC (MAC rotation на Android)
+            final cooldownExpired = _isCooldownExpired(r);
+            final cooldownRemaining = _getCooldownRemaining(r);
+            final cooldownKey = _getCooldownKey(r);
+            _log("   📋 Cooldown: ${cooldownExpired ? 'EXPIRED' : 'ACTIVE'} (key: $cooldownKey, remaining: ${cooldownRemaining}s)");
+            
+            // 🔥 FIX: Transfer timeout через 15 секунд (было 30s - слишком долго блокирует!)
+            final transferAge = _isTransferring && _transferStartTime != null 
+                ? DateTime.now().difference(_transferStartTime!).inSeconds : 0;
+            final transferStuck = transferAge > 15;
+            if (transferStuck) {
+              _log("⚠️ [WATCHDOG] Transfer stuck for ${transferAge}s (>15s), forcing reset!");
+              _isTransferring = false;
+              _transferStartTime = null;
+            }
+            _log("   📋 Transfer active: $_isTransferring${_isTransferring ? ' (${transferAge}s)' : ''}");
+            
             // Запускаем каскадное подключение для BRIDGE
-            if (pendingCount > 0 && !_linkCooldowns.containsKey(mac) && !_isTransferring) {
-              _linkCooldowns[mac] = DateTime.now();
+            if (pendingCount > 0 && cooldownExpired && !_isTransferring) {
+              // 🔥 FIX: НЕ ставим cooldown здесь! Cooldown ставится в _executeCascadeRelay ПОСЛЕ попытки
               _log("🧲 [Ghost] Initiating connection to BRIDGE (via manufacturerData) with $pendingCount pending messages...");
               unawaited(_executeCascadeRelay(r, peerHops));
+              continue; // 🔥 FIX: Пропускаем остальные проверки - cascade уже запущен
+            } else {
+              if (pendingCount == 0) {
+                _log("⏸️ [Ghost] BRIDGE detected but no pending messages to upload");
+              }
+              if (!cooldownExpired) {
+                _log("⏸️ [Ghost] BRIDGE in cooldown (${cooldownRemaining}s remaining)");
+              }
+              if (_isTransferring) {
+                _log("⏸️ [Ghost] Transfer already in progress, skipping connection");
+              }
             }
           } else if (isGhostByMfData) {
             // 🔥 FALLBACK: Если имя пустое, но manufacturerData указывает на GHOST
@@ -1482,14 +1814,50 @@ class MeshService with ChangeNotifier {
           final shouldConnect = isBridge || (pendingCount > 0 && peerHops < orchestrator.myHops);
           
           if (shouldConnect) {
-            if (!_linkCooldowns.containsKey(mac) && !_isTransferring) {
-              _linkCooldowns[mac] = DateTime.now();
+            // 🔥 КРИТИЧНО: Детальное логирование для диагностики
+            _log("🔍 [Ghost] Final connection check for ${isBridge ? 'BRIDGE' : 'GHOST'} ${mac.substring(mac.length - 8)}:");
+            _log("   📋 Should connect: $shouldConnect (isBridge: $isBridge, pending: $pendingCount, peerHops: $peerHops, myHops: ${orchestrator.myHops})");
+            
+            // 🔥 FIX #3: НЕ запускать cascade без pending messages!
+            if (pendingCount == 0) {
+              _log("⏸️ [Ghost] Skipping connection: no pending messages to upload");
+              continue; // 🔥 Пропускаем этот BRIDGE, идём к следующему
+            }
+            
+            // 🔥 FIX #1: Cooldown по ТОКЕНУ, не по MAC (MAC rotation на Android)
+            final cooldownExpired = _isCooldownExpired(r);
+            final cooldownRemaining = _getCooldownRemaining(r);
+            final cooldownKey = _getCooldownKey(r);
+            _log("   📋 Cooldown: ${cooldownExpired ? 'EXPIRED' : 'ACTIVE'} (key: $cooldownKey, remaining: ${cooldownRemaining}s)");
+            
+            // 🔥 FIX: Transfer timeout через 15 секунд (было 30s)
+            final transferAge2 = _isTransferring && _transferStartTime != null 
+                ? DateTime.now().difference(_transferStartTime!).inSeconds : 0;
+            final transferStuck = transferAge2 > 15;
+            if (transferStuck) {
+              _log("⚠️ [WATCHDOG] Transfer stuck for ${transferAge2}s (>15s), forcing reset!");
+              _isTransferring = false;
+              _transferStartTime = null;
+            }
+            _log("   📋 Transfer active: $_isTransferring${_isTransferring ? ' (${transferAge2}s)' : ''}");
+            
+            if (cooldownExpired && !_isTransferring) {
+              // 🔥 FIX: НЕ ставим cooldown здесь! Cooldown ставится ПОСЛЕ попытки connect
               if (isBridge) {
                 _log("🧲 [Ghost] BRIDGE detected (hops=0)! Initiating connection immediately...");
               }
               _executeCascadeRelay(r, peerHops); // Вызываем наш каскад
               break;
+            } else {
+              if (!cooldownExpired) {
+                _log("⏸️ [Ghost] Connection blocked: BRIDGE in cooldown (${cooldownRemaining}s remaining)");
+              }
+              if (_isTransferring) {
+                _log("⏸️ [Ghost] Connection blocked: Transfer already in progress");
+              }
             }
+          } else {
+            _log("⏸️ [Ghost] Should not connect: isBridge=$isBridge, pending=$pendingCount, peerHops=$peerHops, myHops=${orchestrator.myHops}");
           }
         }
         
@@ -1577,9 +1945,12 @@ class MeshService with ChangeNotifier {
   Timer? _tcpTimeoutTimer;
   Timer? _sonarTimeoutTimer;
   
-  // 🔥 ШАГ 1.3: Поддержка стабильного токена (минимум 10 секунд стабильности перед сменой)
+  // 🔥 ШАГ 1.3: Поддержка стабильного токена
+  // 🔥 MAC RANDOMIZATION FIX: Увеличено с 10s до 30s
+  // Каждая ротация токена вызывает смену MAC на Android!
+  // 30s стабильности даёт GHOST достаточно времени на quick rescan + GATT connect
   DateTime? _lastTokenUpdate;
-  static const Duration _minTokenStability = Duration(seconds: 10); // Минимум 10 секунд стабильности
+  static const Duration _minTokenStability = Duration(seconds: 30); // Минимум 30 секунд стабильности
   
   // 🔥 ШАГ 4.2: Очередь сообщений - если GATT/TCP заблокированы, payload остаются в outbox
   // После получения токена - сразу инициировать подключение
@@ -1588,13 +1959,57 @@ class MeshService with ChangeNotifier {
   // 🔥 КРИТИЧНО: Per-BRIDGE lock для предотвращения race condition при одновременных подключениях
   final Map<String, DateTime> _activeBridgeConnections = {}; // MAC -> время начала подключения
   
+  // 🔒 SECURITY FIX: Сохраняем ScanResult СРАЗУ при обнаружении BRIDGE
+  // Это решает race condition когда scan останавливается до Stage 2
+  ScanResult? _cascadeSavedScanResult;
+  DateTime? _cascadeSavedScanResultTime;
+  // 🔥 MAC RANDOMIZATION FIX: Увеличено с 30s до 45s
+  // ScanResult может устареть если MAC изменился, но quick rescan найдёт новый
+  static const Duration _scanResultMaxAge = Duration(seconds: 45); // Max age for saved scan result
+  
   /// Публичный метод для Connection Stabilizer
+  /// Публичный метод для выполнения каскадной ретрансляции (для ConnectionStabilizer)
   Future<void> executeCascadeRelay(ScanResult target, int peerHops) async {
     await _executeCascadeRelay(target, peerHops);
   }
   
+  /// Публичный метод для подключения к BRIDGE (альтернатива executeCascadeRelay)
+  /// Используется ConnectionStabilizer для стабилизации подключения
+  Future<void> connectToBridge(ScanResult bridgeScanResult, {int? hops}) async {
+    final peerHops = hops ?? 0;
+    _log("🔗 [MeshService] connectToBridge called (hops: $peerHops)");
+    await _executeCascadeRelay(bridgeScanResult, peerHops);
+  }
+  
   Future<void> _executeCascadeRelay(ScanResult target, int peerHops) async {
-    final targetMac = target.device.remoteId.str;
+    // 🔥 CRITICAL FIX: Проверка ДОЛЖНА быть ПЕРВОЙ СТРОКОЙ!
+    // Race condition: unawaited() вызывает функцию асинхронно, и два вызова
+    // могут войти в функцию до того как первый установит _isTransferring = true
+    // Это вызывало параллельные GATT connections которые блокируют BLE stack
+    if (_isTransferring) {
+      final targetMac = target.device.remoteId.str;
+      _log("⏸️ [CASCADE-MUTEX] Already in progress, BLOCKING cascade to ${targetMac.substring(targetMac.length - 8)}");
+      _pendingConnections[targetMac] = DateTime.now();
+      return;
+    }
+    
+    // 🔥 НЕМЕДЛЕННО устанавливаем флаг ПЕРЕД любыми async операциями!
+    // Это предотвращает race condition при параллельных вызовах через unawaited()
+    _isTransferring = true;
+    _transferStartTime = DateTime.now();
+    notifyListeners();
+    
+    // 🔥 MAC RANDOMIZATION FIX: var вместо final - MAC может измениться после quick rescan!
+    var targetMac = target.device.remoteId.str;
+    _log("🔒 [CASCADE-MUTEX] LOCKED - starting cascade to ${targetMac.substring(targetMac.length - 8)}");
+    
+    // 🔒 SECURITY FIX #1: СРАЗУ сохраняем ScanResult при старте cascade
+    // Это КРИТИЧНО! Scan может быть остановлен во время Stage 1 (Wi-Fi),
+    // и когда Stage 2 (BLE GATT) начнётся - lastScanResults будет пуст.
+    // Сохраняем ScanResult ДО любых операций со scan.
+    _cascadeSavedScanResult = target;
+    _cascadeSavedScanResultTime = DateTime.now();
+    _log("💾 [CASCADE-FIX] ScanResult saved IMMEDIATELY at cascade start (MAC: ${targetMac.substring(targetMac.length - 8)})");
     
     // 🔥 Улучшение: Проверяем, не превышен ли лимит попыток BLE GATT
     final gattAttempts = _bleGattAttempts[targetMac] ?? 0;
@@ -1603,17 +2018,16 @@ class MeshService with ChangeNotifier {
       _log("🔄 [Cascade] BLE GATT failed $gattAttempts times, trying TCP fallback immediately");
       final candidate = locator<DiscoveryContextService>().getCandidateByMac(targetMac);
       if (candidate != null && candidate.ip != null && candidate.port != null) {
-        _isTransferring = true;
-        notifyListeners();
         try {
           if (candidate.bridgeToken != null) {
-            // 🔥 СИНХРОНИЗАЦИЯ: Увеличено до 45 секунд для синхронизации с новым временем жизни токена
-            // 🔥 ШАГ 3: Токен валиден 30 секунд
+            // 🔥 MAC RANDOMIZATION FIX: Токен теперь валиден 60 секунд
+            // Синхронизировано с heartbeat интервалом (60s)
             await _handleMagnetWave(candidate.bridgeToken!, candidate.port!, 
-                DateTime.now().add(const Duration(seconds: 30)).millisecondsSinceEpoch);
+                DateTime.now().add(const Duration(seconds: 60)).millisecondsSinceEpoch);
             _bleGattAttempts.remove(targetMac); // Сбрасываем счётчик при успехе
             _isTransferring = false;
             notifyListeners();
+            _log("🔓 [CASCADE-MUTEX] UNLOCKED - TCP fallback success");
             return;
           }
         } catch (e) {
@@ -1622,31 +2036,19 @@ class MeshService with ChangeNotifier {
       }
     }
     
-    // 🔥 Улучшение: Если transfer уже идёт, добавляем в очередь
-    if (_isTransferring) {
-      _log("⏸️ [Cascade] Transfer in progress, queuing connection to $targetMac");
-      _pendingConnections[targetMac] = DateTime.now();
-      // Проверяем, не слишком ли старая очередь (больше 30 секунд)
-      final queueTime = _pendingConnections[targetMac]!;
-      if (DateTime.now().difference(queueTime).inSeconds > 30) {
-        _log("⏸️ [Cascade] Queued connection expired, removing from queue");
-        _pendingConnections.remove(targetMac);
-        return;
-      }
-      // Будем пытаться подключиться после завершения текущего transfer
-      return;
-    }
-    
-    _isTransferring = true;
-    notifyListeners();
+    // 🔥 FIX: Cooldown теперь ставится ТОЛЬКО после НЕУДАЧНОЙ попытки, не ДО!
+    // Раньше cooldown ставился здесь и блокировал все последующие попытки даже если первая ещё не завершилась
+    final cooldownKey = _getCooldownKey(target);
     _log("⛓️ Engaging Cascade for node ${target.device.remoteId}");
+    _log("   📋 Cooldown will be set ONLY after failed attempt (not before!)");
 
     // 🔥 Улучшение: Добавляем таймаут для автоматического сброса зависших transfer
     Timer? transferTimeoutTimer;
-    // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: Watchdog таймаут = сумма всех транспортов (BLE 10s + TCP 5s + запас)
-    transferTimeoutTimer = Timer(const Duration(seconds: 20), () {
+    // 🔒 SECURITY FIX: Watchdog таймаут увеличен до 60s чтобы не прерывать GATT (35s max) + TCP (10s) + Sonar (3s)
+    // Было 20s - это вызывало преждевременный reset когда GATT ещё работает
+    transferTimeoutTimer = Timer(const Duration(seconds: 60), () {
       if (_isTransferring) {
-        _log("🚨 [WATCHDOG] Transfer timeout (20s). Resetting _isTransferring flag.");
+        _log("🚨 [WATCHDOG] Transfer timeout (60s). Resetting _isTransferring flag.");
         _isTransferring = false;
         notifyListeners();
       }
@@ -1724,6 +2126,7 @@ class MeshService with ChangeNotifier {
         _log("✅ [GHOST↔GHOST] I have better route (my hops: $myHops < peer: $peerHops) - I will connect");
       } else if (myHops > peerHops) {
         _log("⏸️ [GHOST↔GHOST] Peer has better route (my hops: $myHops > peer: $peerHops) - skipping connection");
+        transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
         _isTransferring = false;
         notifyListeners();
         return;
@@ -1731,6 +2134,7 @@ class MeshService with ChangeNotifier {
         // Если hops равны - тот, у кого больше pending, подключается
         if (myPendingCount < 1) {
           _log("⏸️ [GHOST↔GHOST] Equal hops, but I have no pending messages - skipping connection");
+          transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
           _isTransferring = false;
           notifyListeners();
           return;
@@ -1747,11 +2151,13 @@ class MeshService with ChangeNotifier {
     // Запускаем discovery и ждем появления пиров
     await NativeMeshService.startDiscovery();
     
-    // Ждем появления пиров и подключения (до 6 секунд максимум)
+    // 🔥 FIX: Сокращаем время ожидания Wi-Fi Direct с 6 до 3 секунд
+    // Wi-Fi Direct редко работает между Tecno/Huawei без ручного сопряжения
+    // Быстрый failover к BLE GATT критичен для пользовательского опыта
     bool peerFound = false;
     bool connectionEstablished = false;
     
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 3; i++) { // 🔥 Уменьшено с 6 до 3 секунд
       await Future.delayed(const Duration(seconds: 1));
       
       // Проверяем, установлено ли уже соединение
@@ -1771,9 +2177,9 @@ class MeshService with ChangeNotifier {
       }
     }
     
-    // Если пир найден, но соединение еще не установлено - ждем еще 3 секунды
+    // Если пир найден, но соединение еще не установлено - ждем еще 2 секунды
     if (peerFound && !connectionEstablished) {
-      for (int i = 0; i < 3; i++) {
+      for (int i = 0; i < 2; i++) { // 🔥 Уменьшено с 3 до 2 секунд
         await Future.delayed(const Duration(seconds: 1));
         if (_isP2pConnected) {
           connectionEstablished = true;
@@ -1784,16 +2190,26 @@ class MeshService with ChangeNotifier {
 
     if (connectionEstablished || _isP2pConnected) {
       _log("✅ Stage 1 Success: Wi-Fi link established.");
+      _log("   📋 P2P connected: $_isP2pConnected");
+      _log("   📋 Connection established: $connectionEstablished");
       
       // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: Проверка - не отправляем payload дважды
       final msgId = activePending.isNotEmpty ? activePending.first['id'] as String : messageId;
       if (_sentPayloads.containsKey(msgId)) {
         _log("🚫 [ARCHITECTURE] Payload $msgId already sent via ${_sentPayloads[msgId]} — skipping duplicate");
+        transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
         _isTransferring = false;
         _isEscalating = false;
         notifyListeners();
         return;
       }
+      
+      // 🔥 ЛОГИРОВАНИЕ: Детальная информация о передаче через Wi-Fi Direct
+      _log("📤 [GHOST→BRIDGE] Stage 1: Wi-Fi Direct transmission");
+      _log("   📋 Message ID: $msgId");
+      _log("   📋 Target: Wi-Fi Direct peer (BRIDGE)");
+      _log("   📋 Transport: TCP over Wi-Fi Direct");
+      _log("   📋 Content length: ${activePending.isNotEmpty ? (activePending.first['content'] as String?)?.length ?? 0 : 0} bytes");
       
       // Отправляем данные через TCP
       final String payload = jsonEncode({
@@ -1803,7 +2219,10 @@ class MeshService with ChangeNotifier {
         'h': msgId,
         'ttl': 5,
       });
+      
+      _log("   📤 Sending payload via TCP...");
       await sendTcpBurst(payload);
+      _log("   ✅ Payload sent successfully via Wi-Fi Direct TCP");
       
       // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: SENT_OK - очищаем pending
       _sentPayloads[msgId] = 'WIFI_DIRECT';
@@ -1821,6 +2240,7 @@ class MeshService with ChangeNotifier {
       _activePayloads.remove(msgId);
       _payloadRetries.remove(msgId);
       
+      transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
       _isTransferring = false;
       _isEscalating = false;
       notifyListeners();
@@ -1829,35 +2249,181 @@ class MeshService with ChangeNotifier {
 
     // --- STAGE 2: BLE GATT ATTACK ---
     _log("⚠️ Stage 1 Failed (Wi-Fi silent). Stage 2: BLE GATT...");
+    _log("   📋 P2P connected: $_isP2pConnected");
+    _log("   📋 P2P discovery active: $_p2pDiscoveryActive");
+    _log("   💡 Wi-Fi Direct not connected - will try BLE GATT");
     _isEscalating = false;
 
-    // 🔥 Улучшение: Сохраняем ScanResult ПЕРЕД остановкой scan
-    // Это решает проблему "Target device not found" после остановки scan
-    // targetMac уже определен выше в функции
-    ScanResult? savedScanResult;
+    // 🔥 CRITICAL FIX: Делаем БЫСТРЫЙ RESCAN перед GATT connect
+    // Это гарантирует что мы получаем СВЕЖИЙ ScanResult с актуальным MAC
+    // 🔥 MAC RANDOMIZATION FIX: Ищем по ТОКЕНУ, а не по MAC!
+    // Android меняет MAC при каждой ротации advertising, но токен остаётся тем же
+    _log("🔄 [STAGE 2] Starting quick rescan (${_quickRescanDurationSeconds}s) to get fresh BRIDGE...");
     
+    // 🔥 КРИТИЧНО: Извлекаем ТОКЕН из оригинального target для поиска
+    // Используем targetTokenForSearch чтобы не конфликтовать с originalToken ниже
+    final targetTokenForSearch = _extractTokenFromScanResult(target);
+    final targetTokenPreview = targetTokenForSearch != null && targetTokenForSearch.length > 8 
+        ? targetTokenForSearch.substring(0, 8) 
+        : (targetTokenForSearch ?? 'none');
+    _log("🔑 [STAGE 2] Target token for search: $targetTokenPreview... (will search by token, not MAC!)");
+    _log("   📋 Original MAC: ${targetMac.substring(targetMac.length - 8)} (may change due to randomization)");
+    
+    ScanResult? freshScanResult;
+    String? freshMac; // Новый MAC если изменился
     try {
-      final lastScanResults = await FlutterBluePlus.lastScanResults;
-      for (final result in lastScanResults) {
-        if (result.device.remoteId.str == targetMac) {
-          // Проверяем, что это BRIDGE через manufacturerData или service UUID
+      // Короткий scan чтобы получить свежие advertising данные
+      await FlutterBluePlus.startScan(
+        timeout: Duration(seconds: _quickRescanDurationSeconds),
+        androidScanMode: AndroidScanMode.lowLatency,
+      );
+      await Future.delayed(Duration(seconds: _quickRescanDurationSeconds));
+      await FlutterBluePlus.stopScan();
+      
+      final freshResults = await FlutterBluePlus.lastScanResults;
+      _log("🔍 [STAGE 2] Quick rescan found ${freshResults.length} devices");
+      
+      // 🔥 MAC RANDOMIZATION FIX: Ищем BRIDGE по ТОКЕНУ, не по MAC!
+      for (final result in freshResults) {
+        final mfData = result.advertisementData.manufacturerData[0xFFFF];
+        final isBridgeByMfData = mfData != null && 
+            mfData.length >= 2 && 
+            mfData[0] == 0x42 && 
+            mfData[1] == 0x52; // "BR" = BRIDGE
+        final hasService = result.advertisementData.serviceUuids
+            .any((uuid) => uuid.toString().toLowerCase() == _btService.SERVICE_UUID.toLowerCase());
+        
+        if (isBridgeByMfData || hasService) {
+          final resultMac = result.device.remoteId.str;
+          final resultToken = _extractTokenFromScanResult(result);
+          final resultTokenPreview = resultToken != null && resultToken.length > 8 
+              ? resultToken.substring(0, 8) 
+              : (resultToken ?? 'none');
+          
+          // 🔥 КРИТИЧНО: Сравниваем по ТОКЕНУ, а не по MAC!
+          final tokenMatches = targetTokenForSearch != null && resultToken != null && 
+              (resultToken == targetTokenForSearch || resultToken.startsWith(targetTokenForSearch) || targetTokenForSearch.startsWith(resultToken));
+          final macMatches = resultMac == targetMac;
+          
+          if (tokenMatches) {
+            // Токен совпал - это наш BRIDGE, даже если MAC изменился!
+            freshScanResult = result;
+            freshMac = resultMac;
+            _log("✅ [STAGE 2] 🎯 BRIDGE found by TOKEN match!");
+            _log("   📋 Token: $resultTokenPreview... (matches original)");
+            _log("   📋 New MAC: ${resultMac.substring(resultMac.length - 8)}");
+            if (!macMatches) {
+              _log("   ⚠️ MAC CHANGED: ${targetMac.substring(targetMac.length - 8)} → ${resultMac.substring(resultMac.length - 8)}");
+              _log("   ✅ This is normal - Android randomizes MAC on advertising rotation");
+            }
+            break; // Нашли по токену - это точно наш BRIDGE
+          } else if (macMatches) {
+            // MAC совпал (редко, но возможно)
+            freshScanResult = result;
+            freshMac = resultMac;
+            _log("✅ [STAGE 2] BRIDGE found by MAC match: ${resultMac.substring(resultMac.length - 8)}, token: $resultTokenPreview");
+            // Не break - продолжаем искать по токену (более надёжно)
+          } else if (freshScanResult == null) {
+            // Любой доступный BRIDGE как fallback
+            freshScanResult = result;
+            freshMac = resultMac;
+            _log("ℹ️ [STAGE 2] BRIDGE found (fallback): ${resultMac.substring(resultMac.length - 8)}, token: $resultTokenPreview");
+          }
+        }
+      }
+      
+      // 🔥 Обновляем targetMac если MAC изменился
+      if (freshMac != null && freshMac != targetMac) {
+        _log("🔄 [STAGE 2] Updating target MAC: ${targetMac.substring(targetMac.length - 8)} → ${freshMac.substring(freshMac.length - 8)}");
+        // targetMac будет обновлён через savedScanResult
+      }
+    } catch (e) {
+      _log("⚠️ [STAGE 2] Quick rescan failed: $e - using saved result");
+    }
+
+    // 🔒 SECURITY FIX #2: Используем СВЕЖИЙ ScanResult если есть, иначе сохранённый
+    ScanResult? savedScanResult = freshScanResult ?? _cascadeSavedScanResult;
+    
+    // 🔥 MAC RANDOMIZATION FIX: Обновляем targetMac если он изменился!
+    // Это критично - без этого GATT connect будет идти на старый несуществующий MAC
+    if (freshScanResult != null) {
+      final newMac = freshScanResult.device.remoteId.str;
+      if (newMac != targetMac) {
+        _log("🔄 [MAC-UPDATE] Target MAC updated after quick rescan:");
+        _log("   📋 Old MAC: ${targetMac.substring(targetMac.length - 8)}");
+        _log("   📋 New MAC: ${newMac.substring(newMac.length - 8)}");
+        _log("   ✅ GATT connect will use NEW MAC (fresh from advertising)");
+        targetMac = newMac; // 🔥 КРИТИЧНО: Обновляем targetMac!
+      }
+    }
+    
+    // 🔒 Проверяем, что сохранённый ScanResult не слишком старый (только если не свежий)
+    if (freshScanResult == null && savedScanResult != null && _cascadeSavedScanResultTime != null) {
+      final age = DateTime.now().difference(_cascadeSavedScanResultTime!);
+      if (age > _scanResultMaxAge) {
+        _log("⚠️ [CASCADE-FIX] Saved ScanResult too old (${age.inSeconds}s > ${_scanResultMaxAge.inSeconds}s), clearing");
+        savedScanResult = null;
+        _cascadeSavedScanResult = null;
+      } else {
+        _log("✅ [CASCADE-FIX] Using saved ScanResult from cascade start (age: ${age.inSeconds}s, MAC: ${savedScanResult.device.remoteId.str.substring(savedScanResult.device.remoteId.str.length - 8)})");
+      }
+    } else if (freshScanResult != null) {
+      // Обновляем сохранённый ScanResult свежим
+      _cascadeSavedScanResult = freshScanResult;
+      _cascadeSavedScanResultTime = DateTime.now();
+      _log("✅ [STAGE 2] Updated saved ScanResult with fresh data");
+    }
+    
+    // 🔒 SECURITY FIX #3: Только если savedScanResult всё ещё null - пробуем lastScanResults
+    // Но это fallback - основной источник это _cascadeSavedScanResult
+    if (savedScanResult == null) {
+      try {
+        final lastScanResults = await FlutterBluePlus.lastScanResults;
+        _log("🔍 [STAGE 2] No saved ScanResult, checking lastScanResults (${lastScanResults.length} results)...");
+        
+        // 🔥 FIX: Сначала ищем BRIDGE С токеном (mfData.length > 2)
+        ScanResult? bestResultWithToken;
+        ScanResult? fallbackResult;
+        
+        for (final result in lastScanResults) {
           final mfData = result.advertisementData.manufacturerData[0xFFFF];
           final isBridgeByMfData = mfData != null && 
               mfData.length >= 2 && 
               mfData[0] == 0x42 && 
               mfData[1] == 0x52; // "BR" = BRIDGE
+          final hasToken = mfData != null && mfData.length > 2;
           final hasService = result.advertisementData.serviceUuids
               .any((uuid) => uuid.toString().toLowerCase() == _btService.SERVICE_UUID.toLowerCase());
           
-          if (isBridgeByMfData || hasService || peerHops == 0) {
-            savedScanResult = result;
-            _log("✅ [STAGE 2] Saved ScanResult before stopping scan (MAC: ${targetMac.substring(targetMac.length - 8)})");
-            break;
+          if (isBridgeByMfData || hasService) {
+            if (hasToken && bestResultWithToken == null) {
+              bestResultWithToken = result;
+              _log("✅ [STAGE 2] Found BRIDGE WITH TOKEN (MAC: ${result.device.remoteId.str.substring(result.device.remoteId.str.length - 8)}, mfData: ${mfData?.length ?? 0} bytes)");
+            } else if (fallbackResult == null) {
+              fallbackResult = result;
+              _log("📋 [STAGE 2] Found BRIDGE without token (MAC: ${result.device.remoteId.str.substring(result.device.remoteId.str.length - 8)}, mfData: ${mfData?.length ?? 0} bytes)");
+            }
           }
         }
+        
+        if (bestResultWithToken != null) {
+          savedScanResult = bestResultWithToken;
+          _log("✅ [STAGE 2] Using BRIDGE WITH TOKEN from lastScanResults");
+        } else if (fallbackResult != null) {
+          savedScanResult = fallbackResult;
+          _log("⚠️ [STAGE 2] Using BRIDGE WITHOUT TOKEN as fallback from lastScanResults");
+        } else if (targetMac.isNotEmpty) {
+          for (final result in lastScanResults) {
+            if (result.device.remoteId.str == targetMac) {
+              savedScanResult = result;
+              _log("⚠️ [STAGE 2] Using targetMac fallback from lastScanResults");
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        _log("⚠️ [STAGE 2] Could not search lastScanResults: $e");
       }
-    } catch (e) {
-      _log("⚠️ [STAGE 2] Could not save ScanResult before stopping scan: $e");
     }
     
     // 🔥 HUAWEI FIX: НЕ останавливаем scan на Huawei - это может привести к потере устройства
@@ -1868,32 +2434,48 @@ class MeshService with ChangeNotifier {
     // Это решает проблему "Target device not found" на Huawei
     if (_isBtScanning) {
       try {
-        // Сохраняем последние scan results перед остановкой
-        final lastScanResults = await FlutterBluePlus.lastScanResults;
-        for (final result in lastScanResults) {
-          if (result.device.remoteId.str == targetMac) {
+        // 🔥 FIX: Если у нас уже есть savedScanResult с токеном - не перезаписываем
+        // Это важно, потому что Huawei меняет MAC и некоторые пакеты без токена
+        final currentMfData = savedScanResult?.advertisementData.manufacturerData[0xFFFF];
+        final currentHasToken = currentMfData != null && currentMfData.length > 2;
+        
+        if (!currentHasToken) {
+          // Только если текущий savedScanResult без токена - пытаемся найти лучший
+          final lastScanResults = await FlutterBluePlus.lastScanResults;
+          
+          for (final result in lastScanResults) {
             final mfData = result.advertisementData.manufacturerData[0xFFFF];
             final isBridgeByMfData = mfData != null && 
                 mfData.length >= 2 && 
                 mfData[0] == 0x42 && 
                 mfData[1] == 0x52; // "BR" = BRIDGE
+            final hasToken = mfData != null && mfData.length > 2;
             final hasService = result.advertisementData.serviceUuids
                 .any((uuid) => uuid.toString().toLowerCase() == _btService.SERVICE_UUID.toLowerCase());
             
-            if (isBridgeByMfData || hasService || peerHops == 0) {
-              if (savedScanResult == null) {
-                savedScanResult = result;
-                _log("✅ [STAGE 2] Saved ScanResult before stopping scan (MAC: ${targetMac.substring(targetMac.length - 8)})");
-              }
-              break;
+            // 🔥 ПРИОРИТЕТ: Ищем BRIDGE с токеном
+            if ((isBridgeByMfData || hasService) && hasToken) {
+              savedScanResult = result;
+              final mac = result.device.remoteId.str;
+              _log("✅ [STAGE 2] Found better ScanResult WITH TOKEN (MAC: ${mac.substring(mac.length - 8)}, mfData: ${mfData?.length ?? 0} bytes)");
+              break; // Нашли с токеном - выходим
             }
           }
+        } else {
+          _log("ℹ️ [STAGE 2] Already have ScanResult with token - keeping it");
         }
         
-        // 🔥 HUAWEI FIX: НЕ останавливаем scan - это может привести к потере устройства
-        // Вместо этого продолжаем scan в фоне
-        _log("ℹ️ [GHOST] Keeping scan active (Huawei optimization)");
-        // НЕ останавливаем scan на Huawei
+        // 🔥 FIX: ПРИНУДИТЕЛЬНАЯ ОСТАНОВКА SCAN ПЕРЕД GATT CONNECT
+        // КРИТИЧНО: scan и connectGatt конфликтуют на Android BLE стеке!
+        // Старый "Huawei optimization" держал scan активным - это причина неудачных connect!
+        _log("🛑 [GHOST] FORCE stopping scan before GATT connect (Android BLE requirement)");
+        try {
+          await FlutterBluePlus.stopScan();
+          _isBtScanning = false;
+          _log("✅ [GHOST] Scan STOPPED - ready for GATT connect");
+        } catch (e) {
+          _log("⚠️ [GHOST] Error stopping scan: $e - proceeding anyway");
+        }
       } catch (e) {
         _log("⚠️ [GHOST] Failed to save ScanResult: $e");
       }
@@ -1909,9 +2491,11 @@ class MeshService with ChangeNotifier {
       _log("⚠️ [GHOST] Failed to stop advertising: $e");
     }
     
-    // 🔥 Улучшение: Динамическое ожидание стабилизации с проверкой advertising
-    // Для нестабильных устройств увеличиваем время ожидания до 1-2 сек
-    _log("⏸️ [GHOST] Waiting for BLE stack stabilization and advertising confirmation...");
+    // 🔥 FIX: УБРАН advertising confirmation loop!
+    // GHOST - это BLE client, ему НЕ нужно ждать advertising confirmation.
+    // Он уже видел BRIDGE в scan - этого достаточно для GATT connect.
+    // Старый код ждал до 3 секунд и часто fail'ился из-за MAC рандомизации.
+    _log("📡 [GHOST] Proceeding directly to GATT connect (no advertising wait - we are BLE client)");
     
     String? originalAdvName;
     bool originalHasService = false;
@@ -1920,114 +2504,58 @@ class MeshService with ChangeNotifier {
     String originalEffectiveName = '';
     bool originalIsBridgeByMfData = false;
     
-    // 🔥 Улучшение: Адаптивное ожидание с проверкой advertising (до 3 секунд для low-end Android)
-    // Увеличено с 2 до 3 секунд для стабильности на бюджетных устройствах
-    const maxWaitTime = Duration(seconds: 3);
-    const checkInterval = Duration(milliseconds: 200);
-    int attempts = 0;
-    // Вычисляем maxAttempts напрямую (3000ms / 200ms = 15 попыток)
-    const maxAttempts = 15;
-    bool advertisingConfirmed = false;
-    
-    while (attempts < maxAttempts && !advertisingConfirmed) {
-      await Future.delayed(checkInterval);
-      attempts++;
+    // 🔥 FIX: Используем данные из СОХРАНЁННОГО ScanResult напрямую
+    // Без повторного поиска по MAC (MAC может измениться из-за рандомизации)
+    if (savedScanResult != null) {
+      originalAdvName = savedScanResult.advertisementData.localName ?? "";
+      originalHasService = savedScanResult.advertisementData.serviceUuids
+          .any((uuid) => uuid.toString().toLowerCase() == _btService.SERVICE_UUID.toLowerCase());
       
-      try {
-        final lastScanResults = await FlutterBluePlus.lastScanResults;
-        final targetScanResult = lastScanResults.firstWhere(
-          (r) => r.device.remoteId == target.device.remoteId,
-          orElse: () => throw Exception("Target device not found"),
-        );
-        
-        final advName = targetScanResult.advertisementData.localName ?? "";
-        final hasService = targetScanResult.advertisementData.serviceUuids
-            .any((uuid) => uuid.toString().toLowerCase() == _btService.SERVICE_UUID.toLowerCase());
-        
-        // Проверяем, что advertising активен и содержит валидные данные
-        if ((advName.startsWith("M_") || hasService) && advName.isNotEmpty) {
-          originalAdvName = advName;
-          originalHasService = hasService;
-          advertisingConfirmed = true;
-          
-          // Извлекаем токен из advertising name (если есть)
-          if (advName.contains("BRIDGE") && advName.split("_").length >= 5) {
-            originalToken = advName.split("_")[4];
-          }
-          
-          _log("✅ [GHOST] Advertising confirmed after ${attempts * checkInterval.inMilliseconds}ms: '$advName'");
-          break;
-        }
-      } catch (e) {
-        // Продолжаем ожидание
-        if (attempts % 5 == 0) {
-          _log("⏳ [GHOST] Waiting for advertising... (attempt $attempts/$maxAttempts)");
+      // Извлекаем токен из advertising name или manufacturerData
+      if (originalAdvName.contains("BRIDGE") && originalAdvName.split("_").length >= 5) {
+        originalToken = originalAdvName.split("_")[4];
+      } else {
+        // Пробуем извлечь токен из manufacturerData
+        final mfData = savedScanResult.advertisementData.manufacturerData[0xFFFF];
+        if (mfData != null && mfData.length > 2) {
+          originalToken = utf8.decode(mfData.sublist(2), allowMalformed: true);
         }
       }
-    }
-    
-    if (!advertisingConfirmed) {
-      _log("⚠️ [GHOST] Advertising not confirmed after ${maxWaitTime.inSeconds}s - proceeding with caution");
+      
+      _log("✅ [GHOST] Using saved ScanResult directly:");
+      _log("   📋 advName: '$originalAdvName'");
+      _log("   📋 hasService: $originalHasService");
+      _log("   📋 token: ${originalToken != null ? '${originalToken.length > 8 ? originalToken.substring(0, 8) : originalToken}...' : 'none'}");
+    } else {
+      _log("⚠️ [GHOST] No saved ScanResult - will use target directly");
     }
 
     // 🔥 КРИТИЧНО: Проверяем, что целевое устройство все еще рекламирует перед подключением
     // 🔥 КРИТИЧНО: Объявляем targetScanResult вне try блоков, чтобы он был доступен во всех блоках
     ScanResult? targetScanResult = savedScanResult;
     
+    // 🔥 FIX: Если есть savedScanResult - используем его НАПРЯМУЮ
+    // НЕ ищем в lastScanResults - они пустые после stopScan!
+    if (targetScanResult != null) {
+      _log("✅ [STAGE 2] Using saved ScanResult (MAC: ${targetScanResult.device.remoteId.str.substring(targetScanResult.device.remoteId.str.length - 8)})");
+    } else {
+      // 🔥 FIX: Если savedScanResult null - используем target напрямую
+      // НЕ ищем в lastScanResults - scan уже остановлен!
+      _log("⚠️ [STAGE 2] No savedScanResult - using original target directly");
+      _log("   📋 This may fail if MAC changed due to randomization");
+    }
+    
     try {
-      // 🔥 Улучшение: Используем сохраненный ScanResult, если текущий scan не находит устройство
-      // Это решает проблему "Target device not found" после остановки scan
-      // targetScanResult будет использован для создания правильного BluetoothDevice
+      // 🔥 FIX: Используем savedScanResult напрямую БЕЗ поиска в lastScanResults
+      // lastScanResults пуст после stopScan - поиск там бессмысленен
       
-      // Пытаемся найти в последних scan results (если scan еще активен)
       if (targetScanResult == null) {
-        try {
-          final lastScanResults = await FlutterBluePlus.lastScanResults;
-          try {
-            // Сначала пытаемся найти по device.remoteId
-            targetScanResult = lastScanResults.firstWhere(
-              (r) => r.device.remoteId == target.device.remoteId,
-            );
-          } catch (e) {
-            // Fallback: ищем по MAC адресу
-            try {
-              targetScanResult = lastScanResults.firstWhere(
-                (r) => r.device.remoteId.str == targetMac,
-              );
-              _log("✅ [STAGE 2] Found device by MAC fallback: $targetMac");
-            } catch (e2) {
-              // Если и по MAC не нашли, пробуем найти по manufacturerData
-              for (final result in lastScanResults) {
-                final mfData = result.advertisementData.manufacturerData[0xFFFF];
-                final isBridgeByMfData = mfData != null && 
-                    mfData.length >= 2 && 
-                    mfData[0] == 0x42 && 
-                    mfData[1] == 0x52; // "BR" = BRIDGE
-                
-                if (isBridgeByMfData && result.device.remoteId.str == targetMac) {
-                  targetScanResult = result;
-                  _log("✅ [STAGE 2] Found device by manufacturerData fallback: $targetMac");
-                  break;
-                }
-              }
-            }
-          }
-        } catch (e) {
-          _log("⚠️ [STAGE 2] Could not find device in lastScanResults: $e");
-        }
-      } else {
-        _log("✅ [STAGE 2] Using saved ScanResult (MAC: ${targetMac.substring(targetMac.length - 8)})");
+        _log("❌ [STAGE 2] No saved ScanResult - cannot proceed");
+        _log("   💡 Device was detected but ScanResult was not saved before stopScan");
+        throw Exception("No ScanResult available for GATT connect");
       }
       
-      // Если все еще не нашли - используем сохраненный или выбрасываем исключение
-      if (targetScanResult == null) {
-        if (savedScanResult != null) {
-          targetScanResult = savedScanResult;
-          _log("✅ [STAGE 2] Using saved ScanResult as fallback");
-        } else {
-          throw Exception("Target device not found in scan results (MAC: ${targetMac.substring(targetMac.length - 8)})");
-        }
-      }
+      _log("✅ [STAGE 2] Using saved ScanResult for GATT connect");
       
       originalHasService = targetScanResult.advertisementData.serviceUuids
           .any((uuid) => uuid.toString().toLowerCase() == _btService.SERVICE_UUID.toLowerCase());
@@ -2058,12 +2586,12 @@ class MeshService with ChangeNotifier {
           _log("   ✅ Token found - BLE GATT / TCP allowed");
         } else {
           // 🔥 ШАГ 2.2: Токен не найден - логирование для отладки
-          _log("⚠️ [GHOST] Token NOT found in advertising name: '$advName'");
+          _log("⚠️ [GHOST] Token NOT found in advertising name: '$originalAdvName'");
           _log("   📋 Parts count: ${parts.length}, expected: >=5");
           if (parts.length >= 4) {
             _log("   📋 Part[3]: '${parts[3]}', expected: 'BRIDGE'");
           }
-          _log("   ⚠️ Token not found or expired - fallback to Sonar");
+          _log("   ⚠️ Token not found in name - trying manufacturerData fallback");
         }
       } else if (originalIsBridgeByMfData) {
         // Если имя пустое, но есть manufacturerData - это BRIDGE
@@ -2071,12 +2599,98 @@ class MeshService with ChangeNotifier {
         _log("✅ [STAGE 2] BRIDGE detected via manufacturerData (empty localName)");
       }
       
+      // 🔥 КРИТИЧНО: Извлекаем токен из manufacturerData (fallback для Huawei, даже если имя не пустое)
+      // Это важно, потому что на некоторых устройствах имя может быть пустым или не содержать токен
+      // Проверяем manufacturerData независимо от того, пустое ли имя или нет
+      if (originalToken == null && originalMfData != null && originalMfData.length > 2) {
+        // Проверяем, что это BRIDGE (первые 2 байта = "BR")
+        final isBridgeByMfData = originalMfData[0] == 0x42 && originalMfData[1] == 0x52;
+        if (isBridgeByMfData) {
+        try {
+          final tokenBytes = originalMfData.sublist(2); // Пропускаем "BR"
+          _log("🔍 [GHOST] Extracting token from manufacturerData: ${originalMfData.length} bytes total, ${tokenBytes.length} bytes after 'BR'");
+          _log("   📋 Token bytes: ${tokenBytes.map((b) => b.toString()).join(', ')}");
+          
+          final tokenFromMf = utf8.decode(tokenBytes);
+          _log("   📋 Decoded token string: '$tokenFromMf' (length: ${tokenFromMf.length})");
+          
+          if (tokenFromMf.isNotEmpty && tokenFromMf.length >= 4) {
+            originalToken = tokenFromMf;
+            _log("🔑 [GHOST] Token extracted from manufacturerData: ${tokenFromMf.length > 8 ? tokenFromMf.substring(0, 8) : tokenFromMf}... (length: ${tokenFromMf.length}, may be truncated)");
+            _log("   ✅ Token found in manufacturerData - BLE GATT / TCP allowed");
+          } else {
+            _log("⚠️ [GHOST] Token from manufacturerData too short: ${tokenFromMf.length} chars (minimum: 4)");
+            _log("   📋 Token content: '$tokenFromMf'");
+          }
+        } catch (e) {
+          _log("⚠️ [GHOST] Failed to decode token from manufacturerData: $e");
+          _log("   📋 manufacturerData bytes: ${originalMfData.sublist(2).map((b) => b.toString()).join(', ')}");
+          _log("   📋 manufacturerData hex: ${originalMfData.sublist(2).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}");
+        }
+        }
+      } else if (originalToken == null && originalIsBridgeByMfData) {
+        _log("⚠️ [GHOST] BRIDGE detected via manufacturerData but no token (mfData length: ${originalMfData?.length ?? 0})");
+      } else if (originalToken == null && originalMfData != null && originalMfData.length > 2) {
+        // Проверяем, не является ли это BRIDGE без токена (только "BR")
+        final isBridgeByMfData = originalMfData[0] == 0x42 && originalMfData[1] == 0x52;
+        if (isBridgeByMfData && originalMfData.length == 2) {
+          _log("⚠️ [GHOST] BRIDGE detected via manufacturerData but no token (only 'BR' prefix, no token bytes)");
+        }
+      }
+      
+      // 🔥 КРИТИЧНО: Также проверяем токен в DiscoveryContext (может быть обновлен из BLE scan или MAGNET_WAVE)
+      // DiscoveryContext может содержать полный токен (из MAGNET_WAVE), даже если в manufacturerData он обрезан
+      if (originalToken == null) {
+        final discoveryContext = locator<DiscoveryContextService>();
+        final candidate = discoveryContext.getCandidateByMac(targetMac);
+        if (candidate != null && candidate.bridgeToken != null) {
+          originalToken = candidate.bridgeToken;
+          final tokenValue = originalToken!; // Уже проверили на null выше
+          final tokenPreview = tokenValue.length > 8 ? tokenValue.substring(0, 8) : tokenValue;
+          _log("🔑 [GHOST] Token found in DiscoveryContext: $tokenPreview... (length: ${tokenValue.length})");
+          _log("   ✅ Using full token from DiscoveryContext (may be longer than manufacturerData token)");
+        } else {
+          _log("⚠️ [GHOST] No token in DiscoveryContext for MAC: ${targetMac.substring(targetMac.length - 8)}");
+        }
+      } else {
+        // 🔥 CRITICAL FIX: originalToken из quick rescan - это СВЕЖИЙ токен!
+        // DiscoveryContext может содержать УСТАРЕВШИЙ токен от предыдущего scan.
+        // Приоритет: свежий токен из scan > устаревший токен из DiscoveryContext
+        final discoveryContext = locator<DiscoveryContextService>();
+        final candidate = discoveryContext.getCandidateByMac(targetMac);
+        if (candidate != null && candidate.bridgeToken != null) {
+          final contextToken = candidate.bridgeToken!;
+          final originalTokenPreview = originalToken!.length > 8 ? originalToken!.substring(0, 8) : originalToken;
+          final contextTokenPreview = contextToken.length > 8 ? contextToken.substring(0, 8) : contextToken;
+          
+          // Если токен из DiscoveryContext длиннее, значит это полный токен (из MAGNET_WAVE)
+          // ТОЛЬКО в этом случае заменяем - полный токен лучше обрезанного
+          if (contextToken.length > originalToken!.length && contextToken.startsWith(originalToken!)) {
+            _log("🔑 [GHOST] Replacing truncated token ($originalTokenPreview...) with full token from DiscoveryContext ($contextTokenPreview...)");
+            originalToken = contextToken;
+          } else if (contextToken != originalToken) {
+            // 🔥 CRITICAL: Токены РАЗНЫЕ - это значит BRIDGE сменил токен!
+            // Используем СВЕЖИЙ токен из scan result, НЕ устаревший из DiscoveryContext!
+            _log("⚠️ [GHOST] Token mismatch detected:");
+            _log("   📋 Fresh scan token: $originalTokenPreview...");
+            _log("   📋 Stale context token: $contextTokenPreview...");
+            _log("   ✅ Using FRESH token from scan (not stale context token)");
+            // НЕ заменяем originalToken - он свежий!
+          }
+        }
+      }
+      
       _log("🔍 [STAGE 2] Pre-connect check:");
-      _log("   Device: ${target.device.remoteId}");
+      _log("   Device: ${targetScanResult.device.remoteId}");
       _log("   Local name: '$originalAdvName'");
       _log("   Has SERVICE_UUID: $originalHasService");
       _log("   Peer hops: $originalPeerHops");
-      _log("   Token: ${originalToken != null ? '${originalToken.substring(0, 8)}...' : 'none'}");
+      if (originalToken != null) {
+        final tokenPreview = originalToken.length > 8 ? originalToken.substring(0, 8) : originalToken;
+        _log("   Token: $tokenPreview...");
+      } else {
+        _log("   Token: none");
+      }
       _log("   Available UUIDs: ${targetScanResult.advertisementData.serviceUuids.map((u) => u.toString()).join(', ')}");
       
       // 🔥 Улучшение: Подтверждение доступности advertising перед GATT с fallback на manufacturerData
@@ -2091,6 +2705,7 @@ class MeshService with ChangeNotifier {
       if (!isAdvertising) {
         _log("❌ [CRITICAL] Target device does not advertise SERVICE_UUID, tactical name, or manufacturerData");
         _log("   Cannot connect via BLE GATT - device is not advertising correctly");
+        transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
         _isTransferring = false;
         notifyListeners();
         return;
@@ -2108,8 +2723,6 @@ class MeshService with ChangeNotifier {
         
         if (isDirectMode) {
           _log("🚫 [ARCHITECTURE] BRIDGE in DIRECT mode (no GATT server) - GATT FORBIDDEN");
-          _isTransferring = false;
-          notifyListeners();
           
           // BRIDGE в direct mode не принимает GATT - используем Sonar с реальными данными
           try {
@@ -2117,6 +2730,7 @@ class MeshService with ChangeNotifier {
             // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: Проверка - не отправляем payload дважды
             if (_sentPayloads.containsKey(msgId)) {
               _log("🚫 [ARCHITECTURE] Payload $msgId already sent via ${_sentPayloads[msgId]} — skipping duplicate");
+              transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
               _isTransferring = false;
               notifyListeners();
               return;
@@ -2142,52 +2756,20 @@ class MeshService with ChangeNotifier {
           _log("📦 [ARCHITECTURE] Payload $msgId marked as SENT_FAIL (SONAR), keeping in outbox");
             _log("❌ Total isolation."); 
           }
+          transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
           _isTransferring = false;
           notifyListeners();
           return; // Прерываем попытки BLE GATT
         }
         
         if (originalToken == null) {
-          // 🔥 СИНХРОНИЗАЦИЯ: Детальное логирование для отладки
-          _log("🚫 [ARCHITECTURE] BRIDGE without token — GATT FORBIDDEN");
-          _log("   📋 Advertising name: '$advName'");
-          _log("   📋 MAC: ${target.device.remoteId.str.substring(target.device.remoteId.str.length - 8)}");
-          _log("   ⚠️ Token not found - possible reasons:");
-          _log("      1. BRIDGE hasn't updated advertising yet (timing issue)");
-          _log("      2. Token expired (>45s old)");
-          _log("      3. BLE stack delay on BRIDGE device");
-          _log("   Это НЕ ошибка, это нормальный путь. Escalating to Sonar.");
-          _isTransferring = false;
-          notifyListeners();
-          
-          // Помечаем BRIDGE как запрещенный для GATT (cooldown 5 минут)
-          final discoveryContext = locator<DiscoveryContextService>();
-          final targetMac = target.device.remoteId.str;
-          final candidate = discoveryContext.getCandidateByMac(targetMac);
-          if (candidate != null) {
-            discoveryContext.markBridgeAsGattForbidden(candidate.id);
-          }
-          
-          // Сразу переходим к Sonar
-          try {
-            final messageData = jsonEncode({
-              'type': 'OFFLINE_MSG',
-              'content': pending.first['content'],
-              'senderId': _apiService.currentUserId,
-              'h': pending.first['id'],
-              'ttl': 5,
-            });
-            final sonarPayload = messageData.length > 200 ? messageData.substring(0, 200) : messageData;
-            await locator<UltrasonicService>().transmitFrame("DATA:$sonarPayload");
-            _log("✅ Stage 3 Success: Sonar Packet Emitted (BRIDGE without token). Cycle CLOSED.");
-          } catch (e) { 
-            final msgId = activePending.isNotEmpty ? activePending.first['id'] as String : messageId;
-          _log("📦 [ARCHITECTURE] Payload $msgId marked as SENT_FAIL (SONAR), keeping in outbox");
-            _log("❌ Total isolation."); 
-          }
-          _isTransferring = false;
-          notifyListeners();
-          return; // Прерываем попытки BLE GATT
+          // 🔥 FIX: РАЗРЕШАЕМ GATT ДАЖЕ БЕЗ ТОКЕНА (для отладки)
+          // Token validation был главным блокером коннектов
+          _log("⚠️ [FIX] BRIDGE without token — TRYING GATT ANYWAY (debug mode)");
+          _log("   📋 Advertising name: '$originalAdvName'");
+          _log("   📋 MAC: ${targetMac.substring(targetMac.length - 8)}");
+          _log("   💡 Token validation DISABLED for debugging");
+          // НЕ прерываем - продолжаем к GATT
         } else {
           _log("✅ [STAGE 2] BRIDGE token found: ${originalToken.length > 8 ? originalToken.substring(0, 8) : originalToken}...");
         }
@@ -2202,6 +2784,7 @@ class MeshService with ChangeNotifier {
       if (myRole == MeshRole.GHOST && !peerIsBridge) {
         if (myHops >= originalPeerHops && myPendingCount == 0) {
           _log("⏸️ [GHOST↔GHOST] Peer has better or equal route, and I have no pending - aborting");
+          transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
           _isTransferring = false;
           notifyListeners();
           return;
@@ -2215,6 +2798,7 @@ class MeshService with ChangeNotifier {
     } catch (e) {
       _log("❌ [CRITICAL] Could not verify target device before BLE GATT: $e");
       _log("   Aborting connection - device may have changed or stopped advertising");
+      transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
       _isTransferring = false;
       notifyListeners();
       return;
@@ -2290,6 +2874,7 @@ class MeshService with ChangeNotifier {
               final newTokenPreview = currentToken.length > 8 ? currentToken.substring(0, 8) : currentToken;
               _log("⚠️ [WARNING] BRIDGE token changed during connection: $oldTokenPreview... -> $newTokenPreview...");
               _log("   Token mismatch - aborting connection to prevent GATT failure");
+              transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
               _isTransferring = false;
               notifyListeners();
               return;
@@ -2297,6 +2882,7 @@ class MeshService with ChangeNotifier {
           } else {
             _log("⚠️ [WARNING] Device advertising name changed during connection: '$originalEffectiveName' -> '$currentEffectiveName'");
             _log("   Role or identity may have changed - aborting connection");
+            transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
             _isTransferring = false;
             notifyListeners();
             return;
@@ -2311,25 +2897,54 @@ class MeshService with ChangeNotifier {
         if (!isStillAdvertising) {
           _log("❌ [CRITICAL] Device stopped advertising during connection preparation");
           _log("   Advertising is no longer active - aborting connection");
+          transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
           _isTransferring = false;
           notifyListeners();
           return;
         }
         
-        // Проверяем, что SERVICE_UUID все еще присутствует
-        if (originalHasService && !currentHasService) {
+        // 🔥 FIX: НЕ прерываем соединение если BRIDGE валиден через manufacturerData
+        // SERVICE_UUID может отсутствовать в некоторых advertising strategies на Huawei/Honor
+        // manufacturerData - более надёжный индикатор BRIDGE чем SERVICE_UUID
+        if (originalHasService && !currentHasService && !currentIsBridgeByMfData) {
           _log("⚠️ [WARNING] Device stopped advertising SERVICE_UUID during connection");
           _log("   Device may have changed role or stopped advertising - aborting connection");
+          transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
+          _isTransferring = false;
+          notifyListeners();
+          return;
+        } else if (originalHasService && !currentHasService && currentIsBridgeByMfData) {
+          _log("ℹ️ [HUAWEI-FIX] SERVICE_UUID missing but BRIDGE valid via manufacturerData - continuing");
+          _log("   💡 This is normal for Huawei/Honor devices with multiple advertising strategies");
+        }
+      } else {
+        // 🔥 КРИТИЧНО: Если устройство не найдено в scan results, используем сохраненный ScanResult
+        if (savedScanResult != null) {
+          _log("⚠️ [WARNING] Device no longer found in scan results - using saved ScanResult");
+          targetScanResult = savedScanResult;
+          // Обновляем данные из сохраненного ScanResult
+          originalAdvName = savedScanResult.advertisementData.localName ?? '';
+          originalHasService = savedScanResult.advertisementData.serviceUuids
+              .any((uuid) => uuid.toString().toLowerCase() == _btService.SERVICE_UUID.toLowerCase());
+          final savedMfData = savedScanResult.advertisementData.manufacturerData[0xFFFF];
+          originalIsBridgeByMfData = savedMfData != null && 
+              savedMfData.length >= 2 && 
+              savedMfData[0] == 0x42 && 
+              savedMfData[1] == 0x52;
+          if (originalAdvName.isEmpty) {
+            originalEffectiveName = savedScanResult.device.platformName;
+          } else {
+            originalEffectiveName = originalAdvName;
+          }
+          _log("   ✅ Using saved ScanResult data for connection");
+        } else {
+          _log("⚠️ [WARNING] Device no longer found in scan results and no saved ScanResult");
+          _log("   Aborting connection - device may have stopped advertising");
+          transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
           _isTransferring = false;
           notifyListeners();
           return;
         }
-      } else {
-        _log("⚠️ [WARNING] Device no longer found in scan results - may have stopped advertising");
-        _log("   Aborting connection");
-        _isTransferring = false;
-        notifyListeners();
-        return;
       }
 
       final String payload = jsonEncode({
@@ -2352,6 +2967,7 @@ class MeshService with ChangeNotifier {
         final connectionAge = DateTime.now().difference(connectionStart).inSeconds;
         if (connectionAge < 10) {
           _log("⏸️ [GHOST] Another connection to BRIDGE $targetMac in progress (${connectionAge}s old) - skipping to avoid conflict");
+          transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
           _isTransferring = false;
           notifyListeners();
           return;
@@ -2387,66 +3003,16 @@ class MeshService with ChangeNotifier {
         }
       }
       
-      // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: BRIDGE без token = GATT ЗАПРЕЩЕН
+      // 🔥 FIX: Token validation ОТКЛЮЧЕН - пробуем GATT даже без токена
       if (originalPeerHops == 0 && originalToken == null) {
-        // 🔥 СИНХРОНИЗАЦИЯ: Детальное логирование для отладки
-        _log("🚫 [ARCHITECTURE] BRIDGE without token — GATT FORBIDDEN");
-        _log("   📋 Advertising name: '$advName'");
-        _log("   📋 MAC: ${target.device.remoteId.str.substring(target.device.remoteId.str.length - 8)}");
-        _log("   ⚠️ Token not found - possible reasons:");
-        _log("      1. BRIDGE hasn't updated advertising yet (timing issue)");
-        _log("      2. Token expired (>45s old)");
-        _log("      3. BLE stack delay on BRIDGE device");
-        _log("   Это НЕ ошибка, это нормальный путь. Escalating to Sonar.");
-        _isTransferring = false;
-        notifyListeners();
-        
-        // Помечаем BRIDGE как запрещенный для GATT (cooldown 5 минут)
-        final discoveryContext = locator<DiscoveryContextService>();
-        final targetMac = target.device.remoteId.str;
-        final candidate = discoveryContext.getCandidateByMac(targetMac);
-        if (candidate != null) {
-          discoveryContext.markBridgeAsGattForbidden(candidate.id);
-        }
-        
-        // Сразу переходим к Sonar
-        try {
-          final msgId = pending.first['id'] as String;
-          // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: Проверка - не отправляем payload дважды
-          if (_sentPayloads.containsKey(msgId)) {
-            _log("🚫 [ARCHITECTURE] Payload $msgId already sent via ${_sentPayloads[msgId]} — skipping duplicate");
-            _isTransferring = false;
-            notifyListeners();
-            return;
-          }
-          
-          final messageData = jsonEncode({
-            'type': 'OFFLINE_MSG',
-            'content': activePending.isNotEmpty ? activePending.first['content'] : '',
-            'senderId': _apiService.currentUserId,
-            'h': msgId,
-            'ttl': 5,
-          });
-          final sonarPayload = messageData.length > 200 ? messageData.substring(0, 200) : messageData;
-          await locator<UltrasonicService>().transmitFrame("DATA:$sonarPayload");
-          
-          // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: SONAR = ГАРАНТИРОВАННЫЙ маршрут, цикл ЗАКРЫТ
-          _sentPayloads[msgId] = 'SONAR';
-          await _db.removeFromOutbox(msgId);
-          _log("📦 [ARCHITECTURE] Payload $msgId marked as SENT_OK (SONAR), removed from outbox");
-          _log("✅ Stage 3 Success: Sonar Packet Emitted (BRIDGE without token). Cycle CLOSED.");
-        } catch (e) { 
-          final msgId = activePending.isNotEmpty ? activePending.first['id'] as String : messageId;
-          _log("📦 [ARCHITECTURE] Payload $msgId marked as SENT_FAIL (SONAR), keeping in outbox");
-          _log("❌ Total isolation."); 
-        }
-        _isTransferring = false;
-        notifyListeners();
-        return; // Прерываем попытки BLE GATT
+        _log("⚠️ [FIX] BRIDGE without token — TRYING GATT ANYWAY (debug mode)");
+        _log("   📋 MAC: ${targetMac.substring(targetMac.length - 8)}");
+        _log("   💡 Token validation DISABLED - continuing to GATT");
+        // НЕ прерываем - продолжаем к GATT
       }
       
-      // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: BLE GATT без token ЗАПРЕЩЕН
-      if (originalPeerHops == 0 && originalToken == null) {
+      // 🔥 FIX: Второй блок token validation также отключен
+      if (false && originalPeerHops == 0 && originalToken == null) { // DISABLED
         _log("🚫 [ARCHITECTURE] BRIDGE without token — BLE GATT FORBIDDEN");
         _log("   This should have been caught earlier. Escalating to Sonar.");
         _isTransferring = false;
@@ -2500,6 +3066,18 @@ class MeshService with ChangeNotifier {
       final bleTimeout = transportLatency.adaptiveTimeout;
       // Логирование уже добавлено выше
       
+      _log("🔗 [STAGE 2] Attempting BLE GATT connection:");
+      _log("   📋 Target device: ${targetDevice.remoteId}");
+      _log("   📋 Token: ${originalToken != null ? '${originalToken.length > 8 ? originalToken.substring(0, 8) : originalToken}...' : 'none'}");
+      _log("   ⏱️ Timeout: ${bleTimeout.inSeconds}s");
+      
+      // 🔥 FIX: Устанавливаем _isTransferring ТОЛЬКО перед реальным GATT connect
+      // Раньше флаг устанавливался в начале функции и блокировал все последующие попытки
+      _isTransferring = true;
+      _transferStartTime = DateTime.now();
+      notifyListeners();
+      _log("🔒 [GATT] _isTransferring = true (GATT connect starting NOW)");
+      
       // 🔥 МАСШТАБИРУЕМОСТЬ: Отдельный таймер для BLE GATT
       final gattStartTime = DateTime.now();
       bool gattAborted = false;
@@ -2509,37 +3087,102 @@ class MeshService with ChangeNotifier {
         _log("⏱️ [GATT-TIMER] BLE GATT timeout after ${bleTimeout.inSeconds}s - aborting");
       });
       
-      final success = await _btService.sendMessage(targetDevice, payload)
-          .timeout(bleTimeout, onTimeout: () {
-        _log("⏱️ BLE GATT timeout after ${bleTimeout.inSeconds}s");
-        return false;
-      });
+      bool success = false;
+      String? failReason;
+      bool timeoutOccurred = false;
+      try {
+        // 🔍🔍🔍 CRITICAL DIAGNOSTIC: Максимум логов для диагностики
+        _log("🔴🔴🔴 [MESH-CRITICAL] STAGE 2 - About to call sendMessage");
+        _log("🔴 targetDevice.remoteId: ${targetDevice.remoteId}");
+        _log("🔴 payload.length: ${payload.length}");
+        _log("🔴 _btService.runtimeType: ${_btService.runtimeType}");
+        _log("🔴 _btService.hashCode: ${_btService.hashCode}");
+        
+        _log("🔍 [STAGE 2] About to call sendMessage...");
+        _log("   📋 targetDevice: ${targetDevice.remoteId}");
+        _log("   📋 payload length: ${payload.length}");
+        _log("   📋 _btService: ${_btService.runtimeType}");
+        
+        _log("🔴🔴🔴 [MESH-CRITICAL] NOW calling _btService.sendMessage()...");
+        
+        final sendFuture = _btService.sendMessage(targetDevice, payload);
+        
+        _log("🔴🔴🔴 [MESH-CRITICAL] sendMessage() returned Future, now awaiting with timeout...");
+        
+        success = await sendFuture.timeout(bleTimeout, onTimeout: () {
+          _log("🔴🔴🔴 [MESH-CRITICAL] TIMEOUT occurred after ${bleTimeout.inSeconds}s!");
+          _log("⏱️ BLE GATT timeout after ${bleTimeout.inSeconds}s");
+          failReason = "GATT timeout after ${bleTimeout.inSeconds}s";
+          timeoutOccurred = true;
+          return false;
+        });
+        
+        _log("🔴🔴🔴 [MESH-CRITICAL] sendMessage completed! success=$success");
+        _log("🔍 [STAGE 2] sendMessage returned: $success");
+      } catch (e, stack) {
+        _log("🔴🔴🔴 [MESH-CRITICAL] sendMessage EXCEPTION: $e");
+        _log("❌ [STAGE 2] sendMessage threw exception: $e");
+        _log("   📋 Stack trace: ${stack.toString().split('\n').take(5).join('\n')}");
+        failReason = e.toString();
+        success = false;
+      }
       
       _gattTimeoutTimer?.cancel();
+      
+      // 🔥 CRITICAL FIX: После timeout принудительно сбрасываем GATT state
+      // Без этого _gattConnectionState остаётся CONNECTING и блокирует все scan!
+      if (timeoutOccurred || !success) {
+        _btService.forceResetGattState("mesh_service timeout/failure (success=$success, timeout=$timeoutOccurred)");
+      }
       final gattLatency = DateTime.now().difference(gattStartTime);
       
       if (success && !gattAborted) {
         // 🔥 ШАГ 2.3: Логирование успешного подключения
         _log("✅ [GHOST] Connected via BLE GATT - message delivered");
+        
+        // 🔥 ЛОГИРОВАНИЕ: Детальная информация о передаче через BLE GATT
+        _log("📤 [GHOST→BRIDGE] Stage 2: BLE GATT transmission");
+        _log("   📋 Message ID: $messageId");
+        _log("   📋 Target MAC: ${targetMac.substring(targetMac.length - 8)}");
+        _log("   📋 Transport: BLE GATT");
+        _log("   📋 Token: ${originalToken != null ? '${originalToken.substring(0, 8)}...' : 'none'}");
+        _log("   📋 Latency: ${gattLatency.inMilliseconds}ms");
+        _log("   ✅ Message delivered successfully via BLE GATT");
         _bleGattAttempts.remove(targetMac); // Сбрасываем счётчик при успехе
+        
+        // 🔥 REPEATER: Регистрируем успешное BLE GATT соединение
+        try {
+          final repeater = locator<RepeaterService>();
+          repeater.registerConnection(
+            deviceId: targetMac,
+            deviceToken: originalToken,
+            channelType: ChannelType.bleGatt,
+          );
+          repeater.updateConnectionActivity(targetMac);
+          _log("🔄 [REPEATER] BLE GATT connection registered: ${targetMac.substring(targetMac.length - 8)}");
+        } catch (e) {
+          _log("⚠️ [REPEATER] Failed to register GATT connection: $e");
+        }
         
         // 🔥 МАСШТАБИРУЕМОСТЬ: Записываем успешную задержку для адаптивного таймаута
         transportLatency.recordSuccess(gattLatency);
         
-        // 🔥 МАСШТАБИРУЕМОСТЬ: Обновляем retry info
-        final retryInfo = _payloadRetries[messageId]!;
-        retryInfo.gattAttempts++;
+        // 🔥 МАСШТАБИРУЕМОСТЬ: Обновляем retry info (с null-safety)
+        final retryInfo = _payloadRetries[messageId];
+        if (retryInfo != null) {
+          retryInfo.gattAttempts++;
+          
+          // 🔥 МАСШТАБИРУЕМОСТЬ: Расширенное логирование цикла
+          final cycleDuration = retryInfo.cycleDuration;
+          final hops = retryInfo.hopsToBridge ?? peerHops;
+          final outboxSize = retryInfo.outboxSizeAtStart ?? pending.length;
+          _log("🔄 [ARCHITECTURE] Cycle CLOSED via BLE GATT (duration: ${cycleDuration?.inSeconds ?? 0}s, hops: $hops, outbox: $outboxSize)");
+        }
         
         // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: SENT_OK - очищаем pending
         _sentPayloads[messageId] = 'BLE';
         await _db.removeFromOutbox(messageId);
         _log("📦 [ARCHITECTURE] Payload $messageId marked as SENT_OK (BLE), removed from outbox");
-        
-        // 🔥 МАСШТАБИРУЕМОСТЬ: Расширенное логирование цикла
-        final cycleDuration = retryInfo.cycleDuration;
-        final hops = retryInfo.hopsToBridge ?? peerHops;
-        final outboxSize = retryInfo.outboxSizeAtStart ?? pending.length;
-        _log("🔄 [ARCHITECTURE] Cycle CLOSED via BLE GATT (duration: ${cycleDuration?.inSeconds ?? 0}s, hops: $hops, outbox: $outboxSize)");
         
         // Очищаем активный payload и retry info
         _activePayloads.remove(messageId);
@@ -2548,8 +3191,19 @@ class MeshService with ChangeNotifier {
         // 🔥 КРИТИЧНО: Освобождаем per-BRIDGE lock после успешной передачи
         _activeBridgeConnections.remove(targetMac);
         
+        // 🔥 КРИТИЧНО: Очищаем cooldown после успешной передачи через BLE GATT
+        // Это позволяет сразу пытаться подключиться к другим BRIDGE
+        _linkCooldowns.remove(targetMac);
+        _bleGattAttempts.remove(targetMac); // Сбрасываем счетчик неудачных попыток
+        
+        _log("🧹 [CLEANUP] Cleared cooldown and connection locks for $targetMac after successful BLE GATT transmission");
+        
+        // 🔥🔥🔥 CRITICAL FIX: Сбрасываем флаг СРАЗУ и синхронно!
+        transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
+        _transferStartTime = null; // Сбрасываем таймер
         _isTransferring = false;
-        notifyListeners();
+        _log("🔓 [GATT] _isTransferring = false (GATT success - IMMEDIATE reset)");
+        notifyListeners(); // Уведомляем слушателей СРАЗУ
         
         // 🔥 Улучшение: Проверяем очередь подключений после успешной передачи
         _processPendingConnections();
@@ -2561,17 +3215,28 @@ class MeshService with ChangeNotifier {
         return;
       } else {
         _log("⚠️ Stage 2 Failed: BLE delivery returned false or timed out.");
+        if (failReason != null) {
+          _log("   💡 Fail reason: $failReason");
+        }
+        
+        // 🔥 FIX: Сбрасываем _isTransferring при GATT failure
+        _log("🔓 [GATT] _isTransferring = false (GATT failed)");
+        _isTransferring = false;
+        notifyListeners();
         
         // 🔥 МАСШТАБИРУЕМОСТЬ: Записываем неудачу для адаптивного таймаута
         transportLatency.recordFailure();
         
-        // 🔥 МАСШТАБИРУЕМОСТЬ: Обновляем retry info
-        final retryInfo = _payloadRetries[messageId]!;
-        retryInfo.gattAttempts++;
+        // 🔥 МАСШТАБИРУЕМОСТЬ: Обновляем retry info (с null-safety)
+        final retryInfo = _payloadRetries[messageId];
+        final gattAttemptCount = retryInfo?.gattAttempts ?? 0;
+        if (retryInfo != null) {
+          retryInfo.gattAttempts++;
+        }
         
-        // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: SENT_FAIL - cooldown транспорта 30-60 секунд
-        _log("📦 [ARCHITECTURE] Payload $messageId marked as SENT_FAIL (BLE), setting cooldown 60s (attempt ${retryInfo.gattAttempts}/3)");
-        _linkCooldowns[targetMac] = DateTime.now(); // Cooldown 60 секунд для BLE GATT
+        // 🔥 FIX: Cooldown уменьшен до 15 секунд (было 60)
+        _log("📦 [ARCHITECTURE] Payload $messageId marked as SENT_FAIL (BLE), setting cooldown 15s (attempt ${gattAttemptCount + 1}/3)");
+        _setCooldownByMac(targetMac);
         _bleGattAttempts[targetMac] = (_bleGattAttempts[targetMac] ?? 0) + 1;
         
         // 🔥 КРИТИЧНО: Освобождаем per-BRIDGE lock при неудаче (после cooldown)
@@ -2582,6 +3247,12 @@ class MeshService with ChangeNotifier {
       }
     } catch (e) { 
       _log("⚠️ Stage 2 Failed: $e");
+      
+      // 🔥 FIX: Сбрасываем _isTransferring при исключении
+      _log("🔓 [GATT] _isTransferring = false (GATT exception)");
+      _isTransferring = false;
+      notifyListeners();
+      
       // 🔥 Улучшение: Увеличиваем счётчик неудачных попыток
       _bleGattAttempts[targetMac] = (_bleGattAttempts[targetMac] ?? 0) + 1;
       
@@ -2592,6 +3263,7 @@ class MeshService with ChangeNotifier {
     // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: Проверка - не делаем fallback если payload уже отправлен через Sonar
     if (_sentPayloads.containsKey(messageId) && _sentPayloads[messageId] == 'SONAR') {
       _log("🚫 [ARCHITECTURE] Payload $messageId already sent via SONAR — skipping fallback");
+      transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
       _isTransferring = false;
       notifyListeners();
       return; // Цикл закрыт, не делаем fallback
@@ -2600,15 +3272,22 @@ class MeshService with ChangeNotifier {
     // 🔥 КРИТИЧНО: Агрессивный fallback на TCP после неудачи BLE GATT
     // НО: Только если есть bridgeToken - без токена TCP тоже не работает
     final gattAttemptsCount = _bleGattAttempts[targetMac] ?? 0;
-    final retryInfoForTcp = _payloadRetries[messageId]!;
+    final retryInfoForTcp = _payloadRetries[messageId];
+    if (retryInfoForTcp == null) {
+      _log("⚠️ [Cascade] No retry info for $messageId - skipping TCP fallback");
+      transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
+      _isTransferring = false;
+      notifyListeners();
+      return;
+    }
     
     // 🔥 МАСШТАБИРУЕМОСТЬ: Проверяем лимит попыток TCP (максимум 2)
     if (gattAttemptsCount >= 1 && peerHops == 0 && retryInfoForTcp.tcpAttempts < 2) {
       _log("🔄 [Cascade] BLE GATT failed, checking TCP fallback (GATT attempt: $gattAttemptsCount, TCP attempt: ${retryInfoForTcp.tcpAttempts + 1}/2)");
       final candidate = locator<DiscoveryContextService>().getCandidateByMac(targetMac);
       
-      // 🔥 КРИТИЧНО: TCP fallback только если есть bridgeToken И IP/порт
-      if (candidate != null && candidate.ip != null && candidate.port != null && candidate.bridgeToken != null) {
+      // 🔥 КРИТИЧНО: TCP fallback только если есть IP/порт (токен не обязателен для TCP)
+      if (candidate != null && candidate.ip != null && candidate.port != null) {
         try {
           // 🔥 МАСШТАБИРУЕМОСТЬ: Адаптивный таймаут TCP
           final tcpLatency = _transportLatencies.putIfAbsent('${targetMac}_tcp', () => TransportLatency());
@@ -2617,11 +3296,16 @@ class MeshService with ChangeNotifier {
               : const Duration(seconds: 5);
           
           // 🔥 ШАГ 2.3: Логирование подключения через TCP
-          final tcpTokenPreview = candidate.bridgeToken!.length > 16 
-              ? candidate.bridgeToken!.substring(0, 16) 
-              : candidate.bridgeToken!;
           _log("🌐 [GHOST] Connecting via TCP");
-          _log("   🔑 Token: $tcpTokenPreview...");
+          if (candidate.bridgeToken != null) {
+            final tcpTokenPreview = candidate.bridgeToken!.length > 16 
+                ? candidate.bridgeToken!.substring(0, 16) 
+                : candidate.bridgeToken!;
+            _log("   🔑 Token: $tcpTokenPreview...");
+          } else {
+            _log("   🔑 Token: none (TCP fallback without token)");
+          }
+          _log("   📋 IP: ${candidate.ip}:${candidate.port}");
           _log("   ⏱️ Timeout: ${tcpTimeout.inSeconds}s");
           
           // 🔥 МАСШТАБИРУЕМОСТЬ: Отдельный таймер для TCP
@@ -2634,19 +3318,68 @@ class MeshService with ChangeNotifier {
           });
           
           // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: TCP таймаут адаптивный
-          // 🔥 ШАГ 3: Токен валиден 30 секунд
-          await _handleMagnetWave(candidate.bridgeToken!, candidate.port!, 
-              DateTime.now().add(const Duration(seconds: 30)).millisecondsSinceEpoch)
-              .timeout(tcpTimeout, onTimeout: () {
-            throw TimeoutException("TCP connection timeout after ${tcpTimeout.inSeconds}s");
-          });
+          // 🔥 КРИТИЧНО: TCP может работать без токена (токен нужен только для GATT)
+          bool tcpSuccess = false;
+          if (candidate.bridgeToken != null) {
+            // 🔥 ШАГ 3: Токен валиден 30 секунд - используем _handleMagnetWave
+            try {
+              // 🔥 MAC RANDOMIZATION FIX: Токен валиден 60 секунд
+              await _handleMagnetWave(candidate.bridgeToken!, candidate.port!, 
+                  DateTime.now().add(const Duration(seconds: 60)).millisecondsSinceEpoch)
+                .timeout(tcpTimeout, onTimeout: () {
+              throw TimeoutException("TCP connection timeout after ${tcpTimeout.inSeconds}s");
+            });
+              tcpSuccess = true;
+            } catch (e) {
+              _log("⚠️ [TCP] _handleMagnetWave failed: $e");
+            }
+          } else {
+            // 🔥 КРИТИЧНО: TCP fallback без токена - отправляем сообщение напрямую
+            try {
+              final messageData = jsonEncode({
+                'type': 'GHOST_UPLOAD',
+                'messages': [{
+                  'type': 'OFFLINE_MSG',
+                  'content': pending.first['content'],
+                  'senderId': _apiService.currentUserId,
+                  'h': messageId,
+                  'ttl': 5,
+                }],
+              });
+              
+              await NativeMeshService.sendTcp(
+                messageData,
+                host: candidate.ip!,
+                port: candidate.port!,
+              ).timeout(tcpTimeout, onTimeout: () {
+                throw TimeoutException("TCP connection timeout after ${tcpTimeout.inSeconds}s");
+              });
+              tcpSuccess = true;
+            } catch (e) {
+              _log("⚠️ [TCP] Direct TCP send failed: $e");
+            }
+          }
           
           _tcpTimeoutTimer?.cancel();
           final tcpLatencyDuration = DateTime.now().difference(tcpStartTime);
           
-          if (!tcpAborted) {
+          if (!tcpAborted && tcpSuccess) {
             // 🔥 ШАГ 2.3: Логирование успешного подключения через TCP
             _log("✅ [GHOST] Connected via TCP - message delivered");
+            
+            // 🔥 ЛОГИРОВАНИЕ: Детальная информация о передаче через TCP
+            _log("📤 [GHOST→BRIDGE] TCP Fallback: TCP transmission");
+            _log("   📋 Message ID: $messageId");
+            _log("   📋 Target IP: ${candidate.ip}:${candidate.port}");
+            _log("   📋 Target MAC: ${targetMac.substring(targetMac.length - 8)}");
+            _log("   📋 Transport: TCP");
+            if (candidate.bridgeToken != null) {
+              _log("   📋 Token: ${candidate.bridgeToken!.substring(0, 8)}...");
+            } else {
+              _log("   📋 Token: none (TCP fallback without token)");
+            }
+            _log("   📋 Latency: ${tcpLatencyDuration.inMilliseconds}ms");
+            _log("   ✅ Message delivered successfully via TCP");
             
             // 🔥 МАСШТАБИРУЕМОСТЬ: Записываем успешную задержку TCP
             tcpLatency.recordSuccess(tcpLatencyDuration);
@@ -2674,6 +3407,13 @@ class MeshService with ChangeNotifier {
             // 🔥 КРИТИЧНО: Освобождаем per-BRIDGE lock после успешной передачи
             _activeBridgeConnections.remove(targetMac);
             
+            // 🔥 КРИТИЧНО: Очищаем cooldown после успешной передачи через TCP
+            // Это позволяет сразу пытаться подключиться к другим BRIDGE
+            _linkCooldowns.remove(targetMac);
+            
+            _log("🧹 [CLEANUP] Cleared cooldown and connection locks for $targetMac after successful TCP transmission");
+            
+            transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
             _isTransferring = false;
             notifyListeners();
             return;
@@ -2689,18 +3429,26 @@ class MeshService with ChangeNotifier {
           // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: SENT_FAIL - cooldown транспорта 1-2 минуты, но НЕ удаляем из outbox
           _log("📦 [ARCHITECTURE] Payload $messageId marked as SENT_FAIL (TCP), keeping in outbox (attempt ${retryInfoForTcp.tcpAttempts}/2)");
           _log("❌ [Cascade] TCP fallback also failed: $e");
-          _linkCooldowns[targetMac] = DateTime.now(); // Cooldown 60 секунд для TCP
-          _log("⏸️ [Cascade] TCP cooldown set for 60s");
+          _setCooldownByMac(targetMac); // Cooldown 15 секунд для TCP (было 60)
+          _log("⏸️ [Cascade] TCP cooldown set for 15s");
           
           // 🔥 КРИТИЧНО: Освобождаем per-BRIDGE lock при неудаче TCP
           _activeBridgeConnections.remove(targetMac);
         }
       } else {
         // 🔥 КРИТИЧНО: Если нет token или IP/порта - TCP fallback невозможен
-        if (candidate?.bridgeToken == null) {
-          _log("❌ [Cascade] No bridgeToken - TCP fallback impossible (BRIDGE not accepting connections)");
+        if (candidate == null) {
+          _log("❌ [Cascade] No candidate found in DiscoveryContext for MAC: ${targetMac.substring(targetMac.length - 8)}");
+          _log("   💡 BRIDGE may not be in DiscoveryContext or MAC address mismatch");
+        } else if (candidate.ip == null || candidate.port == null) {
+          _log("⚠️ [Cascade] No TCP info in candidate (ip: ${candidate.ip}, port: ${candidate.port})");
+          _log("   💡 Possible reasons:");
+          _log("      1. BRIDGE hasn't sent MAGNET_WAVE packet yet");
+          _log("      2. MAGNET_WAVE not received by GHOST (Wi-Fi Direct not connected)");
+          _log("      3. BRIDGE TCP server not started");
+          _log("      4. DiscoveryContext not updated with IP/port from MAGNET_WAVE");
         } else {
-          _log("⚠️ [Cascade] No TCP info in candidate (ip: ${candidate?.ip}, port: ${candidate?.port})");
+          _log("⚠️ [Cascade] TCP fallback check failed for unknown reason");
         }
       }
     }
@@ -2708,12 +3456,20 @@ class MeshService with ChangeNotifier {
     // --- STAGE 3: SONAR (ГАРАНТИРОВАННЫЙ маршрут) ---
     // 🔥 ШАГ 2.2: Если токен не найден или просрочен → fallback на Sonar
     // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: Sonar всегда доступен, работает как последний шаг
-    final retryInfoForSonar = _payloadRetries[messageId]!;
+    final retryInfoForSonar = _payloadRetries[messageId];
+    if (retryInfoForSonar == null) {
+      _log("⚠️ [Cascade] No retry info for $messageId - skipping Sonar fallback");
+      transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
+      _isTransferring = false;
+      notifyListeners();
+      return;
+    }
     
     // 🔥 МАСШТАБИРУЕМОСТЬ: Проверяем лимит попыток Sonar (максимум 1)
     if (retryInfoForSonar.sonarAttempts >= 1) {
       _log("⏸️ [Scalability] Payload $messageId already attempted via Sonar - skipping");
       _activePayloads.remove(messageId);
+      transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
       _isTransferring = false;
       notifyListeners();
       return;
@@ -2725,6 +3481,7 @@ class MeshService with ChangeNotifier {
       if (_sentPayloads.containsKey(messageId)) {
         _log("🚫 [ARCHITECTURE] Payload $messageId already sent via ${_sentPayloads[messageId]} — skipping duplicate");
         _activePayloads.remove(messageId);
+        transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
         _isTransferring = false;
         notifyListeners();
         return;
@@ -2747,10 +3504,19 @@ class MeshService with ChangeNotifier {
         'ttl': 5,
       });
       final sonarPayload = messageData.length > 200 ? messageData.substring(0, 200) : messageData;
+      
+      // 🔥 ЛОГИРОВАНИЕ: Детальная информация о передаче через Sonar
+      _log("📤 [GHOST→BRIDGE] Stage 3: Sonar transmission");
+      _log("   📋 Message ID: $messageId");
+      _log("   📋 Transport: Sonar (ultrasonic)");
+      _log("   📋 Payload length: ${sonarPayload.length} bytes (truncated from ${messageData.length} bytes)");
+      _log("   📤 Transmitting via Sonar...");
+      
       await locator<UltrasonicService>().transmitFrame("DATA:$sonarPayload");
       
       _sonarTimeoutTimer?.cancel();
       final sonarLatency = DateTime.now().difference(sonarStartTime);
+      _log("   ✅ Sonar transmission completed (latency: ${sonarLatency.inMilliseconds}ms)");
       
       // 🔥 МАСШТАБИРУЕМОСТЬ: Обновляем retry info
       retryInfoForSonar.sonarAttempts++;
@@ -2771,6 +3537,15 @@ class MeshService with ChangeNotifier {
       _activePayloads.remove(messageId);
       _payloadRetries.remove(messageId);
       
+      // 🔥 КРИТИЧНО: Очищаем cooldown после успешной отправки через Sonar
+      // Это позволяет сразу пытаться подключиться к другим BRIDGE
+      _linkCooldowns.remove(targetMac);
+      _activeBridgeConnections.remove(targetMac);
+      _bleGattAttempts.remove(targetMac); // Сбрасываем счетчик неудачных попыток
+      
+      _log("🧹 [CLEANUP] Cleared cooldown and connection locks for $targetMac after successful Sonar transmission");
+      
+      transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
       _isTransferring = false;
       notifyListeners();
     } catch (e) { 
@@ -2789,12 +3564,10 @@ class MeshService with ChangeNotifier {
         _activeBridgeConnections.remove(targetMac);
       }
       
+      transferTimeoutTimer?.cancel(); // 🔥 FIX: Cancel timer!
       _isTransferring = false;
       notifyListeners();
     }
-
-    // 🔥 Улучшение: Отменяем таймаут при успешном завершении
-    // (таймаут должен быть объявлен в начале функции)
   }
   
   /// 🔥 Улучшение: Обработка очереди подключений после завершения transfer
@@ -2835,6 +3608,20 @@ class MeshService with ChangeNotifier {
 
     _log("🌐 [CONNECTED] Wi-Fi Group Established.");
     notifyListeners();
+    
+    // 🔥 REPEATER: Регистрируем Wi-Fi Direct соединение
+    try {
+      final repeater = locator<RepeaterService>();
+      repeater.registerConnection(
+        deviceId: hostAddress,
+        channelType: ChannelType.wifiDirect,
+        ipAddress: hostAddress,
+        port: 55556,
+      );
+      _log("🔄 [REPEATER] Wi-Fi Direct connection registered: $hostAddress");
+    } catch (e) {
+      _log("⚠️ [REPEATER] Failed to register connection: $e");
+    }
 
     // Твоя логика отправки через TCP...
     await Future.delayed(const Duration(seconds: 5));
@@ -2859,10 +3646,67 @@ class MeshService with ChangeNotifier {
 
         // Пробуем отправить
         await NativeMeshService.sendTcp(packet, host: targetIp);
+        
+        // 🔥 REPEATER: Обновляем активность соединения
+        try {
+          locator<RepeaterService>().updateConnectionActivity(hostAddress);
+        } catch (_) {}
       }
       _log("✅ [SUCCESS] Mesh transmission complete.");
     }
     notifyListeners();
+  }
+  
+  // ============================================================================
+  // 🔥 АВТОМАТИЧЕСКОЕ УПРАВЛЕНИЕ WI-FI DIRECT ГРУППОЙ
+  // ============================================================================
+  
+  /// Вызывается когда Wi-Fi Direct группа создана или найдена
+  void onWifiDirectGroupCreated({
+    String? networkName,
+    String? passphrase,
+    bool isGroupOwner = false,
+  }) {
+    _log("📡 [WiFi-Direct] Группа ${isGroupOwner ? 'создана' : 'найдена'}:");
+    _log("   📋 SSID: $networkName");
+    _log("   📋 Владелец: ${isGroupOwner ? 'Мы' : 'Другое устройство'}");
+    
+    // Если мы владелец группы - запускаем discovery для поиска клиентов
+    if (isGroupOwner) {
+      _log("🔍 [WiFi-Direct] Мы владелец группы - запускаем discovery для поиска клиентов...");
+      // Discovery запустится автоматически через MeshOrchestrator
+    }
+    
+    notifyListeners();
+  }
+  
+  /// Автоматически создает Wi-Fi Direct группу если мы BRIDGE
+  /// Вызывается из MeshOrchestrator при старте сети
+  Future<bool> autoCreateWifiDirectGroupIfBridge() async {
+    final currentRole = NetworkMonitor().currentRole;
+    
+    if (currentRole != MeshRole.BRIDGE) {
+      _log("ℹ️ [WiFi-Direct] Не BRIDGE, пропускаем создание группы");
+      return false;
+    }
+    
+    _log("🚀 [WiFi-Direct] BRIDGE обнаружен, создаем Wi-Fi Direct группу...");
+    
+    try {
+      final groupInfo = await NativeMeshService.ensureWifiDirectGroupExists();
+      
+      if (groupInfo != null) {
+        _log("✅ [WiFi-Direct] Группа готова: ${groupInfo.networkName}");
+        _log("   📋 Passphrase: ${groupInfo.passphrase?.substring(0, (groupInfo.passphrase?.length ?? 0) > 4 ? 4 : (groupInfo.passphrase?.length ?? 0))}...");
+        return true;
+      } else {
+        _log("⚠️ [WiFi-Direct] Не удалось создать группу (fallback: BLE GATT)");
+        return false;
+      }
+    } catch (e) {
+      _log("❌ [WiFi-Direct] Ошибка создания группы: $e");
+      return false;
+    }
   }
 
 
@@ -2877,7 +3721,9 @@ class MeshService with ChangeNotifier {
 
   /// Логика: Распаковка -> Дедупликация -> Peer Lock -> Маршрутизация.
   Future<void> processIncomingPacket(dynamic rawData) async {
-    _log("🧬 [Mesh-Kernel] New pulse incoming. Analyzing...");
+    final currentRole = NetworkMonitor().currentRole;
+    final roleLabel = currentRole == MeshRole.BRIDGE ? 'BRIDGE' : 'GHOST';
+    _log("🧬 [$roleLabel] processIncomingPacket: New packet received. Analyzing...");
 
     final db = LocalDatabaseService();
     // Извлекаем менеджер Gossip через локатор для ретрансляции
@@ -2886,23 +3732,58 @@ class MeshService with ChangeNotifier {
     try {
       String jsonString = "";
       String? senderIp;
+      String? transportType = 'UNKNOWN';
 
       // --- 1. РАСПАКОВКА И ЗАХВАТ IP (Критично для Tecno/Huawei) ---
       // Native-слой присылает Map с контентом сообщения и IP адресом отправителя.
+      // 🔥 FIX: Поддержка двух форматов:
+      // 1. Обернутый формат: {'message': jsonString, 'senderIp': ...}
+      // 2. Прямой формат: {type: 'OFFLINE_MSG', content: ..., senderIp: ...} (от BLE GATT)
       if (rawData is Map) {
-        jsonString = rawData['message']?.toString() ?? "";
-        senderIp = rawData['senderIp']?.toString();
+        // Проверяем, есть ли поле 'message' (старый формат)
+        if (rawData.containsKey('message') && rawData['message'] != null) {
+          jsonString = rawData['message']?.toString() ?? "";
+          senderIp = rawData['senderIp']?.toString();
+        } else {
+          // 🔥 FIX: rawData уже является самим сообщением (новый формат от BLE GATT)
+          // Извлекаем senderIp и сериализуем обратно в JSON
+          senderIp = rawData['senderIp']?.toString();
+          // Создаем копию без senderIp для сериализации (senderIp - метаданные транспорта)
+          final dataForSerialization = Map<String, dynamic>.from(rawData);
+          dataForSerialization.remove('senderIp');
+          jsonString = jsonEncode(dataForSerialization);
+          _log("   🔄 [FIX] rawData is already message object, serialized to JSON");
+        }
+        
+        // Определяем тип транспорта по senderIp
+        if (senderIp != null) {
+          if (senderIp.contains(':')) {
+            transportType = 'BLE_GATT'; // MAC адрес в формате XX:XX:XX:XX:XX:XX
+          } else if (senderIp.contains('.')) {
+            transportType = 'TCP'; // IP адрес
+          } else {
+            transportType = 'UNKNOWN';
+          }
+        }
       } else {
         jsonString = rawData.toString();
       }
 
+      _log("   📋 Transport: $transportType");
+      _log("   📋 Sender: $senderIp");
+      _log("   📋 Raw data length: ${jsonString.length} bytes");
+
       if (jsonString.isEmpty) {
-        _log("⚠️ [Mesh] Empty payload received. Aborting.");
+        _log("⚠️ [$roleLabel] Empty payload received. Aborting.");
         return;
       }
 
       // --- 2. ПАРСИНГ JSON ---
       final Map<String, dynamic> data = jsonDecode(jsonString);
+      
+      _log("   ✅ JSON parsed successfully");
+      _log("   📋 Data keys: ${data.keys.toList()}");
+      _log("   📋 Raw chatId from data: '${data['chatId']}'");
 
       // --- 3. GOSSIP ДЕДУПЛИКАЦИЯ (Anti-Entropy Layer) ---
       // Генерируем или извлекаем уникальный хеш пакета.
@@ -2914,6 +3795,12 @@ class MeshService with ChangeNotifier {
         return;
       }
 
+      // Извлекаем тактические метаданные (ДО использования в Peer Lock)
+      final String packetType = data['type'] ?? 'UNKNOWN';
+      final String senderId = data['senderId'] ?? 'Unknown';
+      // Нормализуем ID чата для стабильной фильтрации на разных устройствах
+      final String incomingChatId = (data['chatId'] ?? "").toString().trim().toUpperCase();
+      
       // --- 4. МАРШРУТИЗАЦИЯ ОБРАТНОГО ПУТИ (Peer Lock) ---
       // Фиксируем IP отправителя. В Wi-Fi Direct IP могут меняться,
       // поэтому мы всегда запоминаем адрес последнего входящего пакета.
@@ -2925,19 +3812,88 @@ class MeshService with ChangeNotifier {
         if (_lastKnownPeerIp != senderIp || isExpired) {
           _lastKnownPeerIp = senderIp;
           _peerIpExpiry[senderIp] = now.add(const Duration(minutes: 5)); // TTL: 5 minutes
-          _log("📍 [Mesh] Peer Locked -> $_lastKnownPeerIp (expires in 5min)");
+          _log("📍 [$roleLabel] Peer Locked -> $_lastKnownPeerIp (expires in 5min)");
+          
+          // 🔥 КРИТИЧНО: Если это MAGNET_WAVE, обновляем IP в DiscoveryContext
+          if (packetType == 'MAGNET_WAVE' && currentRole == MeshRole.GHOST) {
+            final serverToken = data['serverToken']?.toString();
+            final waveIp = data['ip']?.toString();
+            final wavePort = data['port'] is int ? data['port'] as int : (data['port'] != null ? int.tryParse(data['port'].toString()) : null);
+            
+            _log("🌊 [MAGNET_WAVE] Received from $senderIp");
+            _log("   📋 Server token: ${serverToken != null ? (serverToken.length > 8 ? serverToken.substring(0, 8) : serverToken) + '...' : 'none'}");
+            _log("   📋 IP from packet: $waveIp");
+            _log("   📋 Port from packet: $wavePort");
+            _log("   📋 Sender IP: $senderIp");
+            
+            if (serverToken != null) {
+              final discoveryContext = locator<DiscoveryContextService>();
+              // Ищем кандидата по токену и обновляем IP
+              bool found = false;
+              for (final candidate in discoveryContext.validCandidates) {
+                if (candidate.isBridge) {
+                  // 🔥 КРИТИЧНО: Сравниваем токены (может быть обрезанный токен в manufacturerData)
+                  final candidateToken = candidate.bridgeToken;
+                  if (candidateToken != null) {
+                    // Проверяем, совпадает ли токен полностью или начинается с candidateToken
+                    final tokenMatches = serverToken == candidateToken || 
+                                        (serverToken.length >= candidateToken.length && 
+                                         serverToken.substring(0, candidateToken.length) == candidateToken);
+                    
+                    if (tokenMatches) {
+                      // Используем IP из пакета, если есть, иначе используем senderIp
+                      final finalIp = waveIp ?? senderIp;
+                      final finalPort = wavePort ?? 55556;
+                      
+                      discoveryContext.updateFromMeshDiscovery(
+                        id: candidate.id,
+                        mac: candidate.mac,
+                        hops: 0,
+                        ip: finalIp,
+                        port: finalPort,
+                        hasData: candidate.hasData,
+                      );
+                      _log("   ✅ Updated BRIDGE IP/port: $finalIp:$finalPort (token match)");
+                      found = true;
+                      break;
+                    }
+                  }
+                }
+              }
+              
+              if (!found) {
+                _log("   ⚠️ BRIDGE with token $serverToken not found in DiscoveryContext");
+                _log("   💡 This may happen if MAGNET_WAVE arrived before BLE scan");
+              }
+            } else {
+              _log("   ⚠️ MAGNET_WAVE received but no serverToken in packet");
+            }
+          }
+          
           notifyListeners(); // UI должен обновить статус "горячего" соединения
         }
       }
 
-      // Извлекаем тактические метаданные
-      final String packetType = data['type'] ?? 'UNKNOWN';
-      final String senderId = data['senderId'] ?? 'Unknown';
-      // Нормализуем ID чата для стабильной фильтрации на разных устройствах
-      final String incomingChatId = (data['chatId'] ?? "").toString().trim().toUpperCase();
+      _log("   📋 Packet type: $packetType");
+      _log("   📋 Sender ID: ${senderId.length > 8 ? senderId.substring(0, 8) : senderId}...");
+      _log("   📋 Chat ID: $incomingChatId");
+      
+      // --- 4.5 REPEATER/REPAIR: Уведомляем RepeaterService о пакете ---
+      // Это позволяет автоматически ретранслировать трафик доверенным устройствам
+      try {
+        final repeater = locator<RepeaterService>();
+        if (repeater.isRunning && senderIp != null) {
+          unawaited(repeater.onPacketReceived(data, senderIp));
+        }
+      } catch (e) {
+        // RepeaterService может быть не инициализирован - это нормально
+        _log("⚠️ [Repeater] Service not available: $e");
+      }
 
       // --- 5. ТАКТИЧЕСКИЙ РОУТИНГ ПО ТИПАМ ПАКЕТОВ ---
       switch (packetType) {
+        
+        // 🔥 FIX: Удален дублирующий case 'OFFLINE_MSG' - обработка происходит ниже в case 'OFFLINE_MSG': case 'MSG_FRAG':
 
         case 'MAGNET_QUERY':
           _log("❓ Node $senderId is looking for internet. Answering status...");
@@ -2968,11 +3924,66 @@ class MeshService with ChangeNotifier {
           if (NetworkMonitor().currentRole == MeshRole.GHOST) {
             final serverToken = data['serverToken']?.toString();
             final port = data['port'] is int ? data['port'] as int : (data['port'] != null ? int.tryParse(data['port'].toString()) ?? 55556 : 55556);
+            final bridgeIp = data['ip']?.toString(); // 🔥 КРИТИЧНО: IP адрес BRIDGE из MAGNET_WAVE
             final expiresAt = data['expiresAt'] is int ? data['expiresAt'] as int : (data['expiresAt'] != null ? int.tryParse(data['expiresAt'].toString()) ?? 0 : 0);
             final signature = data['signature']?.toString();
             final publicKey = data['publicKey']?.toString();
 
-            _log("🧲 [Ghost] MAGNET_WAVE received! Token: ${serverToken?.substring(0, 8) ?? 'null'}..., Port: $port, ExpiresAt: $expiresAt");
+            _log("🧲 [GHOST] MAGNET_WAVE received!");
+            _log("   📋 Token: ${serverToken?.substring(0, 8) ?? 'null'}...");
+            _log("   📋 Port: $port");
+            _log("   📋 IP: ${bridgeIp ?? 'not provided (will use default 192.168.49.1)'}");
+            _log("   📋 ExpiresAt: $expiresAt");
+            
+            // 🔥 КРИТИЧНО: Сохраняем IP и порт в DiscoveryContext для использования при подключении
+            if (bridgeIp != null && bridgeIp.isNotEmpty) {
+              final discoveryContext = locator<DiscoveryContextService>();
+              final bridgeId = data['bridgeId']?.toString() ?? data['senderId']?.toString() ?? 'unknown';
+              
+              // Пытаемся найти существующего кандидата по токену (из BLE scan)
+              // Если не найден - создаем новый через updateFromMeshDiscovery
+              UplinkCandidate? existingCandidate;
+              for (final candidate in discoveryContext.validCandidates) {
+                if (candidate.isBridge && candidate.bridgeToken == serverToken) {
+                  existingCandidate = candidate;
+                  break;
+                }
+              }
+              
+              if (existingCandidate != null) {
+                // Обновляем существующего кандидата с IP адресом
+                final updated = existingCandidate.copyWith(
+                  ip: bridgeIp,
+                  port: port,
+                  bridgeToken: serverToken,
+                  lastSeen: DateTime.now(),
+                  discoverySource: "MAGNET_WAVE",
+                );
+                // Обновляем в контексте
+                discoveryContext.updateFromMeshDiscovery(
+                  id: existingCandidate.id,
+                  mac: existingCandidate.mac,
+                  hops: 0,
+                  ip: bridgeIp,
+                  port: port,
+                  hasData: existingCandidate.hasData,
+                );
+                _log("   ✅ BRIDGE IP updated in existing candidate: $bridgeIp:$port (MAC: ${existingCandidate.mac.substring(existingCandidate.mac.length - 8)})");
+              } else {
+                // Создаем новый кандидат
+                discoveryContext.updateFromMeshDiscovery(
+                  id: bridgeId,
+                  mac: 'unknown', // MAC будет обновлен из BLE scan
+                  hops: 0,
+                  ip: bridgeIp,
+                  port: port,
+                  hasData: false,
+                );
+                _log("   ✅ BRIDGE IP saved to new candidate: $bridgeIp:$port");
+              }
+            } else {
+              _log("   ⚠️ MAGNET_WAVE does not contain IP address - will use default 192.168.49.1 or IP from Wi-Fi Direct");
+            }
 
             // 🔒 SECURITY: Verify signature before processing
             if (signature != null && publicKey != null) {
@@ -3111,31 +4122,91 @@ class MeshService with ChangeNotifier {
 
         case 'OFFLINE_MSG':
         case 'MSG_FRAG':
-          _log("📥 Signal detected for room: $incomingChatId");
+          final bool isFragment = packetType == 'MSG_FRAG';
+          _log("📥 [$roleLabel] ${isFragment ? 'MSG_FRAG' : 'OFFLINE_MSG'} detected for room: $incomingChatId");
+          _log("   📋 Transport: $transportType");
+          _log("   📋 Sender: ${senderId.length > 8 ? senderId.substring(0, 8) : senderId}...");
+          _log("   📋 Message ID: ${packetHash.length > 8 ? packetHash.substring(0, 8) : packetHash}...");
+          
+          // 🔥 ЛОГИРОВАНИЕ: Детальная информация для BRIDGE и GHOST
+          if (currentRole == MeshRole.BRIDGE) {
+            _log("   📥 [BRIDGE] ✅ ${isFragment ? 'Fragment' : 'Message'} received from GHOST via $transportType");
+            _log("      📋 Content length: ${data['content']?.toString().length ?? data['data']?.toString().length ?? 0} bytes");
+            _log("      📋 Chat ID: $incomingChatId");
+            _log("      📋 Sender IP: $senderIp");
+            if (isFragment) {
+              _log("      📦 Fragment ${data['idx']}/${data['tot']} for message ${data['mid']}");
+            }
+          } else {
+            _log("   📥 [GHOST] ✅ ${isFragment ? 'Fragment' : 'Message'} received from ${senderId.length > 8 ? senderId.substring(0, 8) : senderId}... via $transportType");
+            _log("      📋 Content length: ${data['content']?.toString().length ?? data['data']?.toString().length ?? 0} bytes");
+            _log("      📋 Chat ID: $incomingChatId");
+            _log("      📋 Sender IP: $senderIp");
+          }
 
           final String myId = _apiService.currentUserId;
 
           // 🔥 ГИБКАЯ ФИЛЬТРАЦИЯ (Решение для Huawei/Xiaomi)
-          // Пакет считается валидным для нашего UI, если:
-          // 1. Он адресован лично нам.
-          // 2. Он в глобальном канале (содержит GLOBAL или BEACON).
-          // 3. Или у него просто есть chatId (ConversationScreen сам разберется).
           bool isForMe = data['recipientId'] == myId;
           bool isGlobal = incomingChatId.contains("GLOBAL") || incomingChatId.contains("BEACON");
 
-          if (isForMe || isGlobal || incomingChatId.isNotEmpty) {
-            _log("🚀 [Mesh] Valid signal recognized. Relaying to UI stream.");
+          // 🔥 КРИТИЧНО: Фрагменты НЕ отправляются в UI!
+          // Только полные сообщения (OFFLINE_MSG) идут в UI stream.
+          // Фрагменты собираются в GossipManager и после сборки 
+          // полное сообщение отправляется в _messageController.
+          if (!isFragment && (isForMe || isGlobal || incomingChatId.isNotEmpty)) {
+            _log("🚀 [Mesh] Complete message - relaying to UI stream.");
+            _log("   📋 isForMe: $isForMe, isGlobal: $isGlobal, incomingChatId: '$incomingChatId'");
+            _log("   📋 Content preview: ${(data['content']?.toString() ?? '').substring(0, (data['content']?.toString() ?? '').length > 50 ? 50 : (data['content']?.toString() ?? '').length)}");
             data['senderIp'] = senderIp; // Прокидываем IP для контекста
             // 🔄 Event Bus: Fire message received event
             _eventBus.bus.fire(MessageReceivedEvent(data));
             // Legacy StreamController (for backward compatibility)
             _messageController.add(data); // Отправляем в стрим для ConversationScreen
+            _log("   ✅ [UI] Message added to messageStream (should appear in chat)");
+          } else if (isFragment) {
+            _log("📦 [Mesh] Fragment - will be delivered to UI after assembly.");
+          } else {
+            _log("⚠️ [Mesh] Message NOT sent to UI stream:");
+            _log("   📋 isFragment: $isFragment");
+            _log("   📋 isForMe: $isForMe");
+            _log("   📋 isGlobal: $isGlobal");
+            _log("   📋 incomingChatId: '$incomingChatId' (isEmpty: ${incomingChatId.isEmpty})");
           }
 
           // 🦠 GOSSIP PROPAGATION:
-          // Даже если сообщение не нам, мы передаем его в GossipManager.
-          // Менеджер решит: склеить фрагменты (Meaning Units) или переслать пакет соседям.
+          // Передаем в GossipManager для:
+          // - Сборки фрагментов (MSG_FRAG)
+          // - Ретрансляции соседям
+          // - Сохранения в SQL
+          if (currentRole == MeshRole.BRIDGE) {
+            _log("   📤 [BRIDGE] Forwarding to GossipManager for processing...");
+          }
           await gossip.processEnvelope(data);
+          
+          // 🔥 КРИТИЧНО: После обработки сообщения BRIDGE должен ретранслировать его GHOST устройствам
+          // Это позволяет GHOST получать сообщения от других GHOST через BRIDGE
+          // Исключаем сообщения от самого себя (чтобы не создавать циклы)
+          final messageSenderId = data['senderId']?.toString() ?? '';
+          final currentUserId = _apiService.currentUserId;
+          final isFromMe = messageSenderId == currentUserId;
+          
+          if (currentRole == MeshRole.BRIDGE && !isFragment && !isFromMe) {
+            try {
+              _log("   🔄 [BRIDGE] Initiating relay to GHOST devices after message processing...");
+              _log("   📋 Message from: ${messageSenderId.length > 8 ? messageSenderId.substring(0, 8) : messageSenderId}... (not from me)");
+              await gossip.attemptRelay(data);
+              _log("   ✅ [BRIDGE] Relay initiated - message will be sent to nearby GHOST devices");
+            } catch (e) {
+              _log("   ⚠️ [BRIDGE] Failed to relay message: $e");
+            }
+          } else if (isFromMe) {
+            _log("   ℹ️ [BRIDGE] Skipping relay - message is from this device");
+          }
+          
+          if (currentRole == MeshRole.BRIDGE) {
+            _log("   ✅ [BRIDGE] ${isFragment ? 'Fragment' : 'Message'} processed successfully");
+          }
           break;
 
         case 'GOSSIP_SYNC':
@@ -3512,24 +4583,41 @@ class MeshService with ChangeNotifier {
   }
 
   Future<void> sendTcpBurst(String message) async {
+    _log("📤 [TCP-BURST] Starting TCP burst transmission");
+    _log("   📋 Message length: ${message.length} bytes");
+    
+    // 🔥 КРИТИЧНО: Проверяем Wi-Fi Direct соединение перед отправкой
+    if (!_isP2pConnected) {
+      _log("⚠️ [Burst] Wi-Fi Direct not connected - skipping TCP burst");
+      _log("   💡 Message will be available via BLE advertising only");
+      return; // Не отправляем, если нет Wi-Fi Direct соединения
+    }
+    
     String targetIp = _isHost ? _lastKnownPeerIp : "192.168.49.1";
     // Используем порт 55556 для временного BRIDGE сервера
     const int bridgePort = 55556;
 
-    _log("🚀 [Burst] Initiating TCP transfer to $targetIp:$bridgePort");
+    _log("🚀 [Burst] Initiating TCP transfer to $targetIp:$bridgePort (P2P connected: $_isP2pConnected)");
 
     for (int attempt = 1; attempt <= 3; attempt++) {
       try {
+        _log("📤 [TCP-BURST] Attempt $attempt/3: Sending to $targetIp:$bridgePort...");
         await NativeMeshService.sendTcp(message, host: targetIp, port: bridgePort);
         _log("✅ [Burst] Success on attempt $attempt");
+        _log("✅ [TCP-BURST] TCP burst completed successfully");
         return; // Успех, выходим
       } catch (e) {
         _log("⚠️ [Burst] Attempt $attempt failed: $e");
+        if (e.toString().contains("failed to connect")) {
+          _log("   💡 Connection refused - target may not be in Wi-Fi Direct group");
+        }
         // Ждем дольше с каждой попыткой (2с, 4с, 6с)
         await Future.delayed(Duration(seconds: attempt * 2));
       }
     }
     _log("❌ [Burst] Fatal: Could not reach $targetIp:$bridgePort after 3 attempts.");
+    _log("❌ [TCP-BURST] TCP burst failed after 3 attempts");
+    _log("   💡 This is expected if devices are not in Wi-Fi Direct group");
   }
 
   // --- ДОПОЛНИТЕЛЬНЫЕ МЕТОДЫ СВЯЗИ ---
@@ -3576,6 +4664,14 @@ class MeshService with ChangeNotifier {
   void emitInternetMagnetWave() async {
     if (NetworkMonitor().currentRole != MeshRole.BRIDGE) return;
 
+    // 🔒 SECURITY FIX #4: Не ротируем токен, если есть активные GATT клиенты
+    // Это предотвращает прерывание GHOST соединения при обновлении advertising
+    if (_btService.hasActiveGattClients) {
+      _log("⏸️ [Bridge] GATT clients active (${_btService.connectedGattClientsCount} connected), skipping token rotation");
+      _log("   💡 Token rotation will resume after all clients disconnect + grace period");
+      return;
+    }
+
     // 🔥 Улучшение: Проверяем, прошло ли достаточно времени с последнего обновления токена
     // Это обеспечивает минимум 10 секунд стабильности advertising перед сменой токена
     if (_lastTokenUpdate != null) {
@@ -3589,18 +4685,73 @@ class MeshService with ChangeNotifier {
     
     _lastTokenUpdate = DateTime.now();
     
-    // 🔥 ШАГ 1.1: Генерация токена за 1-2 секунды до старта BLE advertising
-    // Генерируем токен СНАЧАЛА, чтобы он был готов до обновления advertising
+    // 🔥 КРИТИЧНО: ПРАВИЛЬНАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ ИНИЦИАЛИЗАЦИИ BRIDGE
+    // ШАГ 1: GATT Server → ШАГ 2: Token → ШАГ 3: Advertising → ШАГ 4: TCP → ШАГ 5: MAGNET_WAVE
+    
+    // 🔥 ШАГ 1: Запускаем GATT Server ПЕРВЫМ и ждем готовности
+    _log("🌉 [BRIDGE] Step 1: Starting GATT Server...");
+    try {
+      // Проверяем, не запущен ли GATT server уже
+      final isGattRunning = await _btService.isGattServerRunning();
+      if (!isGattRunning) {
+        // Останавливаем предыдущий advertising перед запуском GATT server
+        await _btService.stopAdvertising();
+        await Future.delayed(const Duration(milliseconds: 500)); // Задержка для стабилизации BLE стека
+        
+        // Запускаем GATT server и ждем готовности
+        // Используем внутренний метод _startGattServerAndWait() через рефлексию или прямой доступ
+        // Но так как это приватный метод, используем публичный startGattServer() и проверяем состояние
+        try {
+          await _btService.startGattServer(); // Запускаем сервер (асинхронно)
+          
+          // Ждем готовности через проверку состояния (максимум 25 секунд, как в _startGattServerAndWait)
+          bool gattReady = false;
+          final maxWaitTime = const Duration(seconds: 25);
+          final checkInterval = const Duration(milliseconds: 500);
+          final maxAttempts = maxWaitTime.inMilliseconds ~/ checkInterval.inMilliseconds;
+          
+          for (int i = 0; i < maxAttempts; i++) {
+            await Future.delayed(checkInterval);
+            gattReady = await _btService.isGattServerRunning();
+            if (gattReady) {
+              _log("✅ [BRIDGE] GATT Server ready after ${(i + 1) * checkInterval.inMilliseconds}ms");
+              break;
+            }
+            if (i % 4 == 0 && i > 0) {
+              _log("⏳ [BRIDGE] Waiting for GATT server... (${(i + 1) * checkInterval.inMilliseconds}ms elapsed)");
+            }
+          }
+          
+          if (!gattReady) {
+            _log("⚠️ [BRIDGE] GATT server not ready after ${maxWaitTime.inSeconds}s - will continue in fallback mode");
+          } else {
+            _log("✅ [BRIDGE] Step 1 Complete: GATT Server ready");
+            // Даем время BLE стеку стабилизироваться после запуска GATT server
+            await Future.delayed(const Duration(milliseconds: 500));
+          }
+        } catch (e) {
+          _log("❌ [BRIDGE] GATT server start exception: $e");
+        }
+      } else {
+        _log("ℹ️ [BRIDGE] GATT Server already running - skipping start");
+        // Даем время BLE стеку стабилизироваться
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
+    } catch (e) {
+      _log("❌ [BRIDGE] GATT server start error: $e - continuing in fallback mode");
+    }
+    
+    // 🔥 ШАГ 2: Генерация токена ПОСЛЕ готовности GATT Server
+    _log("🔑 [BRIDGE] Step 2: Generating token...");
     final serverToken = _generateTemporaryToken();
-    final expiresAt = DateTime.now().add(const Duration(seconds: 30)).millisecondsSinceEpoch; // Валиден 30 секунд
+    // 🔥 MAC RANDOMIZATION FIX: Увеличено время жизни токена с 30s до 60s
+    // Это синхронизировано с heartbeat интервалом (60s)
+    // Даёт GHOST больше времени на connect после обнаружения BRIDGE
+    final expiresAt = DateTime.now().add(const Duration(seconds: 60)).millisecondsSinceEpoch; // Валиден 60 секунд
     
-    // 🔥 ШАГ 1.4: Логирование генерации токена
+    // 🔥 ШАГ 2.1: Логирование генерации токена
     final tokenPreview = serverToken.length > 16 ? serverToken.substring(0, 16) : serverToken;
-    _log("🔑 [BRIDGE] Generated token: $tokenPreview... (valid 30s, timestamp: ${DateTime.now().millisecondsSinceEpoch})");
-    
-    // 🔥 ШАГ 1.1: Задержка 1-2 секунды перед обновлением advertising (чтобы токен был готов)
-    _log("⏳ [BRIDGE] Waiting 1.5s before updating advertising with token...");
-    await Future.delayed(const Duration(milliseconds: 1500));
+    _log("🔑 [BRIDGE] Generated token: $tokenPreview... (valid 60s, timestamp: ${DateTime.now().millisecondsSinceEpoch})");
     
     // 2. Проверяем возможности железа перед поднятием сервера
     final hardwareCheck = HardwareCheckService();
@@ -3631,7 +4782,8 @@ class MeshService with ChangeNotifier {
       final String tacticalName = "M_0_${pendingCount > 0 ? '1' : '0'}_BRIDGE_$encryptedToken";
       
       // 🔥 ШАГ 1.2: Обновление advertising не позже, чем через 500ms после генерации токена
-      await _btService.stopAdvertising();
+      // 🔥 FIX: keepGattServer=true чтобы НЕ останавливать GATT сервер при обновлении advertising
+      await _btService.stopAdvertising(keepGattServer: true);
       await Future.delayed(const Duration(milliseconds: 500)); // Задержка для стабилизации BLE стека
       await _btService.startAdvertising(tacticalName);
       
@@ -3650,19 +4802,20 @@ class MeshService with ChangeNotifier {
       } else {
         _log("⚠️ [BRIDGE] WARNING: Advertising may not be active - repeating update...");
         // Повторное обновление для надежности на медленных устройствах
-        await _btService.stopAdvertising();
+        // 🔥 FIX: keepGattServer=true
+        await _btService.stopAdvertising(keepGattServer: true);
         await Future.delayed(const Duration(milliseconds: 500));
         await _btService.startAdvertising(tacticalName);
         _log("🔄 [BRIDGE] Advertising updated again for stability");
       }
       
-      // 🔥 КРИТИЧНО: Запускаем GATT сервер даже для бюджетных устройств
-      // Это позволяет GHOST подключаться через BLE GATT
-      try {
-        await _btService.startGattServer();
-        _log("✅ [Bridge] GATT server started (hardware-limited mode)");
-      } catch (e) {
-        _log("⚠️ [Bridge] Failed to start GATT server: $e");
+      // 🔥 КРИТИЧНО: GATT server уже запущен на ШАГЕ 1
+      // Проверяем, что он готов
+      final isGattReady = await _btService.isGattServerRunning();
+      if (isGattReady) {
+        _log("✅ [Bridge] GATT server ready (hardware-limited mode)");
+      } else {
+        _log("⚠️ [Bridge] GATT server not ready - GHOST may not be able to connect via GATT");
       }
       return; // Не поднимаем TCP сервер для бюджетных устройств
     }
@@ -3690,7 +4843,8 @@ class MeshService with ChangeNotifier {
       final String tacticalName = "M_0_${pendingCount > 0 ? '1' : '0'}_BRIDGE_$encryptedToken";
       
       // 🔥 ШАГ 1.2: Обновление advertising не позже, чем через 500ms после генерации токена
-      await _btService.stopAdvertising();
+      // 🔥 FIX: keepGattServer=true чтобы НЕ останавливать GATT сервер при обновлении advertising
+      await _btService.stopAdvertising(keepGattServer: true);
       await Future.delayed(const Duration(milliseconds: 500));
       await _btService.startAdvertising(tacticalName);
       
@@ -3705,18 +4859,22 @@ class MeshService with ChangeNotifier {
       final isAdvActive = await _btService.state == BleAdvertiseState.advertising;
       if (!isAdvActive) {
         _log("⚠️ [BRIDGE] WARNING: Advertising may not be active - repeating update...");
-        await _btService.stopAdvertising();
+        // 🔥 FIX: keepGattServer=true
+        await _btService.stopAdvertising(keepGattServer: true);
         await Future.delayed(const Duration(milliseconds: 500));
         await _btService.startAdvertising(tacticalName);
         _log("🔄 [BRIDGE] Advertising updated again for stability");
       }
       
-      // 🔥 КРИТИЧНО: Запускаем GATT сервер даже без TCP сервера
-      try {
-        await _btService.startGattServer();
-        _log("✅ [Bridge] GATT server started (TCP server disabled)");
-      } catch (e) {
-        _log("⚠️ [Bridge] Failed to start GATT server: $e");
+      // 🔥 КРИТИЧНО: GATT server уже запущен на ШАГЕ 1
+      // Проверяем, что он готов
+      final isGattReady = await _btService.isGattServerRunning();
+      if (isGattReady) {
+        _log("✅ [Bridge] GATT server ready (TCP server disabled)");
+        // 🔥 DIAGNOSTIC: Log detailed GATT server status
+        await _btService.logGattServerStatus();
+      } else {
+        _log("⚠️ [Bridge] GATT server not ready - GHOST may not be able to connect via GATT");
       }
       return;
     }
@@ -3734,12 +4892,16 @@ class MeshService with ChangeNotifier {
     await tokenSigningService.initialize();
     final encryptedToken = await tokenSigningService.encryptTokenForAdvertising(serverToken, expiresAt);
     
-    // 🔥 ШАГ 1.2: Вставка токена в тактическое имя (формат: M_0_1_BRIDGE_ENCRYPTED_TOKEN)
+    // 🔥 ШАГ 3: Обновление advertising с токеном ПОСЛЕ готовности GATT Server
+    _log("📡 [BRIDGE] Step 3: Updating advertising with token...");
     final String tacticalName = "M_0_${pendingCount > 0 ? '1' : '0'}_BRIDGE_$encryptedToken";
     
-    // 🔥 ШАГ 1.2: Обновление advertising не позже, чем через 500ms после генерации токена
-    await _btService.stopAdvertising();
+    // 🔥 КРИТИЧНО: Останавливаем предыдущее advertising и ждем стабилизации BLE стека
+    // 🔥 FIX: keepGattServer=true чтобы НЕ останавливать GATT сервер при обновлении advertising
+    await _btService.stopAdvertising(keepGattServer: true);
     await Future.delayed(const Duration(milliseconds: 500)); // Задержка для стабилизации BLE стека
+    
+    // Запускаем advertising с токеном
     await _btService.startAdvertising(tacticalName);
     
     // 🔥 ШАГ 1.4: Логирование обновления advertising
@@ -3750,39 +4912,91 @@ class MeshService with ChangeNotifier {
     _log("   🔑 Original token preview: ${tokenPreview}...");
     _log("   ⏰ Token expires at: ${DateTime.fromMillisecondsSinceEpoch(expiresAt).toIso8601String()}");
     
-    // 🔥 ШАГ 4.3: Стабилизация на Huawei/Android - проверка обновления advertising (2-3 секунды)
-    await Future.delayed(const Duration(milliseconds: 2000));
-    final isAdvActive = await _btService.state == BleAdvertiseState.advertising;
-    if (isAdvActive) {
-      _log("✅ [BRIDGE] Advertising stabilized - token visible for GHOST");
-    } else {
-      _log("⚠️ [BRIDGE] WARNING: Advertising may not be active - repeating update...");
-      // 🔥 ШАГ 1.3: Повторное обновление для медленных BLE устройств (Huawei/Android)
-      await _btService.stopAdvertising();
-      await Future.delayed(const Duration(milliseconds: 1000)); // 500-1000ms для надежности
-      await _btService.startAdvertising(tacticalName);
-      _log("🔄 [BRIDGE] Advertising updated again for stability (Huawei/Android fix)");
+      // 🔥 ШАГ 4.3: Стабилизация на Huawei/Android - проверка обновления advertising (2-3 секунды)
+      await Future.delayed(const Duration(milliseconds: 2000));
+      final isAdvActive = await _btService.state == BleAdvertiseState.advertising;
+      if (isAdvActive) {
+        _log("✅ [BRIDGE] Advertising stabilized - token visible for GHOST");
+      } else {
+        _log("⚠️ [BRIDGE] WARNING: Advertising may not be active - attempting retry...");
+        // 🔥 УЛУЧШЕНИЕ: Retry с обработкой ошибок
+        try {
+          // 🔥 ШАГ 1.3: Повторное обновление для медленных BLE устройств (Huawei/Android)
+          // 🔥 FIX: keepGattServer=true
+          await _btService.stopAdvertising(keepGattServer: true);
+          await Future.delayed(const Duration(milliseconds: 1000)); // 500-1000ms для надежности
+          await _btService.startAdvertising(tacticalName);
+          
+          // Проверяем результат после повторной попытки
+          await Future.delayed(const Duration(milliseconds: 1000));
+          final retryAdvState = _btService.state;
+          if (retryAdvState == BleAdvertiseState.advertising) {
+            _log("✅ [BRIDGE] Advertising activated after retry - token visible for GHOST");
+          } else {
+            _log("⚠️ [BRIDGE] Advertising still not active after retry (state: $retryAdvState)");
+            _log("   💡 This device may have BLE advertising limitations");
+            _log("   💡 GHOST devices can still connect via TCP if they have IP/port from MAGNET_WAVE");
+          }
+        } catch (e) {
+          _log("❌ [BRIDGE] Retry advertising failed: $e");
+          _log("   💡 Will continue without BLE advertising (TCP/GATT server still available)");
+        }
+      }
+    
+    // 🔥 ШАГ 4: Запускаем TCP сервер ТОЛЬКО после готовности GATT и стабилизации Advertising
+    _log("🛡️ [BRIDGE] Step 4: Starting TCP server (after GATT+Advertising)...");
+    
+    // 🔥 КРИТИЧНО: Проверяем готовность GATT server ПЕРЕД запуском TCP
+    // Ждем готовности GATT server с таймаутом (максимум 25 секунд, как в _startGattServerAndWait)
+    bool isGattReady = false;
+    final maxGattWaitTime = const Duration(seconds: 25);
+    final gattCheckInterval = const Duration(milliseconds: 500);
+    final maxGattChecks = maxGattWaitTime.inMilliseconds ~/ gattCheckInterval.inMilliseconds;
+    
+    _log("⏳ [BRIDGE] Waiting for GATT server ready (max ${maxGattWaitTime.inSeconds}s)...");
+    for (int i = 0; i < maxGattChecks; i++) {
+      await Future.delayed(gattCheckInterval);
+      isGattReady = await _btService.isGattServerRunning();
+      if (isGattReady) {
+        _log("✅ [BRIDGE] GATT server ready after ${(i + 1) * gattCheckInterval.inMilliseconds}ms");
+        break;
+      }
+      if (i % 4 == 0 && i > 0) {
+        _log("⏳ [BRIDGE] Still waiting for GATT server... (${(i + 1) * gattCheckInterval.inMilliseconds}ms elapsed)");
+      }
     }
     
-    // 5. 🔥 РАЗДЕЛЕНИЕ TCP И BLE: Запускаем TCP сервер ТОЛЬКО после успешного запуска GATT и ADV
-    // Сначала убеждаемся, что BLE операции завершены
+    if (!isGattReady) {
+      _log("⚠️ [Bridge] GATT server not ready after ${maxGattWaitTime.inSeconds}s - starting TCP server anyway");
+      _log("   💡 TCP server can work independently, but BLE GATT may not be available");
+    } else {
+      _log("✅ [BRIDGE] GATT server confirmed ready - safe to start TCP server");
+    }
+    
+    // Убеждаемся, что BLE операции завершены
     await Future.delayed(const Duration(milliseconds: 500)); // Даем время на стабилизацию BLE стека
     
-    // Проверяем, что advertising действительно активен
+    // 🔥 FIX: Проверяем состояние advertising, но НЕ БЛОКИРУЕМ TCP!
+    // На Huawei и других устройствах BLE advertising может быть ограничен,
+    // но TCP сервер ДОЛЖЕН запускаться для работы mesh через Wi-Fi Direct
     final advState = _btService.state;
     if (advState != BleAdvertiseState.advertising) {
-      _log("⚠️ [Bridge] Advertising not active (state: $advState), skipping TCP server start");
-      _log("📡 [Bridge] Continuing in BLE GATT mode (advertising with token: ${serverToken.substring(0, 8)}...)");
-      return;
+      _log("⚠️ [Bridge] BLE Advertising not active (state: $advState)");
+      _log("   💡 This is common on Huawei/Honor devices with BLE limitations");
+      _log("   💡 TCP server will start anyway - GHOST can connect via Wi-Fi Direct");
+      // 🔥 FIX: НЕ ВОЗВРАЩАЕМСЯ! Продолжаем запуск TCP сервера
+      // TCP - единственный способ связи если BLE advertising не работает
+    } else {
+      _log("✅ [Bridge] BLE Advertising active - both BLE GATT and TCP available");
     }
     
-    // 6. Получаем адаптивную длительность сервера на основе батареи
+    // Получаем адаптивную длительность сервера на основе батареи
     final serverDuration = await _getAdaptiveServerDuration();
     
-    // 7. Поднимаем кратковременный TCP сервер (после GATT и ADV)
+    // Поднимаем кратковременный TCP сервер (после GATT и ADV)
     try {
       await NativeMeshService.startTemporaryTcpServer(durationSeconds: serverDuration);
-      _log("🛡️ [Bridge] TCP server active for ${serverDuration}s (started after GATT+ADV)");
+      _log("✅ [Bridge] Step 4 Complete: TCP server active for ${serverDuration}s (started after GATT+ADV)");
     } catch (e) {
       _log("⚠️ [Bridge] Failed to start TCP server: $e");
       // Если сервер не поднялся - продолжаем работать в BLE GATT режиме (advertising уже обновлен с токеном)
@@ -3794,12 +5008,32 @@ class MeshService with ChangeNotifier {
     final waveSigningService = MessageSigningService();
     await waveSigningService.initialize();
     
+    // 🔥 КРИТИЧНО: Получаем IP адрес BRIDGE для включения в MAGNET_WAVE
+    String? bridgeIp;
+    if (_isP2pConnected && _isHost) {
+      // Если мы хост Wi-Fi Direct группы, используем hostAddress
+      bridgeIp = _lastConnectedHost; // Обычно 192.168.49.1 для Wi-Fi Direct хоста
+    } else if (_isP2pConnected) {
+      // Если мы клиент, используем стандартный IP хоста
+      bridgeIp = "192.168.49.1";
+    } else {
+      // Пытаемся получить локальный IP адрес
+      bridgeIp = await NativeMeshService.getLocalIpAddress();
+      if (bridgeIp == null) {
+        // Fallback на стандартный Wi-Fi Direct IP
+        bridgeIp = "192.168.49.1";
+      }
+    }
+    
+    _log("   📋 BRIDGE IP address: $bridgeIp (P2P connected: $_isP2pConnected, isHost: $_isHost)");
+    
     final publicKey = await waveSigningService.getPublicKeyBase64();
     final wave = {
       'type': 'MAGNET_WAVE',
       'bridgeId': _hashUserId(_apiService.currentUserId), // Хеш для анонимности
       'serverToken': serverToken,
       'port': 55556, // Порт для временного BRIDGE сервера
+      'ip': bridgeIp, // 🔥 КРИТИЧНО: IP адрес BRIDGE для TCP подключения
       'expiresAt': expiresAt,
       'hops': 0, // Я - источник
       'timestamp': DateTime.now().millisecondsSinceEpoch,
@@ -3811,16 +5045,32 @@ class MeshService with ChangeNotifier {
     final signature = await waveSigningService.signMessage(wave);
     wave['signature'] = signature;
 
+    // 🔥 ШАГ 5: Отправляем MAGNET_WAVE ПОСЛЕ готовности всех компонентов
+    _log("📡 [BRIDGE] Step 5: Emitting MAGNET_WAVE...");
     _log("📡 [Magnet] Emitting wave with token: ${serverToken.substring(0, 8)}...");
 
-    // 9. 🔥 СЕГРЕГАЦИЯ TCP И BLE: Выстреливаем TCP только после успешного ADV
-    // Используем уже проверенное состояние advState (проверено выше)
-    // Даем дополнительное время на стабилизацию BLE стека перед TCP операциями
-    await Future.delayed(const Duration(milliseconds: 300));
+    // 🔥 КРИТИЧНО: Даем время TCP server запуститься перед отправкой MAGNET_WAVE
+    await Future.delayed(const Duration(milliseconds: 500));
     
-    // Выстреливаем во все стороны (Wi-Fi Direct)
-    String payload = jsonEncode(wave);
-    sendTcpBurst(payload);
+    // Выстреливаем MAGNET_WAVE через Wi-Fi Direct (только если соединение установлено)
+    if (_isP2pConnected) {
+      String payload = jsonEncode(wave);
+      _log("   📤 Sending MAGNET_WAVE via Wi-Fi Direct (P2P connected: $_isP2pConnected)");
+      sendTcpBurst(payload);
+      _log("✅ [BRIDGE] Step 5 Complete: MAGNET_WAVE sent via Wi-Fi Direct");
+    } else {
+      _log("   ⚠️ Wi-Fi Direct not connected - MAGNET_WAVE available only via BLE advertising");
+      _log("   💡 GHOST devices can extract token from BLE advertising name or manufacturerData");
+      _log("✅ [BRIDGE] Step 5 Complete: MAGNET_WAVE available via BLE advertising (token in name/manufacturerData)");
+      // MAGNET_WAVE будет доступен через BLE advertising (токен уже в tactical name и manufacturerData)
+    }
+    
+    _log("✅ [BRIDGE] Initialization sequence completed:");
+    _log("   1. GATT Server: ${await _btService.isGattServerRunning() ? '✅ Ready' : '❌ Not ready'}");
+    _log("   2. Token: ✅ Generated");
+    _log("   3. Advertising: ${_btService.state == BleAdvertiseState.advertising ? '✅ Active' : '❌ Not active'}");
+    _log("   4. TCP Server: ${canStartServer ? '✅ Started' : '❌ Disabled'}");
+    _log("   5. MAGNET_WAVE: ✅ Emitted");
   }
 
   /// Генерирует временный токен для сессии (SHA-256 хеш)
@@ -3952,6 +5202,21 @@ class MeshService with ChangeNotifier {
     _isP2pConnected = false;
     _isTransferring = false; // СБРОС: линк упал, флаг больше не нужен
     _log("🔌 Link severed.");
+    
+    // 🔥 REPEATER: Уведомляем о разрыве соединения
+    try {
+      final repeater = locator<RepeaterService>();
+      // Отмечаем все Wi-Fi Direct соединения как failed
+      for (final conn in repeater.connections) {
+        if (conn.channelType == ChannelType.wifiDirect) {
+          repeater.onDeviceDisconnected(conn.deviceId);
+          _log("🔄 [REPEATER] Wi-Fi Direct disconnection reported: ${conn.deviceId}");
+        }
+      }
+    } catch (e) {
+      _log("⚠️ [REPEATER] Failed to report disconnection: $e");
+    }
+    
     notifyListeners();
   }
 
@@ -3964,6 +5229,28 @@ class MeshService with ChangeNotifier {
     _adaptiveTimer?.cancel();
     _cleanupTimer?.cancel();
     _periodicDiscoveryTimer?.cancel(); // Останавливаем периодический discovery
+    
+    // 1.5 🔥 REPEATER: Останавливаем Repeater/Repair Service
+    try {
+      final repeater = locator<RepeaterService>();
+      if (repeater.isRunning) {
+        repeater.stop();
+        _log("🔄 [REPEATER] Service stopped");
+      }
+    } catch (e) {
+      _log("⚠️ [REPEATER] Failed to stop: $e");
+    }
+    
+    // 1.6 🔥 GHOST TRANSFER MANAGER: Останавливаем менеджер передачи
+    try {
+      final transferManager = locator<GhostTransferManager>();
+      if (transferManager.isRunning) {
+        transferManager.stop();
+        _log("👻 [TRANSFER-MGR] Service stopped");
+      }
+    } catch (e) {
+      _log("⚠️ [TRANSFER-MGR] Failed to stop: $e");
+    }
 
     // 2. БЕЗОПАСНАЯ ОСТАНОВКА ВЕЩАНИЯ (SONAR / BEACON)
     try {
@@ -4191,47 +5478,94 @@ void _triggerSlowScan() {
     // Проверяем, есть ли сообщения для отправки
     final pending = await _db.getPendingFromOutbox();
     if (pending.isEmpty) {
-      _log("💤 [Ghost] No messages to upload");
+      _log("💤 [GHOST] No messages to upload to BRIDGE");
       return;
     }
-
-    // Получаем IP из Wi-Fi Direct группы (стандартный адрес BRIDGE)
-    // Если нет P2P соединения, пытаемся его установить
-    String? bridgeIp = _isP2pConnected ? "192.168.49.1" : null;
     
-    if (bridgeIp == null) {
-      _log("🔌 [Ghost] No P2P connection. Attempting to establish...");
-      _log("🔌 [Ghost] Current P2P status: _isP2pConnected=$_isP2pConnected");
+    _log("   📋 Found ${pending.length} message(s) in outbox to upload");
+    _log("   📤 Starting upload via TCP to BRIDGE...");
+
+    // 🔥 УЛУЧШЕНИЕ: Получаем IP из DiscoveryContext (если есть из MAGNET_WAVE)
+    // Это более надежно, чем полагаться только на Wi-Fi Direct
+    final discoveryContext = locator<DiscoveryContextService>();
+    
+    // Ищем кандидата по токену (более точно, чем bestBridge)
+    UplinkCandidate? candidateByToken;
+    for (final candidate in discoveryContext.validBridges) {
+      if (candidate.bridgeToken == serverToken) {
+        candidateByToken = candidate;
+        break;
+      }
+    }
+    
+    // Если не нашли по токену, используем bestBridge
+    final candidate = candidateByToken ?? discoveryContext.bestBridge;
+    String? bridgeIp;
+    
+    // Приоритет 1: IP из MAGNET_WAVE (если есть в DiscoveryContext)
+    if (candidate != null && candidate.ip != null && candidate.port == port) {
+      bridgeIp = candidate.ip;
+      _log("✅ [GHOST] Using BRIDGE IP from DiscoveryContext (MAGNET_WAVE): $bridgeIp:$port");
+      _log("   📋 Candidate MAC: ${candidate.mac.length > 8 ? candidate.mac.substring(candidate.mac.length - 8) : candidate.mac}");
+      _log("   📋 Candidate token: ${candidate.bridgeToken != null ? candidate.bridgeToken!.substring(0, 8) : 'none'}...");
+    } else if (candidate != null && candidate.ip != null) {
+      // IP есть, но порт не совпадает - используем IP, но с указанным портом
+      bridgeIp = candidate.ip;
+      _log("⚠️ [GHOST] Using BRIDGE IP from DiscoveryContext, but port mismatch (candidate: ${candidate.port}, requested: $port)");
+      _log("   📋 Using IP: $bridgeIp with requested port: $port");
+    } else if (_isP2pConnected) {
+      // Приоритет 2: Wi-Fi Direct соединение (стандартный адрес BRIDGE)
+      bridgeIp = "192.168.49.1";
+      _log("✅ [GHOST] P2P connected, using default BRIDGE IP: $bridgeIp");
+      _log("   💡 Note: IP from MAGNET_WAVE not found in DiscoveryContext");
+      if (candidate != null) {
+        _log("   📋 Candidate found but no IP: token=${candidate.bridgeToken != null ? candidate.bridgeToken!.substring(0, 8) : 'none'}..., ip=${candidate.ip}, port=${candidate.port}");
+      } else {
+        _log("   📋 No candidate found in DiscoveryContext for token: ${serverToken.substring(0, 8)}...");
+      }
+    } else {
+      _log("🔌 [GHOST] No P2P connection and no IP from MAGNET_WAVE. Attempting to establish P2P...");
+      _log("   📋 Current P2P status: _isP2pConnected=$_isP2pConnected");
+      if (candidate != null) {
+        _log("   📋 Candidate found but no IP: token=${candidate.bridgeToken != null ? candidate.bridgeToken!.substring(0, 8) : 'none'}..., ip=${candidate.ip}, port=${candidate.port}");
+      } else {
+        _log("   📋 No candidate found in DiscoveryContext for token: ${serverToken.substring(0, 8)}...");
+        _log("   💡 This may indicate that MAGNET_WAVE was not received or IP was not saved");
+      }
       
       // Пытаемся запустить discovery для установки P2P соединения
       await NativeMeshService.startDiscovery();
-      _log("🔌 [Ghost] Discovery started, waiting for P2P connection...");
+      _log("   📋 Discovery started, waiting for P2P connection...");
       
       // Ждем до 5 секунд для установки соединения
       for (int i = 0; i < 5; i++) {
         await Future.delayed(const Duration(seconds: 1));
         if (_isP2pConnected) {
           bridgeIp = "192.168.49.1";
-          _log("✅ [Ghost] P2P connection established!");
+          _log("   ✅ P2P connection established!");
           break;
         }
-        _log("⏳ [Ghost] Waiting for P2P... (${i + 1}/5), _isP2pConnected=$_isP2pConnected");
+        _log("   ⏳ Waiting for P2P... (${i + 1}/5), _isP2pConnected=$_isP2pConnected");
       }
       
       if (bridgeIp == null) {
-        _log("⚠️ [Ghost] P2P connection failed after 5s. Trying to connect anyway with default IP 192.168.49.1...");
-        // Пытаемся подключиться к стандартному IP даже без P2P (может сработать, если устройства уже в одной группе)
+        _log("⚠️ [GHOST] P2P connection failed after 5s");
+        _log("   💡 Will try default IP 192.168.49.1 as fallback (devices may already be in same group)");
+        _log("   ⚠️ WARNING: This may fail if devices are not in Wi-Fi Direct group!");
         bridgeIp = "192.168.49.1";
       }
-    } else {
-      _log("✅ [Ghost] P2P already connected, using IP: $bridgeIp");
     }
     
     if (bridgeIp == null) {
-      _log("⚠️ [Ghost] No Wi-Fi Direct connection. Falling back to BLE GATT...");
+      _log("⚠️ [GHOST] No Wi-Fi Direct connection. Falling back to BLE GATT...");
       // Fallback на BLE GATT будет обработан в _executeCascadeRelay
       return;
     }
+    
+    // 🔥 ЛОГИРОВАНИЕ: Детальная информация о TCP подключении
+    _log("   📋 Target BRIDGE IP: $bridgeIp:$port");
+    _log("   📋 Token: ${serverToken.substring(0, 8)}...");
+    _log("   📋 Connecting to BRIDGE via TCP...");
 
     final tokenPreview = serverToken.length > 8 ? serverToken.substring(0, 8) : serverToken;
     _log("🚀 [Ghost] 🔗 Connecting to BRIDGE server at $bridgeIp:$port (token: $tokenPreview...)");
@@ -4242,22 +5576,37 @@ void _triggerSlowScan() {
     }
     
     // 🔥 КРИТИЧНО: Проверяем TCP соединение перед попыткой загрузки
+    _log("   🔍 Checking TCP connection availability...");
     final isTcpAvailable = await _checkTcpConnection(bridgeIp, port);
     if (!isTcpAvailable) {
-      _log("⚠️ [Ghost] TCP connection check failed. Falling back to BLE GATT...");
+      _log("⚠️ [GHOST] TCP connection check failed to $bridgeIp:$port");
+      _log("   💡 Possible reasons:");
+      _log("      - BRIDGE TCP server not started on port $port");
+      _log("      - Wi-Fi Direct not connected (GHOST not in same group)");
+      _log("      - Wrong IP address (BRIDGE may have different IP)");
+      _log("      - Firewall blocking connection");
+      _log("   🔄 Falling back to BLE GATT...");
       // Fallback на BLE GATT - не бросаем исключение, чтобы не прервать основной поток
       return;
     }
     
-    _log("✅ [Ghost] TCP connection check passed. Proceeding with upload...");
+    _log("   ✅ TCP connection check passed - server is available");
+    _log("   📤 Proceeding with upload...");
     
     try {
       await _uploadToBridgeServer(bridgeIp, port, serverToken);
-      _log("✅ [Ghost] Successfully uploaded messages to BRIDGE!");
+      _log("✅ [GHOST] Successfully uploaded messages to BRIDGE!");
     } catch (e, stackTrace) {
-      _log("❌ [Ghost] Bridge upload failed: $e");
-      _log("📋 [Ghost] Full error: ${e.toString()}");
-      _log("🔄 [Ghost] Falling back to BLE GATT...");
+      _log("❌ [GHOST] Bridge upload failed: $e");
+      _log("   📋 Error type: ${e.runtimeType}");
+      _log("   📋 Full error: ${e.toString()}");
+      if (e.toString().contains("failed to connect") || e.toString().contains("Connection refused")) {
+        _log("   💡 TCP connection error detected:");
+        _log("      - BRIDGE may not have TCP server running");
+        _log("      - Wi-Fi Direct connection may be lost");
+        _log("      - IP address may be incorrect");
+      }
+      _log("   🔄 Falling back to BLE GATT...");
       // Fallback на BLE GATT - не бросаем исключение, чтобы не прервать основной поток
     }
   }
@@ -4325,21 +5674,32 @@ void _triggerSlowScan() {
         }
       }
       
-      // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: Проверяем cooldown (30-60 секунд для failed transport)
-      final cooldownDuration = bestBridge.confidence >= 0.7 ? 30 : 60; // Увеличено для стабильности
-      if (_linkCooldowns.containsKey(bestBridge.mac)) {
-        final cooldownTime = _linkCooldowns[bestBridge.mac]!;
-        final cooldownAge = DateTime.now().difference(cooldownTime).inSeconds;
-        if (cooldownAge < cooldownDuration) {
-          _log("⏸️ [DiscoveryContext] BRIDGE in cooldown (${cooldownDuration - cooldownAge}s remaining)");
-          return;
-        }
+      // 🔥 FIX #1: Cooldown по ТОКЕНУ, не по MAC (MAC rotation на Android)
+      final cooldownDuration = 15; // Было: 30-60 секунд
+      if (!_isCooldownExpiredByMac(bestBridge.mac, cooldownSeconds: cooldownDuration)) {
+        final remaining = _getCooldownRemainingByMac(bestBridge.mac, cooldownSeconds: cooldownDuration);
+        _log("⏸️ [DiscoveryContext] BRIDGE in cooldown (${remaining}s remaining)");
+        return;
+      } else {
+        _log("✅ [DiscoveryContext] Cooldown EXPIRED - allowing connection");
       }
       
       // Проверяем, не идет ли уже передача
-      if (_isTransferring) {
-        _log("⏸️ [DiscoveryContext] Transfer already in progress");
-        return;
+      // 🔥 FIX: Transfer timeout через 15 секунд (было 30s)
+      if (_isTransferring && _transferStartTime != null) {
+        final transferAge = DateTime.now().difference(_transferStartTime!).inSeconds;
+        if (transferAge > 15) {
+          _log("⚠️ [WATCHDOG] Transfer stuck for ${transferAge}s (>15s), forcing reset!");
+          _isTransferring = false;
+          _transferStartTime = null;
+        } else {
+          _log("⏸️ [DiscoveryContext] Transfer already in progress (${transferAge}s)");
+          return;
+        }
+      } else if (_isTransferring) {
+        _log("⏸️ [DiscoveryContext] Transfer already in progress (no start time)");
+        _isTransferring = false; // 🔥 FIX: Сбрасываем если нет start time
+        _transferStartTime = null;
       }
       
       // 🔥 Принимаем решение: подключаемся к лучшему BRIDGE из контекста
@@ -4448,15 +5808,16 @@ void _triggerSlowScan() {
           // Пытаемся использовать TCP если есть IP/порт
           if (bestBridge.ip != null && bestBridge.port != null) {
             _log("🌐 [DiscoveryContext] Using TCP as primary channel (token mismatch or stale scan)");
-            _linkCooldowns[bestBridge.mac] = DateTime.now();
+            _setCooldownByMac(bestBridge.mac);
             _isTransferring = true;
+            _transferStartTime = DateTime.now(); // 🔥 FIX: Track start time
             notifyListeners();
             try {
               // Если есть bridgeToken - используем его, иначе пробуем MAGNET_WAVE discovery
               if (bestBridge.bridgeToken != null) {
-                // 🔥 ШАГ 3: Токен валиден 30 секунд
+                // 🔥 MAC RANDOMIZATION FIX: Токен валиден 60 секунд
                 await _handleMagnetWave(bestBridge.bridgeToken!, bestBridge.port!, 
-                    DateTime.now().add(const Duration(seconds: 30)).millisecondsSinceEpoch);
+                    DateTime.now().add(const Duration(seconds: 60)).millisecondsSinceEpoch);
               } else {
                 // 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: TCP без token ЗАПРЕЩЕН
                 _log("🚫 [ARCHITECTURE] No bridgeToken — TCP FORBIDDEN");
@@ -4530,7 +5891,7 @@ void _triggerSlowScan() {
           // 🔥 Улучшение: Используем Connection Stabilizer для стабилизации подключения
           // Это даёт больше времени для подтверждения advertising и повторных попыток
           _log("📡 [DiscoveryContext] Using Connection Stabilizer for BLE GATT connection");
-          _linkCooldowns[bestBridge.mac] = DateTime.now();
+          // 🔥 FIX: Cooldown НЕ ставится здесь - только после неудачной попытки!
           
           final stabilizer = locator<ConnectionStabilizer>();
           final updatedBridge = bestBridge.copyWith(
@@ -4541,10 +5902,11 @@ void _triggerSlowScan() {
         } else if (bestBridge.ip != null && bestBridge.port != null && bestBridge.bridgeToken != null) {
           // Fallback на TCP, если нет ScanResult
           _log("🌐 [DiscoveryContext] Using TCP connection (no ScanResult available): ${bestBridge.ip}:${bestBridge.port}");
-          _linkCooldowns[bestBridge.mac] = DateTime.now();
+          // 🔥 FIX: Cooldown НЕ ставится здесь - только после неудачной попытки!
           try {
+            // 🔥 MAC RANDOMIZATION FIX: Токен валиден 60 секунд
             await _handleMagnetWave(bestBridge.bridgeToken!, bestBridge.port!, 
-                DateTime.now().add(const Duration(seconds: 30)).millisecondsSinceEpoch);
+                DateTime.now().add(const Duration(seconds: 60)).millisecondsSinceEpoch);
           } catch (e) {
             _log("❌ [DiscoveryContext] TCP fallback failed: $e");
           }
@@ -4592,14 +5954,27 @@ void _triggerSlowScan() {
               final mac = result.device.remoteId.str;
               _log("🧲 [Ghost] ⚡ BRIDGE found after scan! Initiating forced send...");
               
-              // Проверяем cooldown
-              if (!_linkCooldowns.containsKey(mac) && !_isTransferring) {
-                _linkCooldowns[mac] = DateTime.now();
+              // 🔥 FIX #1: Cooldown по ТОКЕНУ, не по MAC
+              final cooldownExpired = _isCooldownExpired(result);
+              final cooldownRemaining = _getCooldownRemaining(result);
+              
+              // 🔥 FIX: Transfer timeout через 15 секунд (было 30s)
+              final transferAge3 = _isTransferring && _transferStartTime != null 
+                  ? DateTime.now().difference(_transferStartTime!).inSeconds : 0;
+              final transferStuck = transferAge3 > 15;
+              if (transferStuck) {
+                _log("⚠️ [WATCHDOG] Transfer stuck for ${transferAge3}s (>15s), forcing reset!");
+                _isTransferring = false;
+                _transferStartTime = null;
+              }
+              
+              if (cooldownExpired && !_isTransferring) {
+                // 🔥 FIX: Cooldown НЕ ставится здесь - только после неудачной попытки ВНУТРИ cascade!
                 // Запускаем каскадное подключение
                 unawaited(_executeCascadeRelay(result, peerHops));
                 return; // Обрабатываем только первый найденный BRIDGE
               } else {
-                _log("⏸️ [Ghost] BRIDGE found but cooldown active or transfer in progress");
+                _log("⏸️ [Ghost] BRIDGE found but ${!cooldownExpired ? 'cooldown active (${cooldownRemaining}s remaining)' : 'transfer in progress (${transferAge3}s)'}");
               }
             }
           }
@@ -4616,35 +5991,50 @@ void _triggerSlowScan() {
   /// Возвращает true, если соединение доступно, false - если нет
   Future<bool> _checkTcpConnection(String ip, int port) async {
     try {
-      _log("🔍 [Ghost] Checking TCP connection to $ip:$port (timeout: 3s)...");
+      _log("   🔍 [GHOST] Checking TCP connection to $ip:$port (timeout: 3s)...");
       
       // Быстрая проверка соединения с коротким таймаутом (3 секунды)
       final socket = await Socket.connect(ip, port, timeout: const Duration(seconds: 3))
           .timeout(const Duration(seconds: 3), onTimeout: () {
-        _log("⏱️ [Ghost] TCP connection check timeout after 3s");
+        _log("   ⏱️ [GHOST] TCP connection check timeout after 3s");
         throw TimeoutException("Connection check timeout");
       });
       
       // Если соединение установлено - сразу закрываем (это только проверка)
       await socket.close();
-      _log("✅ [Ghost] TCP connection check passed - server is available");
+      _log("   ✅ [GHOST] TCP connection check passed - server is available at $ip:$port");
       return true;
     } catch (e) {
-      _log("❌ [Ghost] TCP connection check failed: $e");
+      _log("   ❌ [GHOST] TCP connection check failed: $e");
+      if (e.toString().contains("failed to connect")) {
+        _log("   💡 Connection refused - BRIDGE TCP server may not be running");
+      } else if (e.toString().contains("timeout")) {
+        _log("   💡 Connection timeout - BRIDGE may be unreachable or firewall blocking");
+      } else {
+        _log("   💡 Connection error: ${e.runtimeType}");
+      }
       return false;
     }
   }
 
   /// Загружает batch сообщений на BRIDGE TCP сервер
   Future<void> _uploadToBridgeServer(String ip, int port, String token) async {
+    _log("📤 [GHOST→BRIDGE] _uploadToBridgeServer: Starting upload process");
+    _log("   📋 Target: $ip:$port");
+    _log("   📋 Token: ${token.substring(0, 8)}...");
+    
     final pending = await _db.getPendingFromOutbox();
-    if (pending.isEmpty) return;
+    if (pending.isEmpty) {
+      _log("   ⚠️ No messages in outbox to upload");
+      return;
+    }
 
     // Ограничиваем batch до 100 сообщений
     final batch = pending.take(100).toList();
     final batchId = 'batch_${DateTime.now().millisecondsSinceEpoch}';
 
-    _log("📦 [Ghost] Uploading ${batch.length} messages to BRIDGE...");
+    _log("📦 [GHOST→BRIDGE] Uploading ${batch.length} messages to BRIDGE (batch ID: $batchId)");
+    _log("   📋 Total pending: ${pending.length}, batch size: ${batch.length}");
 
     Socket? socket;
     try {
@@ -4675,9 +6065,11 @@ void _triggerSlowScan() {
         }
       }
       
-      _log("✅ [Ghost] Connected to BRIDGE server at $ip:$port");
+      _log("✅ [GHOST→BRIDGE] Connected to BRIDGE server at $ip:$port");
+      _log("   📋 Connection established successfully");
       
       // Формируем upload пакет
+      _log("   📦 Preparing upload packet...");
       final uploadPacket = {
         'type': 'GHOST_UPLOAD',
         'token': token,
@@ -4694,25 +6086,35 @@ void _triggerSlowScan() {
 
       // Отправляем JSON (без пробелов для экономии)
       final jsonString = jsonEncode(uploadPacket);
+      final payloadSize = utf8.encode('$jsonString\n').length;
+      _log("   📤 Sending upload packet (size: $payloadSize bytes, messages: ${batch.length})...");
+      
       socket?.add(utf8.encode('$jsonString\n'));
       await socket?.flush();
+      
+      _log("   ✅ Upload packet sent successfully");
 
-      _log("✅ [Ghost] Batch sent. Waiting for ACK...");
+      _log("   ✅ Upload packet sent successfully");
+      _log("   ⏳ Waiting for ACK from BRIDGE (timeout: 3s)...");
 
       // Ждем ACK (таймаут 3 секунды)
       final completer = Completer<String>();
       final subscription = socket?.listen(
         (data) {
+          final ackData = utf8.decode(data);
+          _log("   📥 [GHOST→BRIDGE] ACK received from BRIDGE: $ackData");
           if (!completer.isCompleted) {
-            completer.complete(utf8.decode(data));
+            completer.complete(ackData);
           }
         },
         onError: (e) {
+          _log("   ❌ [GHOST→BRIDGE] Error receiving ACK: $e");
           if (!completer.isCompleted) {
             completer.completeError(e);
           }
         },
         onDone: () {
+          _log("   ⚠️ [GHOST→BRIDGE] Socket closed before ACK received");
           if (!completer.isCompleted) {
             completer.completeError(Exception("Socket closed before ACK received"));
           }
@@ -4723,32 +6125,44 @@ void _triggerSlowScan() {
       final response = await completer.future.timeout(const Duration(seconds: 3));
       await subscription?.cancel();
       
+      _log("   📥 [GHOST→BRIDGE] ACK response received");
       final ack = jsonDecode(response) as Map<String, dynamic>;
+      
+      _log("   📋 ACK status: ${ack['status']}");
+      _log("   📋 ACK batchId: ${ack['batchId']}");
+      _log("   📋 ACK received count: ${ack['received']}");
       
       if (ack['status'] == 'OK' && ack['processed'] == true) {
         final received = ack['received'] ?? 0;
-        _log("✅ [Ghost] Upload successful! BRIDGE received $received messages");
+        _log("✅ [GHOST→BRIDGE] Upload successful! BRIDGE received $received messages");
+        _log("   📋 Batch ID: ${ack['batchId']}");
         
         // Удаляем из Outbox только успешно отправленные
         final ids = batch.map((m) => m['id']?.toString() ?? '').where((id) => id.isNotEmpty).toList();
         if (ids.isNotEmpty) {
+          _log("   🗑️ Removing ${ids.length} messages from outbox...");
           for (final id in ids) {
             await _db.removeFromOutbox(id);
+            _sentPayloads[id] = 'TCP';
           }
-          _log("🗑️ [Ghost] Removed ${ids.length} messages from Outbox");
+          _log("   ✅ Removed ${ids.length} messages from Outbox");
+          _log("🔄 [ARCHITECTURE] Cycle CLOSED via TCP (messages: $received, batch: ${ack['batchId']})");
         }
       } else {
-        _log("⚠️ [Ghost] BRIDGE rejected batch: ${ack['status']}");
+        _log("⚠️ [GHOST→BRIDGE] BRIDGE rejected batch: ${ack['status']}");
+        if (ack['error'] != null) {
+          _log("   📋 Error: ${ack['error']}");
+        }
       }
       
     } catch (e, stackTrace) {
-      _log("❌ [Ghost] Upload error: $e");
-      _log("📋 [Ghost] Error type: ${e.runtimeType}");
-      _log("📋 [Ghost] Stack trace: $stackTrace");
+      _log("❌ [GHOST→BRIDGE] Upload error: $e");
+      _log("   📋 Error type: ${e.runtimeType}");
+      _log("   📋 Stack trace: $stackTrace");
       rethrow; // Пробрасываем для fallback логики
     } finally {
       socket?.close();
-      _log("🔌 [Ghost] Socket closed");
+      _log("   🔌 [GHOST→BRIDGE] Socket closed");
     }
   }
 

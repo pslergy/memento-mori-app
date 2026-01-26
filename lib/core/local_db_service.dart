@@ -749,16 +749,131 @@ class LocalDatabaseService {
     return false;
   }
 
-  Future<void> saveFragment({required String messageId, required int index, required int total, required String data}) async {
+  /// 🔥 MESH FRAGMENT PROTECTION: Лимиты на фрагментацию
+  static const int maxFragmentsPerMessage = 100; // Максимум 100 фрагментов на сообщение
+  static const int maxFragmentDataSize = 500; // Максимум 500 байт на фрагмент
+  static const int fragmentTtlMs = 1000 * 60 * 30; // 30 минут TTL для фрагментов
+  
+  // 🔒 SECURITY FIX: Global limit on pending fragments to prevent OOM
+  static const int maxGlobalPendingFragments = 1000; // Max 1000 fragments globally
+  static const int maxPendingMessages = 50; // Max 50 incomplete messages at a time
+  
+  Future<bool> saveFragment({required String messageId, required int index, required int total, required String data}) async {
+    // 🛡️ FRAGMENT FLOODING PROTECTION
+    if (total > maxFragmentsPerMessage) {
+      print("⚠️ [FRAGMENT] Rejected: too many fragments ($total > $maxFragmentsPerMessage) for $messageId");
+      return false;
+    }
+    if (index < 0 || index >= total) {
+      print("⚠️ [FRAGMENT] Rejected: invalid index ($index/$total) for $messageId");
+      return false;
+    }
+    if (data.length > maxFragmentDataSize) {
+      print("⚠️ [FRAGMENT] Rejected: fragment too large (${data.length} > $maxFragmentDataSize) for $messageId");
+      return false;
+    }
+    
     final db = await database;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    
+    // 🔒 SECURITY FIX: Check global fragment limit
+    final globalCount = Sqflite.firstIntValue(
+      await db.rawQuery('SELECT COUNT(*) FROM message_fragments')
+    ) ?? 0;
+    
+    if (globalCount >= maxGlobalPendingFragments) {
+      print("🛡️ [FRAGMENT] Global limit reached ($globalCount >= $maxGlobalPendingFragments). Cleaning up oldest fragments...");
+      // Clean up oldest fragments to make room
+      await _cleanupOldestFragments(db, maxGlobalPendingFragments ~/ 4); // Remove 25%
+    }
+    
+    // 🔒 SECURITY FIX: Check pending message count (unique messageIds)
+    final pendingMessages = Sqflite.firstIntValue(
+      await db.rawQuery('SELECT COUNT(DISTINCT messageId) FROM message_fragments')
+    ) ?? 0;
+    
+    // Check if this is a new message
+    final existingForMessage = await db.query(
+      'message_fragments',
+      where: 'messageId = ?',
+      whereArgs: [messageId],
+      limit: 1,
+    );
+    
+    if (existingForMessage.isEmpty && pendingMessages >= maxPendingMessages) {
+      print("🛡️ [FRAGMENT] Max pending messages reached ($pendingMessages >= $maxPendingMessages). Rejecting new message: $messageId");
+      // Clean up oldest incomplete messages
+      await _cleanupOldestIncompleteMessages(db, maxPendingMessages ~/ 4);
+      return false;
+    }
+    
+    // 🔥 ДЕДУПЛИКАЦИЯ: Проверяем, не получали ли мы уже этот фрагмент
+    final existing = await db.query(
+      'message_fragments',
+      where: 'fragmentId = ?',
+      whereArgs: ["${messageId}_$index"],
+    );
+    if (existing.isNotEmpty) {
+      print("ℹ️ [FRAGMENT] Duplicate fragment ignored: ${messageId}_$index");
+      return false; // Дубликат
+    }
+    
     await db.insert('message_fragments', {
       'fragmentId': "${messageId}_$index",
       'messageId': messageId,
       'index_num': index,
       'total': total,
       'data': data,
-      'receivedAt': DateTime.now().millisecondsSinceEpoch
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
+      'receivedAt': now,
+    }, conflictAlgorithm: ConflictAlgorithm.ignore);
+    
+    print("📦 [FRAGMENT] Stored: ${messageId}_$index ($index/$total), ${data.length} bytes");
+    return true;
+  }
+  
+  /// 🔒 SECURITY FIX: Clean up oldest fragments when limit exceeded
+  Future<void> _cleanupOldestFragments(Database db, int count) async {
+    await db.rawDelete('''
+      DELETE FROM message_fragments 
+      WHERE fragmentId IN (
+        SELECT fragmentId FROM message_fragments 
+        ORDER BY receivedAt ASC 
+        LIMIT ?
+      )
+    ''', [count]);
+    print("🧹 [FRAGMENT] Cleaned up $count oldest fragments");
+  }
+  
+  /// 🔒 SECURITY FIX: Clean up oldest incomplete messages
+  Future<void> _cleanupOldestIncompleteMessages(Database db, int count) async {
+    // Find oldest incomplete messages
+    final oldestMessages = await db.rawQuery('''
+      SELECT messageId, MIN(receivedAt) as oldest 
+      FROM message_fragments 
+      GROUP BY messageId 
+      ORDER BY oldest ASC 
+      LIMIT ?
+    ''', [count]);
+    
+    for (var msg in oldestMessages) {
+      final messageId = msg['messageId'] as String;
+      await db.delete('message_fragments', where: 'messageId = ?', whereArgs: [messageId]);
+      print("🧹 [FRAGMENT] Cleaned up incomplete message: $messageId");
+    }
+  }
+  
+  /// 🔥 Проверяет, собрано ли сообщение полностью
+  Future<bool> isMessageComplete(String messageId) async {
+    final db = await database;
+    final frags = await db.query(
+      'message_fragments',
+      columns: ['total'],
+      where: 'messageId = ?',
+      whereArgs: [messageId],
+    );
+    if (frags.isEmpty) return false;
+    final total = frags.first['total'] as int;
+    return frags.length == total;
   }
 
   Future<List<Map<String, dynamic>>> getFragments(String messageId) async {
@@ -816,6 +931,25 @@ class LocalDatabaseService {
     await db.delete('outbox', where: 'id=?', whereArgs: [id]);
   }
 
+  /// Получает недавние сообщения из чата за указанный период
+  Future<List<ChatMessage>> getRecentMessages({
+    required String chatId,
+    required DateTime since,
+  }) async {
+    final db = await database;
+    final sinceMs = since.millisecondsSinceEpoch;
+    
+    final results = await db.query(
+      'messages',
+      where: 'chatRoomId = ? AND createdAt >= ?',
+      whereArgs: [chatId, sinceMs],
+      orderBy: 'createdAt DESC',
+      limit: 50, // Ограничиваем последними 50 сообщениями
+    );
+    
+    return results.map((row) => ChatMessage.fromJson(row)).toList();
+  }
+
   // ==========================================
   // 🧹 MAINTENANCE & CLEANUP
   // ==========================================
@@ -823,8 +957,19 @@ class LocalDatabaseService {
   Future<void> _performInternalMaintenance(Database db) async {
     final now = DateTime.now().millisecondsSinceEpoch;
     final pulseTtl = now - (1000 * 60 * 60 * 48); // 48 часов
+    final fragmentTtl = now - fragmentTtlMs; // 30 минут для фрагментов
 
     await db.transaction((txn) async {
+      // 🔥 FRAGMENT GC: Удаляем старые несобранные фрагменты
+      final deletedFragments = await txn.delete(
+        'message_fragments', 
+        where: 'receivedAt < ?', 
+        whereArgs: [fragmentTtl]
+      );
+      if (deletedFragments > 0) {
+        print("🧹 [GC] Cleaned $deletedFragments stale message fragments (TTL: 30min)");
+      }
+      
       await txn.delete('seen_pulses', where: 'seenAt < ?', whereArgs: [pulseTtl]);
       await txn.delete('ads', where: 'expiresAt < ?', whereArgs: [now]);
 

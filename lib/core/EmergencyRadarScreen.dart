@@ -3,8 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:animate_do/animate_do.dart';
 
 import 'package:memento_mori_app/core/websocket_service.dart';
-import 'package:memento_mori_app/core/api_service.dart';
-import 'package:memento_mori_app/core/locator.dart';
 import 'package:memento_mori_app/core/local_db_service.dart';
 import 'package:memento_mori_app/core/location_name_service.dart';
 
@@ -56,7 +54,7 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
       if (mounted) {
         setState(() {
           _hotZones.clear();
-          _hotZones.addAll(localZones.map((z) => z as Map<String, dynamic>));
+          _hotZones.addAll(localZones);
         });
       }
     } catch (e) {
@@ -65,8 +63,8 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
 
     // Пытаемся загрузить с сервера (если есть интернет)
     try {
-      final api = locator<ApiService>();
       // TODO: Добавить GET /api/emergency/active в ApiService
+      // final api = locator<ApiService>();
       // final serverZones = await api.getActiveEmergencyZones();
       // Объединяем с локальными зонами
     } catch (e) {
@@ -249,7 +247,7 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
         Expanded(
           child: ElevatedButton.icon(
             style: ElevatedButton.styleFrom(backgroundColor: AppColors.white05, foregroundColor: Colors.white),
-            onPressed: () {}, // Переход к карте (если будет)
+            onPressed: () => _showLocationDetails(sectorId),
             icon: const Icon(Icons.map_outlined, size: 14),
             label: const Text(
               "VIEW AREA",
@@ -325,6 +323,98 @@ class _EmergencyRadarScreenState extends State<EmergencyRadarScreen> {
             "No mass emergency signals detected on the global grid.",
             textAlign: TextAlign.center,
             style: TextStyle(color: AppColors.textDim, fontSize: 10),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Показывает детали локации с кодировкой 1x1 км
+  Future<void> _showLocationDetails(String sectorId) async {
+    final locationService = LocationNameService();
+    String? locationName;
+    
+    // Пытаемся получить название локации
+    try {
+      locationName = await locationService.getLocationNameFromSectorId(sectorId);
+    } catch (e) {
+      print("⚠️ [EmergencyRadar] Failed to get location name: $e");
+    }
+
+    // Парсим sectorId для отображения координат
+    String coordinates = "Unknown";
+    try {
+      final parts = sectorId.replaceFirst('S_', '').split('_');
+      if (parts.length == 2) {
+        final latStr = parts[0];
+        final lonStr = parts[1];
+        
+        // Восстанавливаем координаты (формат: 6412 -> 64.12)
+        if (latStr.length >= 4 && lonStr.length >= 4) {
+          final lat = double.parse('${latStr.substring(0, latStr.length - 2)}.${latStr.substring(latStr.length - 2)}');
+          final lon = double.parse('${lonStr.substring(0, lonStr.length - 2)}.${lonStr.substring(lonStr.length - 2)}');
+          
+          // Огрубляем до 1x1 км (2 знака после запятой = ~1.1 км)
+          final blurredLat = lat.toStringAsFixed(2);
+          final blurredLon = lon.toStringAsFixed(2);
+          coordinates = "$blurredLat, $blurredLon";
+        }
+      }
+    } catch (e) {
+      print("⚠️ [EmergencyRadar] Failed to parse sectorId: $e");
+    }
+
+    if (!mounted) return;
+    
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: const Text(
+          "LOCATION DETAILS",
+          style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (locationName != null) ...[
+              Text(
+                "Location:",
+                style: TextStyle(color: AppColors.textDim, fontSize: 10),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                locationName,
+                style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 12),
+            ],
+            Text(
+              "Coordinates (1x1 km zone):",
+              style: TextStyle(color: AppColors.textDim, fontSize: 10),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              coordinates,
+              style: const TextStyle(color: Colors.white, fontSize: 12, fontFamily: 'RobotoMono'),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              "Sector ID:",
+              style: TextStyle(color: AppColors.textDim, fontSize: 10),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              sectorId,
+              style: const TextStyle(color: AppColors.textDim, fontSize: 10, fontFamily: 'RobotoMono'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("CLOSE", style: TextStyle(color: AppColors.warningRed)),
           ),
         ],
       ),

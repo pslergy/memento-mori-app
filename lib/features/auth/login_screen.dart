@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:memento_mori_app/core/api_service.dart';
 import 'package:memento_mori_app/core/storage_service.dart';
 import '../../core/network_monitor.dart';
@@ -7,8 +6,10 @@ import '../../core/websocket_service.dart';
 import '../../ghost_input/ghost_controller.dart';
 import '../../ghost_input/ghost_keyboard.dart';
 import '../../warning_screen.dart';
+import '../ui/terminal_style.dart';
 import 'recovery_phrase_screen.dart';
-import 'restore_access_screen.dart'; // ✅ Импортируем новый экран
+import 'restore_access_screen.dart';
+import 'registration_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -22,8 +23,9 @@ class _LoginScreenState extends State<LoginScreen> {
   final _emailGhost = GhostController();
   final _passwordGhost = GhostController();
 
-  final _storage = const FlutterSecureStorage();
   bool _isLoading = false;
+  String? _currentError;
+  bool _isCheckingConnection = false;
 
   @override
   void dispose() {
@@ -71,15 +73,29 @@ class _LoginScreenState extends State<LoginScreen> {
 
     if (isOffline) {
       // ПРОВЕРЯЕМ: А есть ли у нас уже локальный профиль?
-      final savedId = await Vault.read( 'user_id');
+      final savedId = await Vault.read('user_id');
+      final savedName = await Vault.read('user_name');
+      
       if (savedId != null && savedId.startsWith("GHOST_")) {
-        _goToHome({'id': savedId, 'username': 'Ghost', 'deathDate': DateTime.now().add(Duration(days: 30000)).toIso8601String(), 'dateOfBirth': DateTime.now().toIso8601String()});
+        // Есть локальный Ghost ID - можно войти
+        setState(() {
+          _isLoading = true;
+          _isCheckingConnection = false;
+        });
+        
+        await Future.delayed(const Duration(milliseconds: 500));
+        
+        _goToHome({
+          'id': savedId,
+          'username': savedName ?? 'Ghost',
+          'deathDate': DateTime.now().add(const Duration(days: 30000)).toIso8601String(),
+          'dateOfBirth': DateTime.now().toIso8601String()
+        });
         return;
       }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Cloud login unavailable. Switch to Registration to create Ghost ID."))
-      );
+      // Нет локального Ghost ID - предлагаем создать
+      _showOfflineOptions(context);
       return;
     }
 
@@ -91,9 +107,18 @@ class _LoginScreenState extends State<LoginScreen> {
     }
 
     if (_isLoading) return;
-    setState(() => _isLoading = true);
+    setState(() {
+      _isLoading = true;
+      _currentError = null;
+      _isCheckingConnection = true;
+    });
 
     try {
+      // Check connection first
+      await Future.delayed(const Duration(milliseconds: 500));
+      
+      setState(() => _isCheckingConnection = false);
+      
       final api = ApiService();
       final data = await api.login(email, password);
 
@@ -123,15 +148,67 @@ class _LoginScreenState extends State<LoginScreen> {
       }
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(e.toString().replaceAll('Exception:', '').trim()),
-          backgroundColor: Colors.redAccent,
-        ),
+      setState(() {
+        _currentError = _getUserFriendlyError(e);
+      });
+      _showErrorDialog(
+        title: "Login Failed",
+        message: _getUserFriendlyError(e),
+        solution: _getErrorSolution(e),
+        onRetry: () {
+          setState(() => _currentError = null);
+          _login();
+        },
       );
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _isCheckingConnection = false;
+        });
+      }
     }
+  }
+
+  String _getUserFriendlyError(dynamic error) {
+    final errorStr = error.toString().toLowerCase();
+    if (errorStr.contains('network') || errorStr.contains('timeout') || errorStr.contains('connection')) {
+      return "Network connection failed";
+    } else if (errorStr.contains('invalid') || errorStr.contains('credentials') || errorStr.contains('password')) {
+      return "Invalid email or password";
+    } else if (errorStr.contains('not found') || errorStr.contains('user')) {
+      return "User not found";
+    } else {
+      return "Login failed. Please try again.";
+    }
+  }
+
+  String? _getErrorSolution(dynamic error) {
+    final errorStr = error.toString().toLowerCase();
+    if (errorStr.contains('network') || errorStr.contains('timeout')) {
+      return "Check your internet connection and try again.";
+    } else if (errorStr.contains('invalid') || errorStr.contains('credentials')) {
+      return "Verify your email and password are correct.";
+    }
+    return null;
+  }
+
+  void _showErrorDialog({
+    required String title,
+    required String message,
+    String? solution,
+    VoidCallback? onRetry,
+  }) {
+    showDialog(
+      context: context,
+      builder: (_) => TerminalErrorDialog(
+        title: title,
+        message: message,
+        solution: solution,
+        onRetry: onRetry,
+        onDismiss: () => Navigator.pop(context),
+      ),
+    );
   }
 
   // Генерация фразы для новых/старых пользователей
@@ -170,6 +247,45 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
+  /// Показывает диалог с опциями для оффлайн режима
+  void _showOfflineOptions(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1E1E),
+        title: TerminalText(
+          'OFFLINE MODE',
+          color: Colors.orangeAccent,
+        ),
+        content: TerminalText(
+          'No local Ghost ID found.\n\nYou can:\n1. Create a new Ghost ID\n2. Register for Cloud Mode',
+          color: Colors.greenAccent,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              Navigator.of(context).pushReplacement(
+                MaterialPageRoute(builder: (_) => const RegistrationScreen()),
+              );
+            },
+            child: TerminalText(
+              'REGISTER',
+              color: Colors.greenAccent,
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: TerminalText(
+              'CANCEL',
+              color: Colors.redAccent,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
@@ -184,20 +300,57 @@ class _LoginScreenState extends State<LoginScreen> {
             mainAxisAlignment: MainAxisAlignment.center,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const Text(
-                'Memento Mori',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 36,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
-                  letterSpacing: 2,
-                ),
-              ),
-              const SizedBox(height: 60),
+              TerminalTitle(
+              'MEMENTO MORI',
+              color: Colors.greenAccent,
+            ),
+            const SizedBox(height: 40),
+            
+            // Connection status indicator
+            StreamBuilder<MeshRole>(
+              stream: NetworkMonitor().onRoleChanged,
+              initialData: NetworkMonitor().currentRole,
+              builder: (context, snapshot) {
+                final bool isOffline = snapshot.data == MeshRole.GHOST;
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 20),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: isOffline 
+                        ? Colors.orangeAccent.withOpacity(0.1)
+                        : Colors.greenAccent.withOpacity(0.1),
+                    border: Border.all(
+                      color: isOffline 
+                          ? Colors.orangeAccent.withOpacity(0.3)
+                          : Colors.greenAccent.withOpacity(0.3),
+                    ),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        isOffline ? Icons.wifi_off : Icons.cloud_done,
+                        size: 16,
+                        color: isOffline ? Colors.orangeAccent : Colors.greenAccent,
+                      ),
+                      const SizedBox(width: 8),
+                      TerminalText(
+                        isOffline ? "OFFLINE MODE" : "CLOUD UPLINK",
+                        color: isOffline ? Colors.orangeAccent : Colors.greenAccent,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
 
-              // EMAIL
-              const Text("Email Address", style: TextStyle(color: Colors.grey, fontSize: 12)),
+            const SizedBox(height: 20),
+
+            // EMAIL
+            TerminalSubtitle("Email Address"),
               const SizedBox(height: 8),
               _buildGhostWrapper(
                 controller: _emailGhost,
@@ -210,7 +363,7 @@ class _LoginScreenState extends State<LoginScreen> {
               const SizedBox(height: 20),
 
               // PASSWORD
-              const Text("Security Password", style: TextStyle(color: Colors.grey, fontSize: 12)),
+              TerminalSubtitle("Security Password"),
               const SizedBox(height: 8),
               _buildGhostWrapper(
                 controller: _passwordGhost,
@@ -221,37 +374,103 @@ class _LoginScreenState extends State<LoginScreen> {
               ),
 
               // ✅ КНОПКА ВОССТАНОВЛЕНИЯ
-              Align(
-                alignment: Alignment.centerRight,
-                child: TextButton(
-                  onPressed: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(builder: (_) => const RestoreAccessScreen()),
-                    );
-                  },
-                  child: const Text(
-                    'Forgot Password?',
-                    style: TextStyle(color: Colors.white54, fontSize: 13),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  TextButton(
+                    onPressed: () {
+                      showDialog(
+                        context: context,
+                        builder: (context) => AlertDialog(
+                          backgroundColor: const Color(0xFF0D0D0D),
+                          title: const TerminalTitle('Recovery Options', color: Colors.cyanAccent),
+                          content: const Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              TerminalText(
+                                'You can recover access using:',
+                                color: Colors.white70,
+                              ),
+                              SizedBox(height: 12),
+                              TerminalText('1. Recovery Phrase', color: Colors.greenAccent, fontWeight: FontWeight.bold),
+                              TerminalText('   The 12-word phrase you saved during registration', color: Colors.white54, fontSize: 11),
+                              SizedBox(height: 8),
+                              TerminalText('2. Email Recovery', color: Colors.greenAccent, fontWeight: FontWeight.bold),
+                              TerminalText('   Reset password via email link', color: Colors.white54, fontSize: 11),
+                            ],
+                          ),
+                          actions: [
+                            TextButton(
+                              onPressed: () => Navigator.pop(context),
+                              child: const TerminalText('Cancel', color: Colors.white54),
+                            ),
+                            ElevatedButton(
+                              onPressed: () {
+                                Navigator.pop(context);
+                                Navigator.of(context).push(
+                                  MaterialPageRoute(builder: (_) => const RestoreAccessScreen()),
+                                );
+                              },
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.greenAccent,
+                              ),
+                              child: const TerminalText('Continue', color: Colors.black, fontWeight: FontWeight.bold),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                    child: const TerminalText(
+                      'Forgot Password?',
+                      color: Colors.white54,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
+
+              if (_currentError != null) ...[
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.redAccent.withOpacity(0.1),
+                    border: Border.all(color: Colors.redAccent.withOpacity(0.3)),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: TerminalText(
+                    _currentError!,
+                    color: Colors.redAccent,
                   ),
                 ),
-              ),
+              ],
 
               const SizedBox(height: 20),
 
               ElevatedButton(
                 onPressed: _isLoading ? null : _login,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.white,
+                  backgroundColor: Colors.greenAccent,
                   foregroundColor: Colors.black,
                   padding: const EdgeInsets.symmetric(vertical: 16),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                 ),
                 child: _isLoading
-                    ? const SizedBox(
-                  height: 24, width: 24,
-                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black),
-                )
-                    : const Text('SIGN IN', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    ? (_isCheckingConnection
+                        ? const TerminalLoadingIndicator(
+                            message: "Checking connection",
+                            color: Colors.black,
+                          )
+                        : const TerminalLoadingIndicator(
+                            message: "Signing in",
+                            color: Colors.black,
+                          ))
+                    : const TerminalText(
+                        'SIGN IN',
+                        color: Colors.black,
+                        fontWeight: FontWeight.bold,
+                      ),
               ),
             ],
           ),
