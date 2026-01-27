@@ -576,10 +576,14 @@ class TacticalMeshOrchestrator {
       // 🔥 ШАГ 1.1: Генерация токена за 1-2 секунды до старта BLE advertising
       // Вызываем emitInternetMagnetWave() ПЕРВЫМ, чтобы токен был готов до advertising
       // 1. Сначала генерируем токен и обновляем advertising
-      tasks.add(() async => _mesh.emitInternetMagnetWave());
+      tasks.add(() async {
+        _mesh.emitInternetMagnetWave();
+      });
       // 2. Затем обрабатываем очередь сообщений от GHOST
       tasks.add(() async => await _processBridgeQueue());
     } else if (_messagePressure > 0) {
+      // 🔥 FIX: Для GHOST с pending сообщениями запускаем BLE сканирование
+      // seekInternetUplink() вызывает _scanBluetooth(), который теперь проверяет outbox после завершения
       tasks.add(() async => await _mesh.seekInternetUplink());
     }
 
@@ -741,6 +745,9 @@ class TacticalMeshOrchestrator {
     // Ротация токена вызывает перезапуск advertising, что на Android меняет MAC
     // 60s даёт GHOST больше времени для connect после обнаружения BRIDGE
     _heartbeatTimer = Timer.periodic(const Duration(seconds: 60), (timer) async {
+      // 🔥 SELF-GROWING NETWORK: Автоматическое продвижение GHOST → BRIDGE
+      await _evaluateAutoPromotion();
+      
       // 1. Рассылаем пульс (градиент маршрутизации)
       _broadcastRoutingPulse();
 
@@ -785,13 +792,69 @@ class TacticalMeshOrchestrator {
   void _promoteToBridge() {
     if (_role == NodeRole.BRIDGE) return;
     _role = NodeRole.BRIDGE;
+    _myHopsToInternet = 0; // BRIDGE имеет 0 hops до интернета
     _log("🚀 Elevated to BRIDGE. Acting as Internet Gateway.");
   }
 
   void _stepDown() {
     if (_role == NodeRole.GHOST) return;
     _role = NodeRole.GHOST;
+    _myHopsToInternet = 255; // GHOST не имеет прямого доступа к интернету
     _log("👻 Stepping down to GHOST.");
+  }
+  
+  // 🔥 SELF-GROWING NETWORK: Автоматическое продвижение GHOST → BRIDGE
+  /// Оценивает, должен ли узел автоматически стать BRIDGE
+  /// Вызывается в heartbeat цикле для саморастущей сети
+  Future<void> _evaluateAutoPromotion() async {
+    final networkMonitor = NetworkMonitor();
+    final currentRole = networkMonitor.currentRole;
+    
+    // Если мы GHOST, но видим интернет через роутер - автоматически становимся BRIDGE
+    if (currentRole == MeshRole.GHOST) {
+      final routerService = RouterConnectionService();
+      final connectedRouter = routerService.connectedRouter;
+      
+      if (connectedRouter != null && connectedRouter.hasInternet) {
+        // 🔥 SELF-GROWING: Автоматическое продвижение
+        _promoteToBridge();
+        _mesh.emitInternetMagnetWave(); // Метод void, вызываем напрямую
+        _log("🚀 [SELF-GROWING] Auto-promoted to BRIDGE (router has internet)");
+        
+        // Запускаем message sync service для BRIDGE
+        try {
+          _messageSync.start();
+          _log("🔄 [SELF-GROWING] Message sync service started (auto-promoted BRIDGE)");
+        } catch (e) {
+          _log("⚠️ [SELF-GROWING] Message sync service already running or error: $e");
+        }
+      }
+    }
+    
+    // Если мы BRIDGE, но потеряли интернет - автоматически становимся GHOST
+    if (currentRole == MeshRole.BRIDGE) {
+      // NetworkMonitor уже проверяет интернет, но мы можем добавить дополнительную проверку
+      final routerService = RouterConnectionService();
+      final connectedRouter = routerService.connectedRouter;
+      
+      // Если роутер отключен и нет прямого интернета - становимся GHOST
+      if (connectedRouter == null || !connectedRouter.hasInternet) {
+        // Проверяем прямой интернет через NetworkMonitor
+        await networkMonitor.checkNow();
+        if (networkMonitor.currentRole == MeshRole.GHOST) {
+          _stepDown();
+          _log("👻 [SELF-GROWING] Auto-stepped down to GHOST (internet lost)");
+          
+          // Останавливаем message sync service
+          try {
+            _messageSync.stop();
+            _log("🛑 [SELF-GROWING] Message sync service stopped (stepped down to GHOST)");
+          } catch (e) {
+            _log("⚠️ [SELF-GROWING] Message sync service stop error (may not be running): $e");
+          }
+        }
+      }
+    }
   }
 
   // ====================== ENVIRONMENT EVALUATION ======================

@@ -5,11 +5,16 @@ import android.content.Context
 import android.content.Intent
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.InetSocketAddress
@@ -71,6 +76,23 @@ class MeshBackgroundService : Service() {
         // Запуск сервиса в режиме "бессмертия"
         startForeground(1, notification)
 
+        // 🔥 КРИТИЧЕСКИЙ ФИКС #1: Проверяем, является ли устройство Group Owner
+        // TCP сервер должен запускаться ТОЛЬКО на GO, иначе оба устройства пытаются быть серверами
+        val isGroupOwner = checkIfGroupOwner()
+        
+        if (!isGroupOwner) {
+            Log.w("P2P_BG", "⚠️ Not Group Owner - TCP server not started (only GO can be server)")
+            Log.w("P2P_BG", "   💡 This device is a client - will connect to GO's TCP server")
+            // Не поднимаем сервер, но сервис остается активным для других операций
+            return START_STICKY
+        }
+        
+        Log.d("P2P_BG", "✅ Device is Group Owner - TCP server can be started")
+
+        // 🔥 КРИТИЧЕСКИЙ ФИКС #3: Привязываем процесс к Wi-Fi Direct сети (Android 10+)
+        // Без этого сокеты могут идти через мобильную сеть вместо Wi-Fi Direct
+        bindToWifiDirectNetwork()
+
         // 🔥 ПРОВЕРКА: Можно ли поднимать TCP сервер?
         val canStartServer = DeviceDetector.canStartTcpServer(this)
         
@@ -95,6 +117,17 @@ class MeshBackgroundService : Service() {
     }
 
     private fun startTcpServer() {
+        // 🔥 КРИТИЧЕСКИЙ ФИКС #1: Дополнительная проверка перед запуском
+        // (основная проверка уже была в onStartCommand, но на всякий случай)
+        val isGroupOwner = checkIfGroupOwner()
+        if (!isGroupOwner) {
+            Log.w("P2P_BG", "⚠️ Not Group Owner - TCP server not started in startTcpServer()")
+            return
+        }
+        
+        // 🔥 КРИТИЧЕСКИЙ ФИКС #3: Привязываем процесс к Wi-Fi Direct сети
+        bindToWifiDirectNetwork()
+        
         // 1. Убиваем старую задачу, если она жива
         serviceJob?.cancel()
 
@@ -112,7 +145,7 @@ class MeshBackgroundService : Service() {
                     ss.bind(InetSocketAddress("0.0.0.0", MESH_PORT))
                     serverSocket = ss
 
-                    Log.d("P2P_BG", "🛡️ SERVER REBORN on port $MESH_PORT")
+                    Log.d("P2P_BG", "🛡️ SERVER REBORN on port $MESH_PORT (Group Owner confirmed)")
 
                     while (isActive) {
                         val client = try {
@@ -258,6 +291,18 @@ class MeshBackgroundService : Service() {
     }
 
     private fun startTemporaryTcpServer(durationSeconds: Int) {
+        // 🔥 КРИТИЧЕСКИЙ ФИКС #1: Проверяем, является ли устройство Group Owner
+        // Временный сервер тоже должен запускаться ТОЛЬКО на GO
+        val isGroupOwner = checkIfGroupOwner()
+        
+        if (!isGroupOwner) {
+            Log.w("P2P_BG", "⚠️ Not Group Owner - temporary TCP server not started")
+            return
+        }
+        
+        // 🔥 КРИТИЧЕСКИЙ ФИКС #3: Привязываем процесс к Wi-Fi Direct сети
+        bindToWifiDirectNetwork()
+        
         // Закрываем предыдущий временный сервер, если он есть
         temporaryServerJob?.cancel()
         temporaryServerSocket?.close()
@@ -372,6 +417,133 @@ class MeshBackgroundService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * 🔥 КРИТИЧЕСКИЙ ФИКС #1: Проверяет, является ли устройство Group Owner
+     * TCP сервер должен запускаться ТОЛЬКО на GO
+     */
+    private fun checkIfGroupOwner(): Boolean {
+        return try {
+            // Используем WifiP2pHelper для проверки роли
+            // Это требует доступа к экземпляру WifiP2pHelper через MainActivity
+            // Пока используем простую проверку через системные сервисы
+            
+            // 🔥 FIX: Проверяем через WifiP2pManager напрямую
+            val wifiP2pManager = getSystemService(Context.WIFI_P2P_SERVICE) as? android.net.wifi.p2p.WifiP2pManager
+            if (wifiP2pManager == null) {
+                Log.w("P2P_BG", "⚠️ WifiP2pManager not available")
+                return false
+            }
+            
+            // Создаем временный канал для проверки
+            val channel = wifiP2pManager.initialize(applicationContext, mainLooper, null)
+            if (channel == null) {
+                Log.w("P2P_BG", "⚠️ Failed to initialize WifiP2pManager channel")
+                return false
+            }
+            
+            // 🔥 FIX: Используем синхронную проверку через CompletableDeferred
+            var isOwner = false
+            val deferred = CompletableDeferred<Boolean>()
+            
+            wifiP2pManager.requestConnectionInfo(channel) { info ->
+                if (info != null && info.groupFormed) {
+                    isOwner = info.isGroupOwner
+                    Log.d("P2P_BG", "📋 Group info: isGroupOwner=$isOwner, groupFormed=${info.groupFormed}")
+                } else {
+                    Log.d("P2P_BG", "📋 No active group found")
+                    isOwner = false
+                }
+                deferred.complete(isOwner)
+            }
+            
+            // Ждем результат с таймаутом
+            runBlocking {
+                try {
+                    isOwner = deferred.awaitWithTimeout(2000) ?: false
+                } catch (e: Exception) {
+                    Log.w("P2P_BG", "⚠️ Timeout checking group owner status: ${e.message}")
+                    isOwner = false
+                }
+            }
+            
+            isOwner
+        } catch (e: Exception) {
+            Log.e("P2P_BG", "❌ Error checking Group Owner status: ${e.message}")
+            false // По умолчанию считаем, что мы не GO
+        }
+    }
+    
+    /**
+     * 🔥 КРИТИЧЕСКИЙ ФИКС #3: Привязывает процесс к Wi-Fi Direct сети (Android 10+)
+     * Без этого сокеты могут идти через мобильную сеть вместо Wi-Fi Direct
+     */
+    private fun bindToWifiDirectNetwork() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            Log.d("P2P_BG", "ℹ️ Android < 6.0 - network binding not required")
+            return
+        }
+        
+        try {
+            val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            if (connectivityManager == null) {
+                Log.w("P2P_BG", "⚠️ ConnectivityManager not available")
+                return
+            }
+            
+            val networks = connectivityManager.allNetworks
+            var wifiDirectNetwork: Network? = null
+            
+            for (network in networks) {
+                val capabilities = connectivityManager.getNetworkCapabilities(network)
+                if (capabilities != null) {
+                    // 🔥 FIX: TRANSPORT_WIFI_DIRECT не существует в API
+                    // Wi-Fi Direct сети определяем по:
+                    // 1. Wi-Fi транспорт
+                    // 2. Отсутствие интернета (Wi-Fi Direct обычно не имеет интернета)
+                    // 3. Или наличие Wi-Fi с локальным IP (192.168.49.x)
+                    val hasWifi = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                    val hasInternet = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    
+                    // Wi-Fi Direct обычно не имеет интернета, но имеет Wi-Fi транспорт
+                    // Также проверяем наличие Wi-Fi транспорта (может быть Wi-Fi Direct или обычный Wi-Fi)
+                    if (hasWifi) {
+                        wifiDirectNetwork = network
+                        Log.d("P2P_BG", "✅ Found Wi-Fi network (Wi-Fi Direct or regular Wi-Fi): ${network}")
+                        Log.d("P2P_BG", "   📋 Has Internet: $hasInternet")
+                        break
+                    }
+                }
+            }
+            
+            if (wifiDirectNetwork != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                // Привязываем процесс к Wi-Fi Direct сети
+                val success = connectivityManager.bindProcessToNetwork(wifiDirectNetwork)
+                if (success) {
+                    Log.d("P2P_BG", "✅ Process bound to Wi-Fi Direct network")
+                } else {
+                    Log.w("P2P_BG", "⚠️ Failed to bind process to network")
+                }
+            } else {
+                Log.w("P2P_BG", "⚠️ Wi-Fi Direct network not found - sockets may use mobile network")
+            }
+        } catch (e: Exception) {
+            Log.e("P2P_BG", "❌ Failed to bind to Wi-Fi Direct network: ${e.message}")
+        }
+    }
+    
+    /**
+     * Extension для CompletableDeferred с таймаутом
+     */
+    private suspend fun <T> CompletableDeferred<T>.awaitWithTimeout(timeoutMs: Long): T? {
+        return try {
+            withTimeout(timeoutMs) {
+                await()
+            }
+        } catch (e: TimeoutCancellationException) {
+            null
+        }
+    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

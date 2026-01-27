@@ -5,6 +5,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.NetworkInfo
 import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
@@ -572,19 +575,88 @@ class WifiP2pHelper(
     fun sendTcp(host: String, port: Int, message: String) {
         scope.launch {
             try {
-                Socket().use { socket ->
-                    socket.tcpNoDelay = true
-                    socket.soTimeout = 5000
-                    socket.connect(InetSocketAddress(host, port), 5000)
-                    val out = socket.getOutputStream()
+                // 🔥 КРИТИЧЕСКИЙ ФИКС #3: Используем SocketFactory из Wi-Fi Direct Network (Android 10+)
+                // Без этого сокеты могут идти через мобильную сеть вместо Wi-Fi Direct
+                val network = getWifiDirectNetwork()
+                
+                val socket = if (network != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    // Используем SocketFactory из Network для гарантии использования Wi-Fi Direct
+                    try {
+                        network.socketFactory.createSocket()
+                    } catch (e: Exception) {
+                        Log.w("P2P_NET", "⚠️ Failed to create socket from network, using default: ${e.message}")
+                        Socket()
+                    }
+                } else {
+                    Socket()
+                }
+                
+                socket.use { s ->
+                    s.tcpNoDelay = true
+                    s.soTimeout = 5000
+                    s.connect(InetSocketAddress(host, port), 5000)
+                    val out = s.getOutputStream()
                     val bytes = (message + "\n").toByteArray(StandardCharsets.UTF_8)
                     out.write(bytes)
                     out.flush()
-                    Log.d("P2P_NET", "🚀 Burst delivered via P2P to $host")
+                    Log.d("P2P_NET", "🚀 Burst delivered via P2P to $host (network: ${network != null})")
                 }
             } catch (e: Exception) {
                 Log.e("P2P_NET", "Send Error: ${e.message}")
             }
+        }
+    }
+    
+    /**
+     * 🔥 КРИТИЧЕСКИЙ ФИКС #3: Получает Network для Wi-Fi Direct
+     * Используется для создания сокетов через правильную сеть
+     */
+    private fun getWifiDirectNetwork(): Network? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return null
+        }
+        
+        return try {
+            val connectivityManager = context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            if (connectivityManager == null) {
+                Log.w("P2P", "⚠️ ConnectivityManager not available")
+                return null
+            }
+            
+            val networks = connectivityManager.allNetworks
+            for (network in networks) {
+                val capabilities = connectivityManager.getNetworkCapabilities(network)
+                if (capabilities != null) {
+                    // 🔥 FIX: TRANSPORT_WIFI_DIRECT не существует в API
+                    // Wi-Fi Direct сети определяем по наличию Wi-Fi транспорта
+                    // Приоритет: Wi-Fi без интернета (вероятно Wi-Fi Direct) > Wi-Fi с интернетом
+                    val hasWifi = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                    val hasInternet = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    
+                    if (hasWifi) {
+                        // Предпочитаем Wi-Fi без интернета (вероятно Wi-Fi Direct)
+                        if (!hasInternet) {
+                            Log.d("P2P", "✅ Found Wi-Fi network without Internet (likely Wi-Fi Direct) for socket factory")
+                            return network
+                        }
+                    }
+                }
+            }
+            
+            // Fallback: ищем любой Wi-Fi сеть
+            for (network in networks) {
+                val capabilities = connectivityManager.getNetworkCapabilities(network)
+                if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+                    Log.d("P2P", "✅ Found Wi-Fi network (fallback) for socket factory")
+                    return network
+                }
+            }
+            
+            Log.w("P2P", "⚠️ Wi-Fi Direct network not found")
+            null
+        } catch (e: Exception) {
+            Log.e("P2P", "❌ Error getting Wi-Fi Direct network: ${e.message}")
+            null
         }
     }
 

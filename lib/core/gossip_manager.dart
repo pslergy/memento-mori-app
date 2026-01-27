@@ -394,8 +394,10 @@ class GossipManager {
     
     // 🔥 BRIDGE: Ретранслируем сообщения GHOST устройствам
     if (currentRole == MeshRole.BRIDGE) {
+      final String packetIdForLog = packetId.length > 8 ? packetId.substring(0, 8) : packetId;
+      
       _mesh.addLog("🌉 [BRIDGE-GOSSIP] Relaying message to GHOST devices...");
-      _mesh.addLog("   📋 Packet ID: ${packetId.substring(0, packetId.length > 8 ? 8 : packetId.length)}...");
+      _mesh.addLog("   📋 Packet ID: $packetIdForLog...");
       _mesh.addLog("   📋 Packet type: ${packet['type']}");
       _mesh.addLog("   📋 Chat ID: ${packet['chatId']}");
       _mesh.addLog("   📋 TTL: ${packet['ttl'] ?? 5}");
@@ -418,6 +420,11 @@ class GossipManager {
       final bluetoothNodes = _mesh.nearbyNodes.where((n) => n.type == SignalType.bluetooth).toList();
       _mesh.addLog("   🔍 Found ${bluetoothNodes.length} BLE node(s) in nearbyNodes");
       
+      // 🔥 FIX: Для BRIDGE → GHOST НЕ проверяем наличие сообщения в БД BRIDGE
+      // BRIDGE должен отправлять сообщения GHOST, даже если они уже есть в БД BRIDGE
+      // Проверка messageExists нужна только для GHOST → GHOST ретрансляции
+      _mesh.addLog("   📤 [BRIDGE→GHOST] Relaying message to GHOST devices (no DB check for BRIDGE→GHOST)...");
+      
       // 🔥 FIX: Если есть активные GATT соединения, отправляем им сообщения напрямую
       if (connectedClientsCount > 0) {
         _mesh.addLog("   🦷 Relaying to $connectedClientsCount active GATT client(s)...");
@@ -434,6 +441,7 @@ class GossipManager {
       } else if (connectedClientsCount == 0) {
         _mesh.addLog("   ⚠️ No BLE nodes available for relay");
         _mesh.addLog("   💡 GHOST devices need to be in BLE scan range or connected via GATT");
+        _mesh.addLog("   💡 Message will be synced when GHOST connects (via MessageSyncService)");
       }
       
       return;
@@ -452,6 +460,7 @@ class GossipManager {
 
   /// 🔥 Ретрансляция к подключенным GATT клиентам (BRIDGE → GHOST)
   /// Отправляет сообщения напрямую подключенным устройствам через GATT server
+  /// 🔥 FIX: Проверяет наличие сообщения в БД перед отправкой (Gossip протокол)
   Future<void> _relayToConnectedGattClients(Map<String, dynamic> packet, dynamic btService) async {
     final packetJson = jsonEncode(packet);
     final connectedClients = btService.connectedGattClients;
@@ -465,6 +474,11 @@ class GossipManager {
     final packetId = packet['h']?.toString() ?? 'unknown';
     final packetIdPreview = packetId.length > 8 ? packetId.substring(0, 8) : packetId;
     _mesh.addLog("   📋 Packet ID: $packetIdPreview...");
+    
+    // 🔥 FIX: Для BRIDGE → GHOST НЕ проверяем наличие сообщения в БД BRIDGE
+    // BRIDGE должен отправлять сообщения GHOST, даже если они уже есть в БД BRIDGE
+    // Проверка messageExists нужна только для GHOST → GHOST ретрансляции
+    _mesh.addLog("   📤 [BRIDGE→GHOST] Relaying message to connected GATT clients (no DB check for BRIDGE→GHOST)...");
     
     int successCount = 0;
     for (var deviceAddress in connectedClients) {
@@ -581,9 +595,23 @@ class GossipManager {
   }
 
   /// Передача с проверкой наличия пакета у соседа (для GHOST без Wi-Fi Direct)
+  /// 🔥 FIX: Проверяет наличие сообщения в БД перед отправкой (Gossip протокол)
   Future<void> _relayWithPacketCheck(Map<String, dynamic> packet, String packetId) async {
     final ultrasonic = locator<UltrasonicService>();
     final mesh = locator<MeshService>();
+    
+    // 🔥 FIX: Проверяем наличие сообщения в БД перед отправкой (Gossip протокол)
+    // Это позволяет проверить, какие сообщения уже есть на устройстве
+    final chatId = packet['chatId']?.toString() ?? 'THE_BEACON_GLOBAL';
+    final messages = await _db.getMessages(chatId);
+    final messageExists = messages.any((msg) => msg.id == packetId);
+    
+    if (messageExists) {
+      _mesh.addLog("✅ [GOSSIP] Message ${packetId.substring(0, packetId.length > 8 ? 8 : packetId.length)} already exists in DB - skipping relay (Gossip deduplication)");
+      return; // Сообщение уже есть - не отправляем дубликат
+    }
+    
+    _mesh.addLog("📤 [GOSSIP] Message ${packetId.substring(0, packetId.length > 8 ? 8 : packetId.length)} not found in DB - will relay to neighbors...");
     
     // 1. Отправляем запрос через Sonar: "Есть ли у тебя пакет с ID?"
     _mesh.addLog("🔊 [Gossip] Querying neighbors for packet: ${packetId.substring(0, 8)}...");
@@ -606,9 +634,16 @@ class GossipManager {
         _mesh.addLog("🦷 [Gossip] Attempting BLE relay to ${node.name}...");
         
         try {
-          // TODO: Нужно получить BluetoothDevice из SignalNode
-          // Пока используем существующий механизм
-          _mesh.addLog("✅ [Gossip] BLE relay initiated");
+          // Используем существующий механизм ретрансляции через BLE
+          final device = BluetoothDevice.fromId(node.id);
+          final packetJson = jsonEncode(packet);
+          final success = await mesh.btService.sendMessage(device, packetJson);
+          
+          if (success) {
+            _mesh.addLog("✅ [Gossip] BLE relay successful to ${node.name}");
+          } else {
+            _mesh.addLog("⚠️ [Gossip] BLE relay failed to ${node.name}");
+          }
         } catch (e) {
           _mesh.addLog("⚠️ [Gossip] BLE relay failed: $e");
         }

@@ -152,6 +152,19 @@ class _ConversationScreenState extends State<ConversationScreen> {
   @override
   void initState() {
     super.initState();
+    // 🔥 FIX: Скрываем системную навигацию при инициализации экрана чата
+    SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.manual,
+      overlays: [SystemUiOverlay.top], // Показываем только статус-бар
+    );
+    SystemChrome.setSystemUIOverlayStyle(
+      const SystemUiOverlayStyle(
+        systemNavigationBarColor: Colors.transparent,
+        systemNavigationBarIconBrightness: Brightness.dark,
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.light,
+      ),
+    );
     SecurityService.enableSecureMode(); // Защита от скриншотов
     _initializeChat();
     _updateRoomState();
@@ -481,6 +494,11 @@ class _ConversationScreenState extends State<ConversationScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
+      // 🔥 FIX: Убираем системную навигацию через extendBody
+      extendBody: true,
+      extendBodyBehindAppBar: false,
+      // 🔥 FIX: Отключаем автоматическую подстройку под клавиатуру (для Ghost Keyboard)
+      resizeToAvoidBottomInset: false,
       appBar: AppBar(
         backgroundColor: const Color(0xFF0D0D0D),
         title: GestureDetector(
@@ -624,6 +642,10 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   @override
   void dispose() {
+    // Восстанавливаем системную навигацию при выходе
+    SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.edgeToEdge,
+    );
     _socketSubscription?.cancel();
     _meshSubscription?.cancel();
     _ghostController.dispose();

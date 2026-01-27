@@ -164,6 +164,70 @@ class BluetoothMeshService {
     }
   }
   
+  /// 🔥 Синхронизация сообщений BRIDGE → GHOST при подключении
+  /// Проверяет, какие сообщения есть у BRIDGE, и отправляет их GHOST
+  Future<void> _syncMessagesToGhost(String ghostAddress) async {
+    try {
+      final meshService = locator<MeshService>();
+      final db = locator<LocalDatabaseService>();
+      final currentRole = NetworkMonitor().currentRole;
+      
+      // Только BRIDGE синхронизирует сообщения
+      if (currentRole != MeshRole.BRIDGE) return;
+      
+      _log("🔄 [BRIDGE-SYNC] Starting message sync to GHOST $ghostAddress...");
+      
+      // Получаем последние сообщения из чата "The Beacon" за последние 10 минут
+      final recentMessages = await db.getRecentMessages(
+        chatId: 'THE_BEACON_GLOBAL',
+        since: DateTime.now().subtract(const Duration(minutes: 10)),
+      );
+      
+      if (recentMessages.isEmpty) {
+        _log("   ℹ️ No recent messages to sync");
+        return;
+      }
+      
+      _log("   📋 Found ${recentMessages.length} recent message(s) to sync");
+      
+      // Отправляем каждое сообщение GHOST устройству
+      int sentCount = 0;
+      for (var message in recentMessages) {
+        try {
+          final messageData = {
+            'type': 'OFFLINE_MSG',
+            'h': message.id,
+            'content': message.content,
+            'senderId': message.senderId,
+            'senderUsername': message.senderUsername,
+            'chatId': 'THE_BEACON_GLOBAL',
+            'timestamp': message.createdAt.millisecondsSinceEpoch,
+            'ttl': 5,
+          };
+          
+          final messageJson = jsonEncode(messageData);
+          final success = await sendMessageToGattClient(ghostAddress, messageJson);
+          
+          if (success) {
+            sentCount++;
+            _log("   ✅ Synced message ${message.id.substring(0, message.id.length > 8 ? 8 : message.id.length)}...");
+          } else {
+            _log("   ⚠️ Failed to sync message ${message.id.substring(0, message.id.length > 8 ? 8 : message.id.length)}...");
+          }
+          
+          // Небольшая задержка между сообщениями
+          await Future.delayed(const Duration(milliseconds: 200));
+        } catch (e) {
+          _log("   ❌ Error syncing message ${message.id}: $e");
+        }
+      }
+      
+      _log("✅ [BRIDGE-SYNC] Message sync completed: $sentCount/${recentMessages.length} sent");
+    } catch (e) {
+      _log("❌ [BRIDGE-SYNC] Error during message sync: $e");
+    }
+  }
+  
   BluetoothMeshService() {
     _setupGattServerListener();
     _checkNativeAdvertiserSupport();
@@ -222,6 +286,10 @@ class BluetoothMeshService {
             _connectedGattClients.add(deviceAddress);
             _lastGattClientActivity = DateTime.now();
             _log("📋 [GATT-SERVER] Active clients: ${_connectedGattClients.length}");
+            
+            // 🔥 FIX: BRIDGE проверяет и отправляет недостающие сообщения GHOST при подключении
+            _log("🔄 [BRIDGE-SYNC] GHOST connected, checking for message sync...");
+            unawaited(_syncMessagesToGhost(deviceAddress));
           }
           break;
         case 'onGattClientDisconnected':
@@ -826,13 +894,16 @@ class BluetoothMeshService {
   /// чтобы избежать 25-секундного таймаута при перезапуске GATT сервера.
   Future<void> stopAdvertising({bool keepGattServer = false}) async {
     // 🔥 FIX: Mutex to prevent concurrent stop operations causing "Reply already submitted"
-    if (_isStopInProgress) {
-      _log("⏸️ [ADV] Stop already in progress, skipping duplicate call");
-      return;
-    }
-    _isStopInProgress = true;
-    
-    try {
+    // Используем synchronized lock для атомарной проверки и установки флага
+    return _stopLock.synchronized(() async {
+      if (_isStopInProgress) {
+        _log("⏸️ [ADV] Stop already in progress, skipping duplicate call");
+        return;
+      }
+      
+      _isStopInProgress = true;
+      
+      try {
       // 🔥 ОПТИМИЗАЦИЯ ДЛЯ КИТАЙСКИХ УСТРОЙСТВ: Проверяем минимальный интервал
       if (_lastAdvOperation != null) {
         final timeSinceLastOp = DateTime.now().difference(_lastAdvOperation!);
@@ -914,21 +985,26 @@ class BluetoothMeshService {
     } catch (e) {
       _log("⚠️ [ADV] Error in stopAdvertising: $e");
       // Игнорируем ошибки при остановке, чтобы не блокировать состояние
-    } finally {
-      // 🔥 FSM: Фиксируем состояние idle только после полной остановки
-      // FSM state already set to IDLE in transition above
-      _advState = BleAdvertiseState.idle;
-      _log("💤 FSM → IDLE");
-      
-      // 🔒 Fix BLE state machine: Complete completer when state becomes idle
-      if (_stateIdleCompleter != null && !_stateIdleCompleter!.isCompleted) {
-        _stateIdleCompleter!.complete();
-        _stateIdleCompleter = null;
+      // Особенно игнорируем "Reply already submitted" - это известная проблема flutter_ble_peripheral
+      if (e.toString().contains("Reply already submitted")) {
+        _log("   ℹ️ [ADV] Ignoring 'Reply already submitted' error (known flutter_ble_peripheral issue)");
       }
-      
-      // 🔥 FIX: Release mutex
-      _isStopInProgress = false;
-    }
+      } finally {
+        // 🔥 FSM: Фиксируем состояние idle только после полной остановки
+        // FSM state already set to IDLE in transition above
+        _advState = BleAdvertiseState.idle;
+        _log("💤 FSM → IDLE");
+        
+        // 🔒 Fix BLE state machine: Complete completer when state becomes idle
+        if (_stateIdleCompleter != null && !_stateIdleCompleter!.isCompleted) {
+          _stateIdleCompleter!.complete();
+          _stateIdleCompleter = null;
+        }
+        
+        // 🔥 FIX: Сбрасываем флаг в finally блоке
+        _isStopInProgress = false;
+      }
+    }); // Конец synchronized блока
   }
   
   // ======================================================
@@ -1961,6 +2037,7 @@ class BluetoothMeshService {
         _log("💎 [FINAL-DELIVERY] Packet delivered via BLE!");
 
         // 🔥 GHOST: СРАЗУ disconnect после write (не держим соединение)
+        // Для batch отправки используется отдельный метод sendMultipleMessages
         _log("🔌 [GHOST] Disconnecting immediately after write (protocol requirement)");
         await stateSub?.cancel();
         try {
@@ -2063,6 +2140,169 @@ class BluetoothMeshService {
     if (!delivered) {
       throw Exception("GATT delivery failed after 3 attempts or session timeout");
     }
+  }
+  
+  /// 🔥 НОВЫЙ МЕТОД: Отправка множественных сообщений в рамках одного подключения
+  /// Используется для отправки всех сообщений из outbox без переподключения
+  /// 🔥 CRITICAL FIX: Подключается один раз, отправляет все сообщения, отключается только в конце
+  Future<int> sendMultipleMessages(BluetoothDevice device, List<String> messages) async {
+    _log("📤 [BATCH] Starting batch send: ${messages.length} message(s) to ${device.remoteId}");
+    
+    if (messages.isEmpty) {
+      _log("⚠️ [BATCH] No messages to send");
+      return 0;
+    }
+    
+    // 🔥 FIX: GATT MUTEX - проверяем, не идет ли уже подключение
+    final targetMac = device.remoteId.str;
+    if (_isGattConnecting) {
+      _log("🚫 [BATCH] GATT connection already in progress - cannot start batch");
+      throw Exception("GATT connection already in progress");
+    }
+    
+    // Захватываем GATT mutex
+    _isGattConnecting = true;
+    _gattConnectStartTime = DateTime.now();
+    _currentGattTargetMac = targetMac;
+    _gattConnectionState = 'CONNECTING';
+    _log("🔒 [BATCH] GATT mutex acquired for batch send");
+    
+    int sentCount = 0;
+    StreamSubscription<BluetoothConnectionState>? stateSub;
+    BluetoothCharacteristic? characteristic;
+    
+    try {
+      // 🔥 ШАГ 1: Подключаемся один раз для всех сообщений
+      _log("🔗 [BATCH] Connecting to device for batch send...");
+      
+      // Останавливаем scan перед подключением
+      try {
+        await FlutterBluePlus.stopScan();
+        await Future.delayed(const Duration(milliseconds: 500));
+      } catch (e) {
+        _log("⚠️ [BATCH] Error stopping scan: $e");
+      }
+      
+      // Подключаемся
+      final connectStart = DateTime.now();
+      await device.connect(timeout: const Duration(seconds: 15), autoConnect: false);
+      
+      // Проверяем подключение
+      if (!device.isConnected) {
+        throw Exception("Device not connected after connect()");
+      }
+      
+      _log("✅ [BATCH] Connected in ${DateTime.now().difference(connectStart).inMilliseconds}ms");
+      
+      // Запрашиваем MTU
+      if (Platform.isAndroid) {
+        try {
+          await device.requestMtu(158);
+          await Future.delayed(const Duration(milliseconds: 300));
+        } catch (e) {
+          _log("⚠️ [BATCH] MTU request failed: $e");
+        }
+      }
+      
+      // Обнаруживаем сервисы
+      final services = await device.discoverServices();
+      final service = services.firstWhere(
+        (s) => s.uuid.toString().toLowerCase() == SERVICE_UUID.toLowerCase(),
+        orElse: () => throw Exception("Service $SERVICE_UUID not found"),
+      );
+      characteristic = service.characteristics.firstWhere(
+        (c) => c.uuid.toString() == CHAR_UUID,
+        orElse: () => throw Exception("Characteristic $CHAR_UUID not found"),
+      );
+      
+      _log("✅ [BATCH] Service and characteristic found - ready to send ${messages.length} message(s)");
+      
+      // Проверяем, что characteristic не null
+      if (characteristic == null) {
+        throw Exception("Characteristic is null after discovery");
+      }
+      
+      // 🔥 ШАГ 2: Отправляем ВСЕ сообщения в рамках одного подключения
+      for (int i = 0; i < messages.length; i++) {
+        // Проверяем, что соединение еще активно
+        if (!device.isConnected) {
+          _log("❌ [BATCH] Connection lost before message ${i + 1}/${messages.length}");
+          break;
+        }
+        
+        try {
+          final message = messages[i];
+          _log("📤 [BATCH] Sending message ${i + 1}/${messages.length}...");
+          
+          // Фрагментируем и отправляем
+          final fragments = _fragmentMessage(message);
+          int totalBytes = 0;
+          
+          for (int fragIndex = 0; fragIndex < fragments.length; fragIndex++) {
+            final frag = fragments[fragIndex];
+            final jsonPayload = utf8.encode(jsonEncode(frag));
+            final framedMessage = _createFramedMessage(jsonPayload);
+            totalBytes += framedMessage.length;
+            
+            const int chunkSize = 60;
+            for (int j = 0; j < framedMessage.length; j += chunkSize) {
+              if (!device.isConnected) {
+                throw Exception("Connection lost during message send");
+              }
+              
+              final end = (j + chunkSize < framedMessage.length) ? j + chunkSize : framedMessage.length;
+              final chunk = framedMessage.sublist(j, end);
+              await characteristic.write(chunk, withoutResponse: true);
+              
+              if (end < framedMessage.length) {
+                await Future.delayed(const Duration(milliseconds: 100));
+              }
+            }
+            
+            if (fragments.length > 1 && fragIndex < fragments.length - 1) {
+              await Future.delayed(const Duration(milliseconds: 150));
+            }
+          }
+          
+          sentCount++;
+          _log("   ✅ [BATCH] Message ${i + 1}/${messages.length} sent (${totalBytes} bytes)");
+          
+          // Пауза между сообщениями
+          if (i < messages.length - 1) {
+            await Future.delayed(const Duration(milliseconds: 200));
+          }
+        } catch (e) {
+          _log("   ⚠️ [BATCH] Failed to send message ${i + 1}: $e");
+          // Продолжаем отправку остальных сообщений
+        }
+      }
+      
+      _log("📊 [BATCH] Batch send completed: $sentCount/${messages.length} message(s) sent");
+      
+    } catch (e) {
+      _log("❌ [BATCH] Batch send error: $e");
+    } finally {
+      // 🔥 ШАГ 3: Отключаемся только после отправки всех сообщений
+      try {
+        await stateSub?.cancel();
+        if (device.isConnected) {
+          _log("🔌 [BATCH] Disconnecting after batch send...");
+          await device.disconnect();
+          _log("✅ [BATCH] Disconnected successfully");
+        }
+      } catch (e) {
+        _log("⚠️ [BATCH] Error disconnecting: $e");
+      }
+      
+      // Освобождаем GATT mutex
+      _releaseGattMutex("batch send completed - sent: $sentCount/${messages.length}");
+      
+      // Reset FSM
+      await _stateMachine.forceTransition(BleState.IDLE);
+      _advState = BleAdvertiseState.idle;
+    }
+    
+    return sentCount;
   }
 
   /// 🔥 LENGTH-PREFIXED FRAMING: Создаёт framed message с 4-байтным заголовком длины

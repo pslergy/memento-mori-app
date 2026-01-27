@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:memento_mori_app/core/local_db_service.dart';
 import 'package:memento_mori_app/l10n/app_localizations.dart';
@@ -61,6 +62,22 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // 🔥 FIX: Глобально скрываем системную навигацию для всех экранов
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      SystemChrome.setEnabledSystemUIMode(
+        SystemUiMode.manual,
+        overlays: [SystemUiOverlay.top], // Показываем только статус-бар
+      );
+      SystemChrome.setSystemUIOverlayStyle(
+        const SystemUiOverlayStyle(
+          systemNavigationBarColor: Colors.transparent,
+          systemNavigationBarIconBrightness: Brightness.dark,
+          statusBarColor: Colors.transparent,
+          statusBarIconBrightness: Brightness.light,
+        ),
+      );
+    });
+    
     return MaterialApp(
       title: 'Memento Mori',
       debugShowCheckedModeBanner: false,
