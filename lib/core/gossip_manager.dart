@@ -15,6 +15,7 @@ import '../features/chat/conversation_screen.dart';
 import 'network_monitor.dart';
 import 'MeshOrchestrator.dart';
 import 'repeater_service.dart';
+import 'peer_cache_service.dart';
 
 /// 🔒 SECURITY FIX: Rate limiter for flood protection
 class RateLimiter {
@@ -92,6 +93,13 @@ class RateLimiter {
   }
 }
 
+/// Gossip — эвристическое распространение и дедупликация, не маршрутизатор.
+///
+/// 🔒 КОНЦЕПТУАЛЬНЫЕ КОНТРАКТЫ (не нарушать):
+/// - Gossip не является маршрутизатором; Magnet даёт градиент, не путь.
+/// - Relay — эвристический, не гарантированный.
+/// - Дедупликация — защита от шума, не источник истины.
+/// - При отсутствии аплинка Gossip работает как локальный epidemic.
 class GossipManager {
   final LocalDatabaseService _db = locator<LocalDatabaseService>();
 
@@ -99,6 +107,22 @@ class GossipManager {
   MeshService get _mesh => locator<MeshService>();
 
   Timer? _propagationTimer;
+  bool _epidemicStopped = true;
+
+  // 🔒 EVOLUTION: Адаптивный интервал epidemic. Риск: слишком редкий цикл при пустом outbox — первый push после появления сообщения задержится; не ломает доставку, только латентность.
+  static const int _epidemicIntervalBaseSec = 30;
+  static const int _epidemicIntervalWhenBusySec = 20;
+  static const int _epidemicIntervalWhenIdleSec = 45;
+
+  // 🔒 EVOLUTION: Наблюдаемость. In-memory счётчики для адаптации порогов.
+  // Риск при масштабе: только рост int; периодический лог не блокирует доставку.
+  int _statsAccepted = 0;
+  int _statsDroppedRateLimit = 0;
+  int _statsDroppedTtl = 0;
+  int _statsRelayedGatt = 0;
+  int _statsRelayedBle = 0;
+  int _statsRelayedNetwork = 0;
+  static const Duration _statsSummaryInterval = Duration(minutes: 5);
   
   // 🔒 SECURITY FIX: Rate limiters for different packet types
   final RateLimiter _messageRateLimiter = RateLimiter(
@@ -120,15 +144,34 @@ class GossipManager {
   Timer? _rateLimiterCleanupTimer;
   
   GossipManager() {
-    // Periodic cleanup of rate limiter history
+    // Periodic cleanup of rate limiter history + наблюдаемость (сводка счётчиков, размер outbox)
     _rateLimiterCleanupTimer = Timer.periodic(
-      const Duration(minutes: 5),
+      _statsSummaryInterval,
       (_) {
         _messageRateLimiter.cleanup();
         _fragmentRateLimiter.cleanup();
         _waveRateLimiter.cleanup();
+        unawaited(_emitStatsSummary());
       },
     );
+  }
+
+  /// 🔒 P1: Наблюдаемость — агрегаты (drop, relay по каналам, размер outbox). Не меняет логику доставки.
+  Future<void> _emitStatsSummary() async {
+    final outboxCount = await _db.getOutboxCount();
+    if (_statsAccepted == 0 && _statsDroppedRateLimit == 0 &&
+        _statsDroppedTtl == 0 && _statsRelayedGatt == 0 &&
+        _statsRelayedBle == 0 && _statsRelayedNetwork == 0 && outboxCount == 0) return;
+    _mesh.addLog(
+      "📊 [GOSSIP] summary: accepted=$_statsAccepted droppedRate=$_statsDroppedRateLimit droppedTtl=$_statsDroppedTtl "
+      "relayGatt=$_statsRelayedGatt relayBle=$_statsRelayedBle relayNet=$_statsRelayedNetwork outbox=$outboxCount"
+    );
+    _statsAccepted = 0;
+    _statsDroppedRateLimit = 0;
+    _statsDroppedTtl = 0;
+    _statsRelayedGatt = 0;
+    _statsRelayedBle = 0;
+    _statsRelayedNetwork = 0;
   }
   
   void dispose() {
@@ -173,8 +216,9 @@ class GossipManager {
     
     // 🔒 Drop packet if rate limit exceeded
     if (!rateLimitAllowed) {
+      _statsDroppedRateLimit++;
       // Log suspicious activity
-      if (_messageRateLimiter.isSuspicious(senderId) || 
+      if (_messageRateLimiter.isSuspicious(senderId) ||
           _fragmentRateLimiter.isSuspicious(senderId)) {
         _mesh.addLog("⚠️ [SECURITY] Suspicious sender flagged: ${senderId.substring(0, senderId.length > 8 ? 8 : senderId.length)}...");
       }
@@ -183,6 +227,7 @@ class GossipManager {
 
     // 1. СТРАТЕГИЧЕСКАЯ ДЕДУПЛИКАЦИЯ
     if (type == 'MAGNET_WAVE') {
+      _statsAccepted++;
       // Для поисковой волны проверяем: не видели ли мы этот путь короче?
       await _handleMagnetWave(packet);
       return;
@@ -191,6 +236,7 @@ class GossipManager {
     // Обычная дедупликация для данных (O(1) через SQLite)
     if (await _db.isPacketSeen(packetId)) return;
 
+    _statsAccepted++;
     // 2. СЕМАНТИЧЕСКИЙ РАЗБОР
     if (type == 'MSG_FRAG') {
       // КЕЙС А: Фрагмент (Meaning Unit)
@@ -371,7 +417,38 @@ class GossipManager {
   // 🚀 ТАКТИЧЕСКАЯ РЕТРАНСЛЯЦИЯ (PUSH PHASE)
   // ============================================================
 
+  /// 🔥 TTL: Проверяет и обрабатывает TTL в пакете
+  /// Возвращает false если TTL истек, true если пакет валиден
+  /// 🔥 STABILIZATION: Различает relay и конечную доставку
+  bool _checkAndDecrementTtl(Map<String, dynamic> packet, {bool isFinalRecipient = false}) {
+    final ttl = packet['ttl'] as int?;
+    
+    // Если TTL отсутствует - текущее поведение без изменений
+    if (ttl == null) return true;
+    
+    // Если TTL истек - дропаем пакет
+    if (ttl <= 0) {
+      _mesh.addLog("⚠️ [TTL] Packet TTL expired (ttl=$ttl), dropping");
+      return false;
+    }
+    
+    // 🔥 STABILIZATION: Уменьшаем TTL только при relay, не при конечной доставке
+    if (!isFinalRecipient) {
+      packet['ttl'] = ttl - 1;
+    } else {
+      _mesh.addLog("📥 [TTL] Final recipient, TTL not decremented (ttl=$ttl)");
+    }
+    
+    return true;
+  }
+
   Future<void> attemptRelay(Map<String, dynamic> packet) async {
+    // 🔥 TTL: Проверяем TTL перед ретрансляцией (это relay, не конечная доставка)
+    if (!_checkAndDecrementTtl(packet, isFinalRecipient: false)) {
+      _statsDroppedTtl++;
+      return; // TTL истек, не ретранслируем
+    }
+    
     final String packetId = packet['h'] ?? "pulse_${packet['timestamp']}_${packet['senderId']}";
     final currentRole = NetworkMonitor().currentRole;
     final senderId = packet['senderId']?.toString();
@@ -412,21 +489,30 @@ class GossipManager {
       
       // 2. 🔥 КРИТИЧНО: Всегда ретранслируем через BLE к GHOST устройствам
       // Это гарантирует доставку даже без Wi-Fi Direct
-      // 🔥 FIX: Проверяем как nearbyNodes, так и активные GATT соединения
+      // 🔥 FIX: Используем снимок подключённых клиентов на момент приёма (_relayRecipientsSnapshot),
+      // иначе к моменту attemptRelay GHOST может уже отключиться и connectedGattClients пуст.
       final btService = _mesh.btService;
-      final connectedClientsCount = btService.connectedGattClientsCount;
-      _mesh.addLog("   🔍 Active GATT clients: $connectedClientsCount");
+      final List<String>? snapshot = _parseRelayRecipientsSnapshot(packet);
+      final int connectedClientsCount = btService.connectedGattClientsCount;
+      final int snapshotCount = snapshot?.length ?? 0;
+      _mesh.addLog("   🔍 Active GATT clients (now): $connectedClientsCount");
+      if (snapshotCount > 0) {
+        _mesh.addLog("   🔍 Relay recipients snapshot (at receive): $snapshotCount");
+      }
       
       final bluetoothNodes = _mesh.nearbyNodes.where((n) => n.type == SignalType.bluetooth).toList();
       _mesh.addLog("   🔍 Found ${bluetoothNodes.length} BLE node(s) in nearbyNodes");
       
       // 🔥 FIX: Для BRIDGE → GHOST НЕ проверяем наличие сообщения в БД BRIDGE
-      // BRIDGE должен отправлять сообщения GHOST, даже если они уже есть в БД BRIDGE
-      // Проверка messageExists нужна только для GHOST → GHOST ретрансляции
       _mesh.addLog("   📤 [BRIDGE→GHOST] Relaying message to GHOST devices (no DB check for BRIDGE→GHOST)...");
       
-      // 🔥 FIX: Если есть активные GATT соединения, отправляем им сообщения напрямую
-      if (connectedClientsCount > 0) {
+      // 🔥 FIX: Сначала отправляем по снимку (получатель на момент приёма), затем по текущему списку
+      final bool hasRecipients = (snapshotCount > 0) || (connectedClientsCount > 0);
+      if (snapshotCount > 0) {
+        _mesh.addLog("   🦷 Relaying to $snapshotCount recipient(s) from snapshot...");
+        await _relayToConnectedGattClients(packet, btService, recipientsSnapshot: snapshot);
+      }
+      if (connectedClientsCount > 0 && snapshotCount == 0) {
         _mesh.addLog("   🦷 Relaying to $connectedClientsCount active GATT client(s)...");
         await _relayToConnectedGattClients(packet, btService);
       }
@@ -438,7 +524,7 @@ class GossipManager {
           _mesh.addLog("      📋 Node: ${node.name} (${node.id.substring(node.id.length > 8 ? node.id.length - 8 : 0)})");
         }
         await _relayViaBle(packet, bluetoothNodes);
-      } else if (connectedClientsCount == 0) {
+      } else if (!hasRecipients) {
         _mesh.addLog("   ⚠️ No BLE nodes available for relay");
         _mesh.addLog("   💡 GHOST devices need to be in BLE scan range or connected via GATT");
         _mesh.addLog("   💡 Message will be synced when GHOST connects (via MessageSyncService)");
@@ -455,57 +541,71 @@ class GossipManager {
     }
 
     // Если есть Wi-Fi Direct соединение - передаем через сеть
+    // 🔥 КОНЦЕПТУАЛЬНОЕ ВЫРАВНИВАНИЕ: Wi-Fi Direct рассматривается как high-bandwidth link
+    // Приоритеты доставки не изменены, но логика не привязана к типу канала
     await _relayViaNetwork(packet);
   }
 
+  /// Парсит снимок получателей из пакета (на момент приёма по GATT). Не уходит в сеть.
+  static List<String>? _parseRelayRecipientsSnapshot(Map<String, dynamic> packet) {
+    final raw = packet['_relayRecipientsSnapshot'];
+    if (raw == null || raw is! List) return null;
+    final list = raw.map((e) => e?.toString()).whereType<String>().toList();
+    return list.isEmpty ? null : list;
+  }
+
   /// 🔥 Ретрансляция к подключенным GATT клиентам (BRIDGE → GHOST)
-  /// Отправляет сообщения напрямую подключенным устройствам через GATT server
-  /// 🔥 FIX: Проверяет наличие сообщения в БД перед отправкой (Gossip протокол)
-  Future<void> _relayToConnectedGattClients(Map<String, dynamic> packet, dynamic btService) async {
-    final packetJson = jsonEncode(packet);
-    final connectedClients = btService.connectedGattClients;
-    
-    if (connectedClients.isEmpty) {
+  /// [recipientsSnapshot] — снимок MAC-адресов на момент приёма (избегает race с disconnect).
+  Future<void> _relayToConnectedGattClients(Map<String, dynamic> packet, dynamic btService, {List<String>? recipientsSnapshot}) async {
+    final clients = recipientsSnapshot ?? btService.connectedGattClients;
+    if (clients.isEmpty) {
       _mesh.addLog("   ⚠️ No connected GATT clients to relay to");
       return;
     }
+    // Не отправляем по GATT внутреннее поле _relayRecipientsSnapshot
+    final packetForSend = Map<String, dynamic>.from(packet)..remove('_relayRecipientsSnapshot');
+    final packetJson = jsonEncode(packetForSend);
     
-    _mesh.addLog("🦷 [GOSSIP-GATT] Relaying to ${connectedClients.length} connected GATT client(s)...");
+    _mesh.addLog("🦷 [GOSSIP-GATT] Relaying to ${clients.length} GATT client(s)${recipientsSnapshot != null ? " (snapshot)" : ""}...");
     final packetId = packet['h']?.toString() ?? 'unknown';
     final packetIdPreview = packetId.length > 8 ? packetId.substring(0, 8) : packetId;
     _mesh.addLog("   📋 Packet ID: $packetIdPreview...");
     
-    // 🔥 FIX: Для BRIDGE → GHOST НЕ проверяем наличие сообщения в БД BRIDGE
-    // BRIDGE должен отправлять сообщения GHOST, даже если они уже есть в БД BRIDGE
-    // Проверка messageExists нужна только для GHOST → GHOST ретрансляции
-    _mesh.addLog("   📤 [BRIDGE→GHOST] Relaying message to connected GATT clients (no DB check for BRIDGE→GHOST)...");
+    _mesh.addLog("   📤 [BRIDGE→GHOST] Relaying to connected GATT clients (no DB check for BRIDGE→GHOST)...");
     
+    // 🔒 EVOLUTION: Обратная связь в PeerCache (существующие метрики). Риск: рост числа пиров — уже есть cleanup по времени.
+    final peerCache = locator<PeerCacheService>();
     int successCount = 0;
-    for (var deviceAddress in connectedClients) {
+    for (var deviceAddress in clients) {
       try {
         final shortMac = deviceAddress.length > 8 ? deviceAddress.substring(deviceAddress.length - 8) : deviceAddress;
-        _mesh.addLog("   📤 Relaying to connected client (MAC: $shortMac)...");
+        _mesh.addLog("   📤 Relaying to client (MAC: $shortMac)...");
         
         final success = await btService.sendMessageToGattClient(deviceAddress, packetJson);
         
         if (success) {
           successCount++;
-          _mesh.addLog("   ✅ Successfully relayed to connected client (MAC: $shortMac)");
+          peerCache.recordSuccess(peerId: deviceAddress, latency: Duration.zero, channel: 'bleGatt');
+          _mesh.addLog("   ✅ Successfully relayed to client (MAC: $shortMac)");
         } else {
-          _mesh.addLog("   ⚠️ Failed to relay to connected client (MAC: $shortMac)");
+          peerCache.recordFailure(peerId: deviceAddress, channel: 'bleGatt', reason: null);
+          _mesh.addLog("   ⚠️ Failed to relay to client (MAC: $shortMac)");
         }
       } catch (e) {
-        _mesh.addLog("   ❌ Error relaying to connected client: $e");
+        peerCache.recordFailure(peerId: deviceAddress, channel: 'bleGatt', reason: e.toString());
+        _mesh.addLog("   ❌ Error relaying to client: $e");
       }
     }
     
-    _mesh.addLog("🦷 [GOSSIP-GATT] Relay complete: $successCount/${connectedClients.length} successful");
+    _mesh.addLog("🦷 [GOSSIP-GATT] Relay complete: $successCount/${clients.length} successful");
+    _statsRelayedGatt += successCount;
   }
 
   /// 🔥 Ретрансляция через BLE GATT (BRIDGE → GHOST)
   Future<void> _relayViaBle(Map<String, dynamic> packet, List<dynamic> bluetoothNodes) async {
     final btService = _mesh.btService;
-    final packetJson = jsonEncode(packet);
+    final packetForSend = Map<String, dynamic>.from(packet)..remove('_relayRecipientsSnapshot');
+    final packetJson = jsonEncode(packetForSend);
     
     _mesh.addLog("🦷 [GOSSIP-BLE] Starting BLE relay to ${bluetoothNodes.length} device(s)...");
     final packetId = packet['h']?.toString() ?? 'unknown';
@@ -513,43 +613,53 @@ class GossipManager {
     _mesh.addLog("   📋 Packet ID: $packetIdPreview...");
     _mesh.addLog("   📋 Content length: ${(packet['content']?.toString() ?? '').length} bytes");
     
+    // 🔒 EVOLUTION: Обратная связь в PeerCache по каналу bleNearby (отличие от GATT-клиентов).
+    final peerCache = locator<PeerCacheService>();
     int successCount = 0;
     for (var node in bluetoothNodes) {
       try {
-        // Получаем BluetoothDevice из SignalNode
         final deviceId = node.id;
         if (deviceId.isEmpty) continue;
         
         final shortMac = deviceId.length > 8 ? deviceId.substring(deviceId.length - 8) : deviceId;
         _mesh.addLog("   📤 Relaying to ${node.name} (MAC: $shortMac)...");
         
-        // Используем BluetoothDevice.fromId (как в mesh_service.dart)
         final device = BluetoothDevice.fromId(deviceId);
         final success = await btService.sendMessage(device, packetJson);
         
         if (success) {
           successCount++;
+          peerCache.recordSuccess(peerId: deviceId, latency: Duration.zero, channel: 'bleNearby');
           _mesh.addLog("   ✅ Successfully relayed to ${node.name} (MAC: $shortMac)");
         } else {
+          peerCache.recordFailure(peerId: deviceId, channel: 'bleNearby', reason: null);
           _mesh.addLog("   ⚠️ Failed to relay to ${node.name} (MAC: $shortMac)");
         }
       } catch (e) {
+        peerCache.recordFailure(peerId: node.id, channel: 'bleNearby', reason: e.toString());
         _mesh.addLog("   ❌ Error relaying to ${node.name}: $e");
       }
     }
     
     _mesh.addLog("🦷 [GOSSIP-BLE] Relay complete: $successCount/${bluetoothNodes.length} successful");
+    _statsRelayedBle += successCount;
   }
 
   /// Передача через сеть (Wi-Fi Direct или Router)
+  /// 🔥 КОНЦЕПТУАЛЬНОЕ ВЫРАВНИВАНИЕ: Рассматривает любой high-bandwidth link
+  /// Не привязан к типу канала, только к характеристикам (bandwidth, latency)
+  /// 🔒 АРХИТЕКТУРНОЕ ПРАВИЛО: Wi-Fi Direct = link (bandwidth, latency) + topology (Group Owner)
   Future<void> _relayViaNetwork(Map<String, dynamic> packet) async {
-    // 1. Управление жизненным циклом
-    int ttl = packet['ttl'] ?? 5;
-    if (ttl <= 0) {
+    // 1. Управление жизненным циклом (TTL уже обработан в attemptRelay)
+    // Проверяем еще раз на всякий случай
+    final ttl = packet['ttl'] as int?;
+    if (ttl != null && ttl <= 0) {
       _mesh.addLog("⚠️ [GOSSIP-NETWORK] TTL expired, dropping packet");
       return;
     }
-    packet['ttl'] = ttl - 1;
+    
+    // 🔥 STABILIZATION: TTL уже уменьшен в attemptRelay (это relay, не конечная доставка)
+    // Здесь только проверка на истечение
 
     // 2. Вероятностный фильтр нагрузки (масштабируемость)
     // 🔥 FIX: Для BRIDGE всегда ретранслируем (вероятность = 1.0)
@@ -559,8 +669,16 @@ class GossipManager {
       relayProbability = 1.0; // BRIDGE всегда ретранслирует
       _mesh.addLog("🌉 [BRIDGE-GOSSIP] Relay probability: 1.0 (always relay)");
     } else {
-      relayProbability = math.pow(ttl / 5.0, 1.5).toDouble().clamp(0.0, 1.0);
-      _mesh.addLog("👻 [GHOST-GOSSIP] Relay probability: ${relayProbability.toStringAsFixed(2)} (TTL: $ttl)");
+      final ttlValue = ttl ?? 5; // Fallback если ttl null
+      relayProbability = math.pow(ttlValue / 5.0, 1.5).toDouble().clamp(0.0, 1.0);
+      // 🔒 EVOLUTION: Мягкая безопасность — понижаем приоритет релея для подозрительного отправителя, не дропаем. Локальная доставка уже произошла.
+      final senderId = packet['senderId']?.toString();
+      if (senderId != null && _messageRateLimiter.isSuspicious(senderId)) {
+        relayProbability *= 0.5;
+        _mesh.addLog("👻 [GHOST-GOSSIP] Demoted relay (suspicious sender): ${relayProbability.toStringAsFixed(2)}");
+      } else {
+        _mesh.addLog("👻 [GHOST-GOSSIP] Relay probability: ${relayProbability.toStringAsFixed(2)} (TTL: $ttlValue)");
+      }
     }
     
     if (math.Random().nextDouble() > relayProbability) {
@@ -591,6 +709,7 @@ class GossipManager {
 
     _mesh.addLog("   📤 Transmitting ${fragments.length} fragment(s) to $targetIp...");
     await _transmitWithRetry(fragments, targetIp, "Relay-Node");
+    _statsRelayedNetwork++;
     _mesh.addLog("   ✅ Network relay transmission completed");
   }
 
@@ -680,37 +799,68 @@ class GossipManager {
   // ============================================================
   // 🔄 EPIDEMIC CYCLE (PULL/PUSH SYNC)
   // ============================================================
+  // 🔒 EVOLUTION: Адаптивный интервал + приоритизация (старые, SOS). Порядок каналов и fallback не меняются.
 
   void startEpidemicCycle() {
     _propagationTimer?.cancel();
-    _propagationTimer = Timer.periodic(const Duration(seconds: 30), (timer) async {
-      final List<Map<String, dynamic>> pending = await _db.getPendingFromOutbox();
-      if (pending.isEmpty) return;
+    _epidemicStopped = false;
+    _runEpidemicCycle();
+  }
 
+  void _runEpidemicCycle() async {
+    if (_epidemicStopped) return;
+
+    final List<Map<String, dynamic>> pending = await _db.getPendingFromOutbox();
+    final bool hadPending = pending.isNotEmpty;
+    final int pendingCount = pending.length;
+
+    if (pending.isNotEmpty) {
       // Если я сам стал мостом - выгружаю всё в облако
       if (NetworkMonitor().currentRole == MeshRole.BRIDGE) {
         await locator<ApiService>().syncOutbox();
-        return;
-      }
-
-      // Иначе ищем лучший аплинк через Оркестратор
-      final bestUplink = locator<TacticalMeshOrchestrator>().getBestUplink();
-      if (bestUplink != null) {
-        _mesh.addLog("🦠 [Epidemic] Infecting superior node: ${bestUplink.nodeId}");
-        for (var msg in pending) {
-          await attemptRelay(msg);
-        }
       } else {
-        // Если нет аплинка - пытаемся заразить соседей через BLE/Sonar
-        _mesh.addLog("🦠 [Epidemic] No uplink found, attempting neighbor infection...");
-        for (var msg in pending) {
-          await attemptRelay(msg);
+        // Приоритизация: SOS первыми, затем по ts (старые первыми). Не меняет каналы доставки.
+        final sorted = List<Map<String, dynamic>>.from(pending);
+        sorted.sort((a, b) {
+          final aSos = (a['type'] ?? '') == 'SOS' ? 1 : 0;
+          final bSos = (b['type'] ?? '') == 'SOS' ? 1 : 0;
+          if (aSos != bSos) return bSos.compareTo(aSos);
+          final aTs = a['ts'] ?? a['timestamp'] ?? 0;
+          final bTs = b['ts'] ?? b['timestamp'] ?? 0;
+          final aNum = aTs is num ? aTs : 0;
+          final bNum = bTs is num ? bTs : 0;
+          return aNum.compareTo(bNum);
+        });
+
+        final bestUplink = locator<TacticalMeshOrchestrator>().getBestUplink();
+        if (bestUplink != null) {
+          _mesh.addLog("🦠 [Epidemic] Infecting superior node: ${bestUplink.nodeId}");
+          for (var msg in sorted) {
+            await attemptRelay(msg);
+          }
+        } else {
+          _mesh.addLog("🦠 [Epidemic] No uplink found, attempting neighbor infection...");
+          for (var msg in sorted) {
+            await attemptRelay(msg);
+          }
         }
       }
-    });
+    }
+
+    if (!_epidemicStopped) {
+      final nextSec = _computeEpidemicIntervalSeconds(hadPending, pendingCount);
+      _propagationTimer = Timer(Duration(seconds: nextSec), _runEpidemicCycle);
+    }
+  }
+
+  int _computeEpidemicIntervalSeconds(bool hadPending, int pendingCount) {
+    if (hadPending && pendingCount > 0) return _epidemicIntervalWhenBusySec;
+    if (!hadPending) return _epidemicIntervalWhenIdleSec;
+    return _epidemicIntervalBaseSec;
   }
 
   void stop() {
+    _epidemicStopped = true;
     _propagationTimer?.cancel();
   }
 }

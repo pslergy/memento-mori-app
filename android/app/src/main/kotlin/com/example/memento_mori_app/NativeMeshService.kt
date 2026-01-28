@@ -89,7 +89,7 @@ class NativeMeshService(
 
             "sendTcp" -> {
                 val host = call.argument<String>("host") ?: "192.168.49.1"
-                val port = call.argument<Int>("port") ?: 55556 // По умолчанию 55556 для временного BRIDGE сервера
+                val port = call.argument<Int>("port") ?: 55555 // MESH_PORT: BRIDGE слушает, GHOST шлёт
                 val msg = call.argument<String>("message") ?: ""
                 p2pHelper?.sendTcp(host, port, msg)
                 result.success(true)

@@ -142,6 +142,8 @@ class MainActivity : FlutterFragmentActivity() {
 
         // 3. Привязка нативного сервиса Mesh к каналу Wi-Fi Direct
         p2pHelper = WifiP2pHelper(this, this, p2pMethodChannel!!)
+        // 🔥 КРИТИЧНО: Регистрируем receiver для обработки Wi-Fi Direct событий
+        p2pHelper?.registerReceiver()
         val nativeMeshService = NativeMeshService(this, manager, wifiP2pChannel!!, p2pHelper)
         nativeMeshService.setGattServerHelper(gattServerHelper)
         meshMethodChannel?.setMethodCallHandler(nativeMeshService)

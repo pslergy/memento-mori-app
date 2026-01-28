@@ -9,10 +9,9 @@ import 'mesh_service.dart';
 import 'bluetooth_service.dart';
 import 'native_mesh_service.dart';
 import 'ultrasonic_service.dart';
-import 'network_monitor.dart';
 import 'local_db_service.dart';
 import 'api_service.dart';
-import 'discovery_context_service.dart';
+import 'peer_cache_service.dart';
 
 /// ============================================================================
 /// 🔥 GHOST TRANSFER MANAGER - ОПТИМИЗИРОВАННАЯ АРХИТЕКТУРА
@@ -153,6 +152,53 @@ class BridgeInfo {
   }
   
   double get priority {
+    // 🔥 УЛУЧШЕННЫЙ SCORING: Используем peer cache если доступен
+    final peerCache = PeerCacheService();
+    final cachedScore = peerCache.calculateBridgeScore(
+      peerId: mac,
+      hasInternet: true, // BRIDGE всегда имеет интернет
+      hops: hops,
+    );
+    
+    // 🔥 PER-CHANNEL STATS: Используем метрики по каналам если доступны
+    final metrics = peerCache.getPeer(mac);
+    double? perChannelBonus = null;
+    
+    if (metrics != null && metrics.channelStats.isNotEmpty) {
+      // Находим лучший канал по успешности
+      final bestChannel = metrics.bestChannel;
+      if (bestChannel != null) {
+        final channelStats = metrics.channelStats[bestChannel]!;
+        // Бонус за хорошую успешность на конкретном канале
+        perChannelBonus = channelStats.successRate * 10.0; // До 10 баллов
+      }
+    }
+    
+    // Если есть кешированные метрики - используем их
+    if (cachedScore != null) {
+      // Комбинируем с текущими метриками (70% cache, 30% текущие)
+      final currentScore = _calculateCurrentPriority();
+      var combinedScore = (cachedScore * 0.7) + (currentScore * 0.3);
+      
+      // Добавляем per-channel bonus если доступен
+      if (perChannelBonus != null) {
+        combinedScore += perChannelBonus;
+      }
+      
+      return combinedScore;
+    }
+    
+    // Fallback к текущему поведению (с per-channel bonus если доступен)
+    final baseScore = _calculateCurrentPriority();
+    if (perChannelBonus != null) {
+      return baseScore + perChannelBonus;
+    }
+    
+    return baseScore;
+  }
+  
+  /// Текущий расчет приоритета (оригинальная логика)
+  double _calculateCurrentPriority() {
     // Приоритет = (наличие токена * 100) + (1 / hops) * 50 + successRate * 30 - avgLatency/1000
     double score = 0;
     if (token != null && token!.isNotEmpty) score += 100;
@@ -221,13 +267,14 @@ class PendingMessage {
     this.lastFailReason,
   });
   
-  Map<String, dynamic> toPacket() => {
+  Map<String, dynamic> toPacket({int? ttl, bool isFinalRecipient = false}) => {
     'type': 'OFFLINE_MSG',
     'content': content,
     'chatId': chatId,
     'senderId': senderId,
     'h': id,
-    'ttl': 5,
+    'ttl': ttl ?? 5, // 🔥 TTL: Опциональное поле, по умолчанию 5
+    'isFinalRecipient': isFinalRecipient, // 🔥 TTL: Флаг конечного получателя (не уменьшаем TTL)
     'timestamp': DateTime.now().millisecondsSinceEpoch,
   };
   
@@ -279,6 +326,12 @@ class GhostTransferManager with ChangeNotifier {
   // Флаги
   bool _isRunning = false;
   bool _isPaused = false;
+  
+  // 🔥 STABILIZATION: Hysteresis для выбора BRIDGE
+  String? _currentBridgeMac; // Текущий выбранный BRIDGE
+  DateTime? _currentBridgeSelectedAt; // Когда был выбран
+  static const Duration MIN_BRIDGE_STICKINESS = Duration(seconds: 45); // Минимальное время привязки
+  static const double BRIDGE_SWITCH_THRESHOLD = 15.0; // ε-порог для переключения (score delta)
   
   // Логи
   final List<String> _logs = [];
@@ -406,11 +459,20 @@ class GhostTransferManager with ChangeNotifier {
     final removed = _bridges.remove(mac);
     if (removed != null) {
       _log("🗑️ [BRIDGE] Удален: ${mac.substring(mac.length - 8)}");
+      
+      // 🔥 STABILIZATION: Сбрасываем текущий BRIDGE если он был удален
+      if (_currentBridgeMac == mac) {
+        _currentBridgeMac = null;
+        _currentBridgeSelectedAt = null;
+        _log("🔄 [STABILIZATION] Current BRIDGE removed, will select new one on next getBestBridge()");
+      }
+      
       notifyListeners();
     }
   }
   
   /// Получает лучший BRIDGE для отправки
+  /// 🔥 STABILIZATION: Добавлен hysteresis для предотвращения осцилляций
   BridgeInfo? getBestBridge() {
     final available = _bridges.values
         .where((b) => b.hasAvailableChannel && !b.isStale)
@@ -421,7 +483,47 @@ class GhostTransferManager with ChangeNotifier {
     // Сортируем по приоритету (токен, hops, success rate)
     available.sort((a, b) => b.priority.compareTo(a.priority));
     
-    return available.first;
+    final bestCandidate = available.first;
+    
+    // 🔥 STABILIZATION: Hysteresis - проверяем, нужно ли переключаться
+    if (_currentBridgeMac != null) {
+      final currentBridge = _bridges[_currentBridgeMac];
+      
+      // Если текущий BRIDGE всё ещё доступен и "достаточно хорош"
+      if (currentBridge != null && 
+          currentBridge.hasAvailableChannel && 
+          !currentBridge.isStale) {
+        
+        final timeSinceSelection = _currentBridgeSelectedAt != null
+            ? DateTime.now().difference(_currentBridgeSelectedAt!)
+            : Duration.zero;
+        
+        // Проверка 1: Минимальное время привязки (stickiness)
+        if (timeSinceSelection < MIN_BRIDGE_STICKINESS) {
+          _log("📌 [STABILIZATION] Keeping current BRIDGE ${_currentBridgeMac!.substring(_currentBridgeMac!.length - 8)} (stickiness: ${timeSinceSelection.inSeconds}s < ${MIN_BRIDGE_STICKINESS.inSeconds}s)");
+          return currentBridge; // Не переключаемся, если не прошло минимальное время
+        }
+        
+        // Проверка 2: ε-порог (delta threshold)
+        final currentScore = currentBridge.priority;
+        final candidateScore = bestCandidate.priority;
+        final scoreDelta = candidateScore - currentScore;
+        
+        if (scoreDelta < BRIDGE_SWITCH_THRESHOLD) {
+          _log("📌 [STABILIZATION] Keeping current BRIDGE ${_currentBridgeMac!.substring(_currentBridgeMac!.length - 8)} (score delta: ${scoreDelta.toStringAsFixed(2)} < $BRIDGE_SWITCH_THRESHOLD)");
+          return currentBridge; // Не переключаемся, если преимущество недостаточно
+        }
+        
+        // Переключаемся только при явном преимуществе
+        _log("🔄 [STABILIZATION] Switching BRIDGE: ${_currentBridgeMac!.substring(_currentBridgeMac!.length - 8)} → ${bestCandidate.mac.substring(bestCandidate.mac.length - 8)} (score delta: ${scoreDelta.toStringAsFixed(2)})");
+      }
+    }
+    
+    // Обновляем текущий BRIDGE
+    _currentBridgeMac = bestCandidate.mac;
+    _currentBridgeSelectedAt = DateTime.now();
+    
+    return bestCandidate;
   }
   
   /// Получает все доступные BRIDGE отсортированные по приоритету
@@ -613,6 +715,13 @@ class GhostTransferManager with ChangeNotifier {
     bridge.channels[channel]!.markSuccess(latency);
     bridge.totalSuccesses++;
     
+    // 🔥 PEER CACHE: Записываем успешную передачу
+    PeerCacheService().recordSuccess(
+      peerId: mac,
+      latency: latency,
+      channel: channel.name,
+    );
+    
     // Удаляем из очереди
     bridge.messageQueue.remove(message);
     
@@ -638,6 +747,13 @@ class GhostTransferManager with ChangeNotifier {
     
     // Адаптивный cooldown для канала
     bridge.channels[channel]!.markFailed();
+    
+    // 🔥 PEER CACHE: Записываем неудачную передачу
+    PeerCacheService().recordFailure(
+      peerId: mac,
+      channel: channel.name,
+      reason: reason,
+    );
     
     _log("❌ [TRANSFER] Неудача: $msgId → ${mac.substring(mac.length - 8)} via ${channel.name}: $reason");
     
@@ -687,12 +803,40 @@ class GhostTransferManager with ChangeNotifier {
       final mesh = locator<MeshService>();
       
       if (!mesh.isP2pConnected) {
+        _log("   📋 [WIFI-DIRECT] skip: isP2pConnected=false");
         return false;
       }
       
-      final payload = jsonEncode(message.toPacket());
-      await NativeMeshService.sendTcp(payload, host: "192.168.49.1");
+      // 🔥 Wi-Fi Direct Fix: единый порт MESH_PORT (55555)
+      final hostAddress = mesh.lastKnownPeerIp.isNotEmpty 
+          ? mesh.lastKnownPeerIp 
+          : "192.168.49.1";
+      final port = MeshService.meshTcpPort;
+      _log("   📋 [WIFI-DIRECT] host=$hostAddress port=$port isRouteReady=${mesh.isRouteReady}");
       
+      if (hostAddress == "192.168.49.1") {
+        _log("⚠️ [WIFI-DIRECT] Using fallback IP, hostAddress may not be set");
+      }
+      
+      final packet = message.toPacket();
+      final ttl = packet['ttl'] as int?;
+      final isFinalRecipient = packet['isFinalRecipient'] as bool? ?? false;
+      
+      if (ttl != null && ttl <= 0) {
+        _log("⚠️ [WIFI-DIRECT] TTL expired (ttl=$ttl), dropping message");
+        return false;
+      }
+      
+      if (ttl != null && ttl > 0 && !isFinalRecipient) {
+        packet['ttl'] = ttl - 1;
+      } else if (isFinalRecipient) {
+        _log("📥 [WIFI-DIRECT] Final recipient, TTL not decremented (ttl=$ttl)");
+      }
+      
+      final payload = jsonEncode(packet);
+      await NativeMeshService.sendTcp(payload, host: hostAddress, port: port);
+      
+      _log("✅ [WIFI-DIRECT] Sent to $hostAddress:$port");
       return true;
     } catch (e) {
       _log("⚠️ [WIFI-DIRECT] Ошибка: $e");
@@ -707,8 +851,25 @@ class GhostTransferManager with ChangeNotifier {
         return false;
       }
       
+      // 🔥 TTL: Проверяем и уменьшаем TTL перед отправкой (только если не конечный получатель)
+      final packet = message.toPacket();
+      final ttl = packet['ttl'] as int?;
+      final isFinalRecipient = packet['isFinalRecipient'] as bool? ?? false;
+      
+      if (ttl != null && ttl <= 0) {
+        _log("⚠️ [BLE-GATT] TTL expired (ttl=$ttl), dropping message");
+        return false;
+      }
+      
+      // Уменьшаем TTL только если это relay, не конечная доставка
+      if (ttl != null && ttl > 0 && !isFinalRecipient) {
+        packet['ttl'] = ttl - 1; // Уменьшаем TTL при relay
+      } else if (isFinalRecipient) {
+        _log("📥 [BLE-GATT] Final recipient, TTL not decremented (ttl=$ttl)");
+      }
+      
       final bt = locator<BluetoothMeshService>();
-      final payload = jsonEncode(message.toPacket());
+      final payload = jsonEncode(packet);
       
       final success = await bt.sendMessage(bridge.scanResult!.device, payload)
           .timeout(CHANNEL_TIMEOUT_BLE, onTimeout: () => false);
@@ -727,7 +888,24 @@ class GhostTransferManager with ChangeNotifier {
         return false;
       }
       
-      final payload = jsonEncode(message.toPacket());
+      // 🔥 TTL: Проверяем и уменьшаем TTL перед отправкой (только если не конечный получатель)
+      final packet = message.toPacket();
+      final ttl = packet['ttl'] as int?;
+      final isFinalRecipient = packet['isFinalRecipient'] as bool? ?? false;
+      
+      if (ttl != null && ttl <= 0) {
+        _log("⚠️ [TCP] TTL expired (ttl=$ttl), dropping message");
+        return false;
+      }
+      
+      // Уменьшаем TTL только если это relay, не конечная доставка
+      if (ttl != null && ttl > 0 && !isFinalRecipient) {
+        packet['ttl'] = ttl - 1; // Уменьшаем TTL при relay
+      } else if (isFinalRecipient) {
+        _log("📥 [TCP] Final recipient, TTL not decremented (ttl=$ttl)");
+      }
+      
+      final payload = jsonEncode(packet);
       await NativeMeshService.sendTcp(payload, host: bridge.ip!, port: bridge.port);
       
       return true;

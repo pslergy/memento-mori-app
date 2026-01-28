@@ -56,6 +56,23 @@ class NativeMeshService {
           locator<MeshService>().onNetworkDisconnected();
           break;
 
+        case 'onConnectionFailed':
+          final args = Map<String, dynamic>.from(call.arguments);
+          final String error = args['error'] ?? 'UNKNOWN';
+          final String message = args['message'] ?? 'Connection failed';
+          final int? code = args['code'] as int?;
+          print("❌ [Native] Wi-Fi Direct connection failed:");
+          print("   📋 Error: $error");
+          print("   📋 Message: $message");
+          if (code != null) print("   📋 Code: $code");
+          // Уведомляем MeshService об ошибке подключения
+          try {
+            locator<MeshService>().onNetworkConnectionFailed(error, message, code);
+          } catch (e) {
+            print("⚠️ [Native] MeshService.onNetworkConnectionFailed error: $e");
+          }
+          break;
+
         case 'onP2pStateChanged':
           final args = Map<String, dynamic>.from(call.arguments);
           final bool enabled = args['enabled'] ?? false;
@@ -478,8 +495,8 @@ class NativeMeshService {
       // Гарантируем терминатор строки для Kotlin BufferedReader
       final String payload = message.endsWith('\n') ? message : '$message\n';
       
-      // Используем переданный порт или порт по умолчанию (55556 для временного BRIDGE сервера)
-      final int targetPort = port ?? 55556;
+      // 🔥 Wi-Fi Direct Fix: единый порт MESH_PORT (55555) — BRIDGE слушает, GHOST шлёт
+      final int targetPort = port ?? 55555;
 
       await _channel.invokeMethod('sendTcp', {
         'host': host,

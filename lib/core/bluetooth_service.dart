@@ -112,6 +112,10 @@ class BluetoothMeshService {
   // 🔒 SECURITY FIX #4: Track connected GATT clients to prevent token rotation
   // This prevents BRIDGE from rotating token while GHOST is connected
   final Set<String> _connectedGattClients = {};
+  
+  // 🔥 BRIDGE→GHOST: буфер для сборки notify-чанков от BRIDGE (формат: 4-byte length + payload)
+  final List<int> _ghostNotifyBuffer = [];
+  int _ghostNotifyExpectedLength = -1;
   DateTime? _lastGattClientActivity;
   static const Duration _gattClientGracePeriod = Duration(seconds: 5); // Grace period after disconnect
   
@@ -339,6 +343,14 @@ class BluetoothMeshService {
       
       // Добавляем senderIp в данные для обработки
       jsonData['senderIp'] = deviceAddress;
+      
+      // 🔥 FIX BRIDGE→GHOST relay: processIncomingPacket() вызывается без await, поэтому
+      // к моменту attemptRelay GHOST может уже отключиться и connectedGattClients пуст.
+      // Сохраняем снимок подключённых GATT-клиентов сейчас — relay будет отправлять по нему.
+      final recipientsSnapshot = _connectedGattClients.toList();
+      if (recipientsSnapshot.isNotEmpty) {
+        jsonData['_relayRecipientsSnapshot'] = recipientsSnapshot;
+      }
       
       _log("   📤 Forwarding to MeshService.processIncomingPacket()...");
       
@@ -1988,6 +2000,26 @@ class BluetoothMeshService {
         final c = matchingChars.first;
         _log("✅ Characteristic found! Properties: write=${c.properties.write}, notify=${c.properties.notify}");
 
+        // 🔥 BRIDGE→GHOST: подписываемся на notify, чтобы получать сообщения от BRIDGE после отправки
+        StreamSubscription<List<int>>? notifySub;
+        if (c.properties.notify) {
+          try {
+            await c.setNotifyValue(true);
+            _ghostNotifyBuffer.clear();
+            _ghostNotifyExpectedLength = -1;
+            final bridgeAddress = device.remoteId.str;
+            notifySub = c.lastValueStream.listen(
+              (value) => _onNotifyChunkFromBridge(bridgeAddress, value),
+              onError: (e) => _log("⚠️ [GHOST] Notify stream error: $e"),
+            );
+            _log("📥 [GHOST] Subscribed to BRIDGE notify - can receive relayed messages");
+          } catch (e) {
+            _log("⚠️ [GHOST] Could not enable notify: $e");
+          }
+        } else {
+          _log("ℹ️ [GHOST] Characteristic does not support notify - BRIDGE→GHOST relay may not work");
+        }
+
         // 🔥 LENGTH-PREFIXED FRAMING: Формат [4 bytes: length (Big-Endian)][N bytes: JSON]
         // Фрагментация: делим сообщение на части, каждая не больше 60 байт полезной нагрузки
         _log("📤 [WRITE] Fragmenting message (${message.length} chars)...");
@@ -2036,9 +2068,15 @@ class BluetoothMeshService {
 
         _log("💎 [FINAL-DELIVERY] Packet delivered via BLE!");
 
-        // 🔥 GHOST: СРАЗУ disconnect после write (не держим соединение)
-        // Для batch отправки используется отдельный метод sendMultipleMessages
-        _log("🔌 [GHOST] Disconnecting immediately after write (protocol requirement)");
+        // 🔥 BRIDGE→GHOST: окно приёма — ждём 5 сек, чтобы BRIDGE успел отправить relay по notify
+        _log("📥 [GHOST] Listen window 5s for BRIDGE→GHOST messages...");
+        await Future.delayed(const Duration(seconds: 5));
+        await notifySub?.cancel();
+        _ghostNotifyBuffer.clear();
+        _ghostNotifyExpectedLength = -1;
+
+        // 🔥 GHOST: disconnect после write и окна приёма
+        _log("🔌 [GHOST] Disconnecting after write and listen window");
         await stateSub?.cancel();
         try {
           await device.disconnect();
@@ -2169,6 +2207,7 @@ class BluetoothMeshService {
     
     int sentCount = 0;
     StreamSubscription<BluetoothConnectionState>? stateSub;
+    StreamSubscription<List<int>>? batchNotifySub;
     BluetoothCharacteristic? characteristic;
     
     try {
@@ -2220,6 +2259,24 @@ class BluetoothMeshService {
       // Проверяем, что characteristic не null
       if (characteristic == null) {
         throw Exception("Characteristic is null after discovery");
+      }
+      
+      // 🔥 BRIDGE→GHOST: подписываемся на notify для приёма relay от BRIDGE
+      StreamSubscription<List<int>>? batchNotifySub;
+      if (characteristic!.properties.notify) {
+        try {
+          await characteristic!.setNotifyValue(true);
+          _ghostNotifyBuffer.clear();
+          _ghostNotifyExpectedLength = -1;
+          final bridgeAddress = device.remoteId.str;
+          batchNotifySub = characteristic!.lastValueStream.listen(
+            (value) => _onNotifyChunkFromBridge(bridgeAddress, value),
+            onError: (e) => _log("⚠️ [BATCH] Notify stream error: $e"),
+          );
+          _log("📥 [BATCH] Subscribed to BRIDGE notify");
+        } catch (e) {
+          _log("⚠️ [BATCH] Could not enable notify: $e");
+        }
       }
       
       // 🔥 ШАГ 2: Отправляем ВСЕ сообщения в рамках одного подключения
@@ -2282,6 +2339,12 @@ class BluetoothMeshService {
     } catch (e) {
       _log("❌ [BATCH] Batch send error: $e");
     } finally {
+      // 🔥 BRIDGE→GHOST: окно приёма перед disconnect
+      _log("📥 [BATCH] Listen window 5s for BRIDGE→GHOST messages...");
+      await Future.delayed(const Duration(seconds: 5));
+      await batchNotifySub?.cancel();
+      _ghostNotifyBuffer.clear();
+      _ghostNotifyExpectedLength = -1;
       // 🔥 ШАГ 3: Отключаемся только после отправки всех сообщений
       try {
         await stateSub?.cancel();
@@ -2303,6 +2366,40 @@ class BluetoothMeshService {
     }
     
     return sentCount;
+  }
+
+  /// 🔥 BRIDGE→GHOST: обрабатывает чанки notify от BRIDGE, собирает в полное сообщение и передаёт в mesh
+  /// Формат как у GattServerHelper: [4 bytes length Big-Endian][N bytes JSON]
+  void _onNotifyChunkFromBridge(String bridgeAddress, List<int> chunk) {
+    if (chunk.isEmpty) return;
+    _ghostNotifyBuffer.addAll(chunk);
+    if (_ghostNotifyExpectedLength < 0 && _ghostNotifyBuffer.length >= 4) {
+      _ghostNotifyExpectedLength = (_ghostNotifyBuffer[0] << 24) |
+          (_ghostNotifyBuffer[1] << 16) |
+          (_ghostNotifyBuffer[2] << 8) |
+          _ghostNotifyBuffer[3];
+    }
+    while (_ghostNotifyExpectedLength >= 0 &&
+        _ghostNotifyBuffer.length >= 4 + _ghostNotifyExpectedLength) {
+      final payload = _ghostNotifyBuffer.sublist(4, 4 + _ghostNotifyExpectedLength);
+      _ghostNotifyBuffer.removeRange(0, 4 + _ghostNotifyExpectedLength);
+      _ghostNotifyExpectedLength = -1;
+      if (_ghostNotifyBuffer.length >= 4) {
+        _ghostNotifyExpectedLength = (_ghostNotifyBuffer[0] << 24) |
+            (_ghostNotifyBuffer[1] << 16) |
+            (_ghostNotifyBuffer[2] << 8) |
+            _ghostNotifyBuffer[3];
+      }
+      try {
+        final jsonStr = utf8.decode(payload);
+        final map = jsonDecode(jsonStr) as Map<String, dynamic>;
+        map['senderIp'] = bridgeAddress;
+        _log("📥 [GHOST] Received message from BRIDGE via notify (${payload.length} bytes)");
+        locator<MeshService>().processIncomingPacket(map);
+      } catch (e) {
+        _log("⚠️ [GHOST] Notify reassembly error: $e");
+      }
+    }
   }
 
   /// 🔥 LENGTH-PREFIXED FRAMING: Создаёт framed message с 4-байтным заголовком длины

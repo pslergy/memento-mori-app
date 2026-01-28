@@ -389,12 +389,38 @@ class WifiP2pHelper(
                             intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO)
                         }
 
+                        Log.d("P2P", "🔗 [CONNECTION_CHANGED] Network state: ${networkInfo?.state}, Connected: ${networkInfo?.isConnected}")
+
                         if (networkInfo?.isConnected == true) {
+                            // 🔥 КРИТИЧНО: Проверяем, что P2P инициализирован перед запросом информации
+                            if (!ensureP2pInitialized()) {
+                                Log.e("P2P", "❌ [CONNECTION_CHANGED] P2P not initialized, cannot get connection info")
+                                return@onReceive
+                            }
+                            
                             manager?.requestConnectionInfo(channel) { info ->
-                                if (info != null && info.groupFormed && info.groupOwnerAddress != null) {
+                                if (info == null) {
+                                    Log.w("P2P", "⚠️ [CONNECTION_CHANGED] Connection info is null")
+                                    return@requestConnectionInfo
+                                }
+                                
+                                Log.d("P2P", "📋 [CONNECTION_CHANGED] Connection info:")
+                                Log.d("P2P", "   - Group formed: ${info.groupFormed}")
+                                Log.d("P2P", "   - Is group owner: ${info.isGroupOwner}")
+                                Log.d("P2P", "   - Group owner address: ${info.groupOwnerAddress?.hostAddress}")
+                                
+                                if (info.groupFormed && info.groupOwnerAddress != null) {
                                     val isHost = info.isGroupOwner
                                     val hostAddress = info.groupOwnerAddress.hostAddress
-                                    if (wakeLock?.isHeld == false) wakeLock?.acquire(10 * 60 * 1000L)
+                                    
+                                    Log.d("P2P", "✅ [CONNECTION_CHANGED] Connection established!")
+                                    Log.d("P2P", "   - Role: ${if (isHost) "HOST (Group Owner)" else "CLIENT"}")
+                                    Log.d("P2P", "   - Host address: $hostAddress")
+                                    
+                                    if (wakeLock?.isHeld == false) {
+                                        wakeLock?.acquire(10 * 60 * 1000L)
+                                        Log.d("P2P", "🔒 WakeLock acquired")
+                                    }
 
                                     runOnMain {
                                         methodChannel.invokeMethod("onConnected", mapOf(
@@ -402,10 +428,50 @@ class WifiP2pHelper(
                                             "hostAddress" to hostAddress
                                         ))
                                     }
+                                } else {
+                                    Log.w("P2P", "⚠️ [CONNECTION_CHANGED] Network connected but group not formed or address missing")
+                                    Log.w("P2P", "   - Group formed: ${info.groupFormed}")
+                                    Log.w("P2P", "   - Group owner address: ${info.groupOwnerAddress?.hostAddress}")
+                                    
+                                    // Возможно, подключение еще устанавливается, ждем немного
+                                    scope.launch {
+                                        delay(2000) // Ждем 2 секунды
+                                        manager?.requestConnectionInfo(channel) { retryInfo ->
+                                            if (retryInfo != null && retryInfo.groupFormed && retryInfo.groupOwnerAddress != null) {
+                                                val isHost = retryInfo.isGroupOwner
+                                                val hostAddress = retryInfo.groupOwnerAddress.hostAddress
+                                                
+                                                Log.d("P2P", "✅ [CONNECTION_CHANGED] Connection established after retry!")
+                                                
+                                                if (wakeLock?.isHeld == false) {
+                                                    wakeLock?.acquire(10 * 60 * 1000L)
+                                                }
+                                                
+                                                runOnMain {
+                                                    methodChannel.invokeMethod("onConnected", mapOf(
+                                                        "isHost" to isHost,
+                                                        "hostAddress" to hostAddress
+                                                    ))
+                                                }
+                                            } else {
+                                                Log.e("P2P", "❌ [CONNECTION_CHANGED] Connection failed after retry")
+                                                runOnMain {
+                                                    methodChannel.invokeMethod("onConnectionFailed", mapOf(
+                                                        "error" to "GROUP_NOT_FORMED",
+                                                        "message" to "Группа не сформирована после подключения"
+                                                    ))
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         } else {
-                            if (wakeLock?.isHeld == true) wakeLock?.release()
+                            Log.d("P2P", "🔌 [CONNECTION_CHANGED] Connection disconnected")
+                            if (wakeLock?.isHeld == true) {
+                                wakeLock?.release()
+                                Log.d("P2P", "🔓 WakeLock released")
+                            }
                             runOnMain { methodChannel.invokeMethod("onDisconnected", null) }
                         }
                     }
@@ -564,12 +630,72 @@ class WifiP2pHelper(
 
     @SuppressLint("MissingPermission")
     fun connect(hashedAddress: String) {
-        val realMac = addressMap[hashedAddress] ?: return
+        if (!ensureP2pInitialized()) {
+            Log.e("P2P", "❌ [CONNECT] P2P not initialized")
+            runOnMain {
+                methodChannel.invokeMethod("onConnectionFailed", mapOf(
+                    "error" to "P2P_NOT_INITIALIZED",
+                    "message" to "Wi-Fi P2P не инициализирован"
+                ))
+            }
+            return
+        }
+        
+        if (!isP2pEnabled) {
+            Log.w("P2P", "⚠️ [CONNECT] Wi-Fi Direct is DISABLED")
+            runOnMain {
+                methodChannel.invokeMethod("onConnectionFailed", mapOf(
+                    "error" to "P2P_DISABLED",
+                    "message" to "Wi-Fi Direct выключен. Включите в настройках."
+                ))
+            }
+            return
+        }
+        
+        val realMac = addressMap[hashedAddress]
+        if (realMac == null) {
+            Log.e("P2P", "❌ [CONNECT] Device address not found for hashed: $hashedAddress")
+            runOnMain {
+                methodChannel.invokeMethod("onConnectionFailed", mapOf(
+                    "error" to "DEVICE_NOT_FOUND",
+                    "message" to "Адрес устройства не найден"
+                ))
+            }
+            return
+        }
+        
+        Log.d("P2P", "🔗 [CONNECT] Attempting connection to device: ${anonymize(realMac)}")
+        
         val config = WifiP2pConfig().apply {
             deviceAddress = realMac
             groupOwnerIntent = 15 // Форсируем роль владельца для стабильности моста
         }
-        manager?.connect(channel, config, null)
+        
+        manager?.connect(channel, config, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.d("P2P", "✅ [CONNECT] Connection request sent successfully")
+                // Подключение будет обработано через WIFI_P2P_CONNECTION_CHANGED_ACTION
+            }
+            
+            override fun onFailure(reason: Int) {
+                val errorMsg = when (reason) {
+                    WifiP2pManager.P2P_UNSUPPORTED -> "Wi-Fi Direct не поддерживается"
+                    WifiP2pManager.BUSY -> "Wi-Fi P2P занят, попробуйте позже"
+                    WifiP2pManager.ERROR -> "Ошибка подключения"
+                    else -> "Неизвестная ошибка: $reason"
+                }
+                
+                Log.e("P2P", "❌ [CONNECT] Connection failed: $errorMsg (code: $reason)")
+                
+                runOnMain {
+                    methodChannel.invokeMethod("onConnectionFailed", mapOf(
+                        "error" to "CONNECT_FAILED",
+                        "code" to reason,
+                        "message" to errorMsg
+                    ))
+                }
+            }
+        })
     }
 
     fun sendTcp(host: String, port: Int, message: String) {

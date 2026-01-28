@@ -45,6 +45,7 @@ import 'models/uplink_candidate.dart';
 import 'connection_stabilizer.dart';
 import 'repeater_service.dart';
 import 'ghost_transfer_manager.dart';
+import 'peer_cache_service.dart';
 
 
 // 🔥 МАСШТАБИРУЕМОСТЬ: Классы для оптимизации отправки
@@ -340,6 +341,9 @@ class MeshService with ChangeNotifier {
   // Хранение всех логов для копирования
   final List<String> _allLogs = [];
   static const int _maxLogs = 10000; // 🔥 Увеличено до 10000 для полной диагностики передачи сообщений
+
+  /// Единый порт Wi-Fi Direct TCP: BRIDGE слушает, GHOST шлёт. Совпадает с Android MESH_PORT.
+  static const int meshTcpPort = 55555;
 
   /// Получить все логи для копирования
   List<String> getAllLogs() => List.unmodifiable(_allLogs);
@@ -893,6 +897,8 @@ class MeshService with ChangeNotifier {
     final key = await encryption.getChatKey(targetId);
     final encryptedContent = await encryption.encrypt(content, key);
     final String tempId = messageId ?? "temp_${DateTime.now().millisecondsSinceEpoch}";
+    // Контракт порядка: ts — время создания сообщения, не меняется при ретрансляции
+    final int ts = DateTime.now().millisecondsSinceEpoch;
     _log("🔐 [SEND-AUTO] Message encrypted, tempId: $tempId");
 
     final offlinePacket = jsonEncode({
@@ -902,8 +908,10 @@ class MeshService with ChangeNotifier {
       'isEncrypted': true,
       'senderId': api.currentUserId.isNotEmpty ? api.currentUserId : "GHOST_NODE",
       'senderUsername': "Nomad",
-      'timestamp': DateTime.now().millisecondsSinceEpoch,
+      'timestamp': ts,
+      'ts': ts, // Канонический timestamp создания (mesh-контракт)
       'clientTempId': tempId,
+      'h': tempId,
       'ttl': 5, // Начальный TTL для Gossip-паутины
     });
 
@@ -967,11 +975,11 @@ class MeshService with ChangeNotifier {
     // ==========================================
     // 👻 КАНАЛ 2: MESH (Wi-Fi Direct) - HIGH SPEED
     // ==========================================
-    // Мы шлем через TCP только если физический линк установлен И маршрут "прогрет"
+    // Мы шлем через TCP только если физический линк установлен И маршрут готов
+    _log("   📋 [Channel 2] _isP2pConnected=$_isP2pConnected isRouteReady=$isRouteReady");
     if (_isP2pConnected && isRouteReady) {
       _log("📤 [SEND-AUTO] Channel 2: Wi-Fi Direct TCP (P2P connected, route ready)");
-      _log("📡 Mesh: Route is stable. Emitting TCP bursts...");
-      // Используем sendTcpBurst (он внутри делает 3 попытки)
+      _log("📡 Mesh: Route is stable. Emitting TCP bursts to $_lastKnownPeerIp:${MeshService.meshTcpPort}...");
       await sendTcpBurst(offlinePacket);
       _log("✅ [SEND-AUTO] Channel 2: TCP burst completed");
       messageDeliveredToNetwork = true;
@@ -2237,35 +2245,30 @@ class MeshService with ChangeNotifier {
     // Запускаем discovery и ждем появления пиров
     await NativeMeshService.startDiscovery();
     
-    // 🔥 FIX: Сокращаем время ожидания Wi-Fi Direct с 6 до 3 секунд
-    // Wi-Fi Direct редко работает между Tecno/Huawei без ручного сопряжения
-    // Быстрый failover к BLE GATT критичен для пользовательского опыта
+    // 🔥 Wi-Fi Direct Fix: после унификации портов даём P2P чуть больше времени (4+2 сек)
+    // Порядок каналов не меняем: Wi-Fi Direct → BLE GATT
     bool peerFound = false;
     bool connectionEstablished = false;
     
-    for (int i = 0; i < 3; i++) { // 🔥 Уменьшено с 6 до 3 секунд
+    for (int i = 0; i < 4; i++) {
       await Future.delayed(const Duration(seconds: 1));
       
-      // Проверяем, установлено ли уже соединение
       if (_isP2pConnected) {
         connectionEstablished = true;
         break;
       }
       
-      // Проверяем, появился ли нужный пир в списке
       final wifiNodes = _nearbyNodes.values.where((n) => n.type == SignalType.mesh).toList();
       if (wifiNodes.isNotEmpty && !peerFound) {
-        // Пытаемся подключиться к первому найденному Wi-Fi узлу
         final targetNode = wifiNodes.first;
         _log("🔗 Found Wi-Fi peer: ${targetNode.id}, attempting connection...");
-        unawaited(connectToNode(targetNode.id)); // Не ждем, продолжаем проверку
+        unawaited(connectToNode(targetNode.id));
         peerFound = true;
       }
     }
     
-    // Если пир найден, но соединение еще не установлено - ждем еще 2 секунды
     if (peerFound && !connectionEstablished) {
-      for (int i = 0; i < 2; i++) { // 🔥 Уменьшено с 3 до 2 секунд
+      for (int i = 0; i < 2; i++) {
         await Future.delayed(const Duration(seconds: 1));
         if (_isP2pConnected) {
           connectionEstablished = true;
@@ -2306,11 +2309,13 @@ class MeshService with ChangeNotifier {
           continue;
         }
         
+        final int ts = (msgData['createdAt'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
         final String payload = jsonEncode({
           'type': 'OFFLINE_MSG',
           'content': msgData['content'],
           'senderId': _apiService.currentUserId,
           'h': currentMsgId,
+          'ts': ts,
           'ttl': 5,
         });
         
@@ -2320,15 +2325,18 @@ class MeshService with ChangeNotifier {
           await _db.removeFromOutbox(currentMsgId);
           sentCount++;
           _log("   ✅ Message $currentMsgId sent and removed from outbox");
+          try {
+            locator<PeerCacheService>().recordSuccess(peerId: _lastKnownPeerIp, latency: Duration.zero, channel: 'wifiDirect');
+          } catch (_) {}
           
-          // ⚡ OPTIMIZATION: Уменьшена задержка между TCP сообщениями с 100ms до 50ms
-          // TCP более стабилен чем BLE, меньшая задержка безопасна
           if (sentCount < activePending.length) {
             await Future.delayed(const Duration(milliseconds: 50));
           }
         } catch (e) {
+          try {
+            locator<PeerCacheService>().recordFailure(peerId: _lastKnownPeerIp, channel: 'wifiDirect', reason: e.toString());
+          } catch (_) {}
           _log("   ⚠️ Failed to send message $currentMsgId: $e");
-          // Продолжаем с следующим сообщением
         }
       }
       
@@ -2845,11 +2853,14 @@ class MeshService with ChangeNotifier {
               return;
             }
             
+            final firstPending = pending.first;
+            final int tsSonar2 = (firstPending['createdAt'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
             final messageData = jsonEncode({
               'type': 'OFFLINE_MSG',
-              'content': pending.first['content'],
+              'content': firstPending['content'],
               'senderId': _apiService.currentUserId,
               'h': msgId,
+              'ts': tsSonar2,
               'ttl': 5,
             });
             final sonarPayload = messageData.length > 200 ? messageData.substring(0, 200) : messageData;
@@ -3061,11 +3072,14 @@ class MeshService with ChangeNotifier {
       _log("📤 [BLE-GATT] Preparing to send ${activePending.length} message(s) via BLE GATT...");
       
       // Формируем payload для первого сообщения (для обратной совместимости)
+      final firstMsg = activePending.isNotEmpty ? activePending.first : null;
+      final int firstTs = firstMsg != null ? ((firstMsg['createdAt'] as int?) ?? DateTime.now().millisecondsSinceEpoch) : DateTime.now().millisecondsSinceEpoch;
       final String payload = jsonEncode({
         'type': 'OFFLINE_MSG',
-        'content': activePending.isNotEmpty ? activePending.first['content'] : '',
+        'content': firstMsg?['content'] ?? '',
         'senderId': _apiService.currentUserId,
         'h': messageId,
+        'ts': firstTs,
         'ttl': 5,
       });
 
@@ -3230,11 +3244,13 @@ class MeshService with ChangeNotifier {
             continue;
           }
           
+          final int ts = (msgData['createdAt'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
           final currentPayload = jsonEncode({
             'type': 'OFFLINE_MSG',
             'content': msgData['content'],
             'senderId': _apiService.currentUserId,
             'h': currentMsgId,
+            'ts': ts,
             'ttl': 5,
           });
           
@@ -3244,6 +3260,15 @@ class MeshService with ChangeNotifier {
         
         if (messagesToSend.isEmpty) {
           _log("   ⏸️ No new messages to send (all already sent)");
+          // 🔥 FIX: BLE attempt sent 0 messages (all skipped). Clear _sentPayloads for these IDs
+          // so the next cascade will retry them instead of skipping forever.
+          for (var msgData in activePending) {
+            final id = msgData['id'] as String;
+            if (_sentPayloads.containsKey(id)) {
+              _sentPayloads.remove(id);
+              _log("   🔄 Cleared _sentPayloads for $id — will retry on next cascade");
+            }
+          }
           success = false;
         } else {
           _log("📤 [BATCH] Sending ${messagesToSend.length} message(s) via BLE GATT in single connection...");
@@ -3387,6 +3412,10 @@ class MeshService with ChangeNotifier {
         
         // 🔥 МАСШТАБИРУЕМОСТЬ: Записываем успешную задержку для адаптивного таймаута
         transportLatency.recordSuccess(gattLatency);
+        // 🔒 P1: Единый контракт метрик — доставка по GATT пишет в PeerCache (Gossip, GhostTransfer, Sync, Orchestrator используют те же данные)
+        try {
+          locator<PeerCacheService>().recordSuccess(peerId: targetMac, latency: gattLatency, channel: 'bleGatt');
+        } catch (_) {}
         
         // 🔥 МАСШТАБИРУЕМОСТЬ: Обновляем retry info (с null-safety)
         final retryInfo = _payloadRetries[messageId];
@@ -3552,6 +3581,9 @@ class MeshService with ChangeNotifier {
         
         // 🔥 МАСШТАБИРУЕМОСТЬ: Записываем неудачу для адаптивного таймаута
         transportLatency.recordFailure();
+        try {
+          locator<PeerCacheService>().recordFailure(peerId: targetMac, channel: 'bleGatt', reason: failReason);
+        } catch (_) {}
         
         // 🔥 МАСШТАБИРУЕМОСТЬ: Обновляем retry info (с null-safety)
         final retryInfo = _payloadRetries[messageId];
@@ -3662,13 +3694,16 @@ class MeshService with ChangeNotifier {
           } else {
             // 🔥 КРИТИЧНО: TCP fallback без токена - отправляем сообщение напрямую
             try {
+              final firstPending = pending.first;
+              final int tsTcp = (firstPending['createdAt'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
               final messageData = jsonEncode({
                 'type': 'GHOST_UPLOAD',
                 'messages': [{
                   'type': 'OFFLINE_MSG',
-                  'content': pending.first['content'],
+                  'content': firstPending['content'],
                   'senderId': _apiService.currentUserId,
                   'h': messageId,
+                  'ts': tsTcp,
                   'ttl': 5,
                 }],
               });
@@ -3709,6 +3744,9 @@ class MeshService with ChangeNotifier {
             
             // 🔥 МАСШТАБИРУЕМОСТЬ: Записываем успешную задержку TCP
             tcpLatency.recordSuccess(tcpLatencyDuration);
+            try {
+              locator<PeerCacheService>().recordSuccess(peerId: targetMac, latency: tcpLatencyDuration, channel: 'tcp');
+            } catch (_) {}
             
             // 🔥 МАСШТАБИРУЕМОСТЬ: Обновляем retry info
             retryInfoForTcp.tcpAttempts++;
@@ -3748,6 +3786,9 @@ class MeshService with ChangeNotifier {
           // 🔥 МАСШТАБИРУЕМОСТЬ: Записываем неудачу TCP
           final tcpLatency = _transportLatencies.putIfAbsent('${targetMac}_tcp', () => TransportLatency());
           tcpLatency.recordFailure();
+          try {
+            locator<PeerCacheService>().recordFailure(peerId: targetMac, channel: 'tcp', reason: e.toString());
+          } catch (_) {}
           
           // 🔥 МАСШТАБИРУЕМОСТЬ: Обновляем retry info
           retryInfoForTcp.tcpAttempts++;
@@ -3822,11 +3863,14 @@ class MeshService with ChangeNotifier {
       
       // 🔥 КРИТИЧНО: Передаем реальные данные через Sonar, а не только hash
       // Sonar может передать только короткие сообщения - используем первые 200 символов
+      final firstForSonar = activePending.first;
+      final int tsSonar = (firstForSonar['createdAt'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
       final messageData = jsonEncode({
         'type': 'OFFLINE_MSG',
-        'content': activePending.first['content'],
+        'content': firstForSonar['content'],
         'senderId': _apiService.currentUserId,
         'h': messageId,
+        'ts': tsSonar,
         'ttl': 5,
       });
       final sonarPayload = messageData.length > 200 ? messageData.substring(0, 200) : messageData;
@@ -3932,9 +3976,15 @@ class MeshService with ChangeNotifier {
     _isTransferring = false;
     _transferGuardTimer?.cancel(); // Выключаем стража
 
+    // 🔥 FIX: Сохраняем hostAddress для последующего использования
+    // Для клиента это IP GO, для GO это его собственный IP
+    _lastKnownPeerIp = hostAddress;
+    _lastConnectedHost = hostAddress;
+
     _log("🌐 [CONNECTED] Wi-Fi Group Established.");
     _log("   📋 Role: ${isHost ? 'Group Owner (GO)' : 'Client'}");
     _log("   📋 Host IP: $hostAddress");
+    _log("   📋 Saved to _lastKnownPeerIp: $_lastKnownPeerIp");
     notifyListeners();
     
     // 🔥 КРИТИЧЕСКИЙ ФИКС #1: Запускаем TCP сервер ТОЛЬКО если мы Group Owner
@@ -3944,6 +3994,10 @@ class MeshService with ChangeNotifier {
         // Проверяем, можно ли поднимать TCP сервер
         final canStartServer = await NativeMeshService.canStartTcpServer();
         if (canStartServer) {
+          // 🔥 FIX: Небольшая задержка для гарантии, что группа полностью сформирована
+          // Android может формировать группу асинхронно после onNetworkConnected
+          await Future.delayed(const Duration(milliseconds: 500));
+          
           // Запускаем постоянный TCP сервер на порту 55555
           await NativeMeshService.startBackgroundMesh();
           _log("✅ [GO] TCP server started on port 55555");
@@ -3954,8 +4008,12 @@ class MeshService with ChangeNotifier {
         _log("❌ [GO] Failed to start TCP server: $e");
       }
     } else {
-      _log("📱 [CLIENT] We are client - will connect to GO's TCP server at $hostAddress:55555");
+      _log("📱 [CLIENT] We are client - will connect to GO's TCP server at $hostAddress:${MeshService.meshTcpPort}");
     }
+    
+    // 🔥 Wi-Fi Direct Fix: маршрут готов к отправке (sendAuto Channel 2 и cascade смогут использовать TCP)
+    _isRouteReady = true;
+    _log("   📋 isRouteReady=true (Wi-Fi Direct TCP available)");
     
     // 🔥 REPEATER: Регистрируем Wi-Fi Direct соединение
     try {
@@ -3964,7 +4022,7 @@ class MeshService with ChangeNotifier {
         deviceId: hostAddress,
         channelType: ChannelType.wifiDirect,
         ipAddress: hostAddress,
-        port: isHost ? 55555 : 55556, // GO использует 55555, клиент подключается к 55556
+        port: 55555, // 🔥 FIX: Оба используют порт 55555: GO слушает, Client подключается
       );
       _log("🔄 [REPEATER] Wi-Fi Direct connection registered: $hostAddress");
     } catch (e) {
@@ -3978,18 +4036,25 @@ class MeshService with ChangeNotifier {
     // 2. ВЫГРУЗКА
     final pending = await _db.getPendingFromOutbox();
     if (pending.isNotEmpty) {
-      // КЛИЕНТ всегда шлет на .49.1 - это железное правило Android
-      String targetIp = isHost ? hostAddress : "192.168.49.1";
+      // 🔥 FIX: Используем сохранённый hostAddress (для клиента это IP GO)
+      // НЕ используем хардкод "192.168.49.1" - Android может назначить другой IP
+      String targetIp = _lastKnownPeerIp.isNotEmpty ? _lastKnownPeerIp : hostAddress;
+      if (targetIp.isEmpty) {
+        _log("⚠️ [OFFLOAD] No host address available, skipping TCP send");
+        return;
+      }
 
-      _log("🚀 [OFFLOAD] Pushing signals to $targetIp");
+      _log("🚀 [OFFLOAD] Pushing signals to $targetIp (isHost: $isHost)");
 
       for (var msgData in pending) {
+        final int tsOffload = (msgData['createdAt'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
         final packet = jsonEncode({
           'type': 'OFFLINE_MSG',
           'chatId': msgData['chatRoomId'],
           'content': msgData['content'],
           'senderId': _apiService.currentUserId,
           'h': msgData['id'],
+          'ts': tsOffload,
         });
 
         // Пробуем отправить
@@ -4749,20 +4814,18 @@ class MeshService with ChangeNotifier {
     final db = LocalDatabaseService();
 
     try {
-      // 1. Генерируем уникальный ключ для дедупликации на основе контента и времени.
-      // Если придет такой же пакет - SQLite его просто проигнорирует (ConflictAlgorithm.replace)
-      final String timestamp = (data['timestamp'] ?? DateTime.now().millisecondsSinceEpoch).toString();
-      final String meshId = "mesh_${data['senderId']}_$timestamp";
+      // 1. Канонический ID = h (не генерировать из timestamp)
+      final String meshId = data['h']?.toString() ?? data['clientTempId']?.toString() ?? data['id']?.toString() ?? '';
+      if (meshId.isEmpty) return;
+      final int tsMs = data['ts'] ?? data['timestamp'] ?? DateTime.now().millisecondsSinceEpoch;
 
-      // 2. Создаем объект сообщения
-      // Важно: в оффлайне мы не можем расшифровать его здесь без контекста чата,
-      // поэтому сохраняем зашифрованный контент. ConversationScreen расшифрует его при открытии.
+      // 2. Создаем объект сообщения (createdAt = ts)
       final msg = ChatMessage(
         id: meshId,
-        content: data['content'] ?? "", // Зашифрованный AES-пакет
+        content: data['content'] ?? "",
         senderId: data['senderId'] ?? "Unknown",
         senderUsername: data['senderUsername'] ?? "Nomad",
-        createdAt: DateTime.fromMillisecondsSinceEpoch(int.tryParse(timestamp) ?? DateTime.now().millisecondsSinceEpoch),
+        createdAt: DateTime.fromMillisecondsSinceEpoch(tsMs),
         status: "MESH_LINK",
       );
 
@@ -4934,37 +4997,34 @@ class MeshService with ChangeNotifier {
     _log("📤 [TCP-BURST] Starting TCP burst transmission");
     _log("   📋 Message length: ${message.length} bytes");
     
-    // 🔥 КРИТИЧНО: Проверяем Wi-Fi Direct соединение перед отправкой
     if (!_isP2pConnected) {
       _log("⚠️ [Burst] Wi-Fi Direct not connected - skipping TCP burst");
       _log("   💡 Message will be available via BLE advertising only");
-      return; // Не отправляем, если нет Wi-Fi Direct соединения
+      return;
     }
     
-    String targetIp = _isHost ? _lastKnownPeerIp : "192.168.49.1";
-    // Используем порт 55556 для временного BRIDGE сервера
-    const int bridgePort = 55556;
+    // 🔥 Wi-Fi Direct Fix: единый порт MESH_PORT (55555) — BRIDGE слушает, GHOST шлёт
+    final String targetIp = _lastKnownPeerIp.isNotEmpty ? _lastKnownPeerIp : "192.168.49.1";
+    final int port = MeshService.meshTcpPort;
 
-    _log("🚀 [Burst] Initiating TCP transfer to $targetIp:$bridgePort (P2P connected: $_isP2pConnected)");
+    _log("🚀 [Burst] Initiating TCP transfer to $targetIp:$port (P2P: $_isP2pConnected, isRouteReady: $isRouteReady)");
 
     for (int attempt = 1; attempt <= 3; attempt++) {
       try {
-        _log("📤 [TCP-BURST] Attempt $attempt/3: Sending to $targetIp:$bridgePort...");
-        await NativeMeshService.sendTcp(message, host: targetIp, port: bridgePort);
+        _log("📤 [TCP-BURST] Attempt $attempt/3: Sending to $targetIp:$port...");
+        await NativeMeshService.sendTcp(message, host: targetIp, port: port);
         _log("✅ [Burst] Success on attempt $attempt");
-        _log("✅ [TCP-BURST] TCP burst completed successfully");
-        return; // Успех, выходим
+        _log("✅ [TCP-BURST] TCP burst completed successfully (host=$targetIp port=$port)");
+        return;
       } catch (e) {
         _log("⚠️ [Burst] Attempt $attempt failed: $e");
         if (e.toString().contains("failed to connect")) {
           _log("   💡 Connection refused - target may not be in Wi-Fi Direct group");
         }
-        // ⚡ OPTIMIZATION: Уменьшены задержки между TCP retry с (2s,4s,6s) до (1s,2s,3s)
-        // Fail fast лучше для пользовательского опыта, BLE fallback сработает быстрее
         await Future.delayed(Duration(seconds: attempt));
       }
     }
-    _log("❌ [Burst] Fatal: Could not reach $targetIp:$bridgePort after 3 attempts.");
+    _log("❌ [Burst] Fatal: Could not reach $targetIp:$port after 3 attempts.");
     _log("❌ [TCP-BURST] TCP burst failed after 3 attempts");
     _log("   💡 This is expected if devices are not in Wi-Fi Direct group");
   }
@@ -5292,6 +5352,26 @@ class MeshService with ChangeNotifier {
         }
       }
     
+    // 🔥 ШАГ 3.5: Создаём Wi-Fi Direct группу, чтобы устройство стало Group Owner до запуска TCP
+    // Без этого MeshBackgroundService.checkIfGroupOwner() всегда false → TCP сервер не поднимается
+    _log("🛡️ [BRIDGE] Step 3.5: Ensuring Wi-Fi Direct group (so we become Group Owner)...");
+    try {
+      final groupInfo = await NativeMeshService.ensureWifiDirectGroupExists()
+          .timeout(const Duration(seconds: 15));
+      if (groupInfo != null) {
+        _log("✅ [BRIDGE] Wi-Fi Direct group ready: ${groupInfo.networkName} (GO: ${groupInfo.isGroupOwner})");
+        onWifiDirectGroupCreated(
+          networkName: groupInfo.networkName,
+          passphrase: groupInfo.passphrase,
+          isGroupOwner: groupInfo.isGroupOwner,
+        );
+      } else {
+        _log("⚠️ [BRIDGE] Wi-Fi Direct group not created - TCP server may not start (fallback: BLE GATT)");
+      }
+    } catch (e) {
+      _log("⚠️ [BRIDGE] Ensure Wi-Fi Direct group failed: $e");
+    }
+    
     // 🔥 ШАГ 4: Запускаем TCP сервер ТОЛЬКО после готовности GATT и стабилизации Advertising
     _log("🛡️ [BRIDGE] Step 4: Starting TCP server (after GATT+Advertising)...");
     
@@ -5549,6 +5629,7 @@ class MeshService with ChangeNotifier {
 
   void onNetworkDisconnected() {
     _isP2pConnected = false;
+    _isRouteReady = false;
     _isTransferring = false; // СБРОС: линк упал, флаг больше не нужен
     _log("🔌 Link severed.");
     
@@ -5564,6 +5645,37 @@ class MeshService with ChangeNotifier {
       }
     } catch (e) {
       _log("⚠️ [REPEATER] Failed to report disconnection: $e");
+    }
+    
+    notifyListeners();
+  }
+
+  /// Обработка ошибок подключения Wi-Fi Direct
+  void onNetworkConnectionFailed(String error, String message, int? code) {
+    _log("❌ [CONNECTION_FAILED] Wi-Fi Direct connection failed:");
+    _log("   📋 Error: $error");
+    _log("   📋 Message: $message");
+    if (code != null) {
+      _log("   📋 Code: $code");
+    }
+    
+    // 🔥 REPEATER: Уведомляем об ошибке подключения
+    try {
+      final repeater = locator<RepeaterService>();
+      // Отмечаем все Wi-Fi Direct соединения как failed
+      for (final conn in repeater.connections) {
+        if (conn.channelType == ChannelType.wifiDirect) {
+          repeater.onDeviceDisconnected(conn.deviceId);
+          _log("🔄 [REPEATER] Wi-Fi Direct connection failure reported: ${conn.deviceId}");
+        }
+      }
+    } catch (e) {
+      _log("⚠️ [REPEATER] Failed to report connection failure: $e");
+    }
+    
+    // Если Wi-Fi Direct выключен, предлагаем пользователю включить его
+    if (error == "P2P_DISABLED") {
+      _log("💡 [CONNECTION_FAILED] Wi-Fi Direct is disabled. Please enable it in settings.");
     }
     
     notifyListeners();
@@ -5804,11 +5916,14 @@ void _triggerSlowScan() {
         try {
           final msgId = pending.first['id'] as String;
           if (!_sentPayloads.containsKey(msgId)) {
+            final firstP = pending.first;
+            final int tsMagnet = (firstP['createdAt'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
             final messageData = jsonEncode({
               'type': 'OFFLINE_MSG',
-              'content': pending.first['content'],
+              'content': firstP['content'],
               'senderId': _apiService.currentUserId,
               'h': msgId,
+              'ts': tsMagnet,
               'ttl': 5,
             });
             final sonarPayload = messageData.length > 200 ? messageData.substring(0, 200) : messageData;
@@ -6183,11 +6298,14 @@ void _triggerSlowScan() {
                       return;
                     }
                     
+                    final firstP = pending.first;
+                    final int tsSonarTcp = (firstP['createdAt'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
                     final messageData = jsonEncode({
                       'type': 'OFFLINE_MSG',
-                      'content': pending.first['content'],
+                      'content': firstP['content'],
                       'senderId': _apiService.currentUserId,
                       'h': msgId,
+                      'ts': tsSonarTcp,
                       'ttl': 5,
                     });
                     final sonarPayload = messageData.length > 200 ? messageData.substring(0, 200) : messageData;
@@ -6212,11 +6330,14 @@ void _triggerSlowScan() {
               // Если есть bridgeToken - используем TCP напрямую
               final pendingForTcp = await _db.getPendingFromOutbox();
               if (pendingForTcp.isNotEmpty) {
+                final firstTcp = pendingForTcp.first;
+                final int tsTcpFirst = (firstTcp['createdAt'] as int?) ?? DateTime.now().millisecondsSinceEpoch;
                 final String payload = jsonEncode({
                   'type': 'OFFLINE_MSG',
-                  'content': pendingForTcp.first['content'],
+                  'content': firstTcp['content'],
                   'senderId': _apiService.currentUserId,
-                  'h': pendingForTcp.first['id'],
+                  'h': firstTcp['id'],
+                  'ts': tsTcpFirst,
                   'ttl': 5,
                 });
                 await sendTcpBurst(payload);

@@ -9,7 +9,9 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import android.util.Log
 import kotlinx.coroutines.*
@@ -421,46 +423,59 @@ class MeshBackgroundService : Service() {
     /**
      * 🔥 КРИТИЧЕСКИЙ ФИКС #1: Проверяет, является ли устройство Group Owner
      * TCP сервер должен запускаться ТОЛЬКО на GO
+     * 
+     * 🔥 FIX: Добавлена retry логика для случая, когда группа ещё формируется
      */
     private fun checkIfGroupOwner(): Boolean {
         return try {
-            // Используем WifiP2pHelper для проверки роли
-            // Это требует доступа к экземпляру WifiP2pHelper через MainActivity
-            // Пока используем простую проверку через системные сервисы
-            
-            // 🔥 FIX: Проверяем через WifiP2pManager напрямую
             val wifiP2pManager = getSystemService(Context.WIFI_P2P_SERVICE) as? android.net.wifi.p2p.WifiP2pManager
             if (wifiP2pManager == null) {
                 Log.w("P2P_BG", "⚠️ WifiP2pManager not available")
                 return false
             }
             
-            // Создаем временный канал для проверки
-            val channel = wifiP2pManager.initialize(applicationContext, mainLooper, null)
+            val channel = wifiP2pManager.initialize(applicationContext, Looper.getMainLooper(), null)
             if (channel == null) {
                 Log.w("P2P_BG", "⚠️ Failed to initialize WifiP2pManager channel")
                 return false
             }
             
-            // 🔥 FIX: Используем синхронную проверку через CompletableDeferred
             var isOwner = false
             val deferred = CompletableDeferred<Boolean>()
             
-            wifiP2pManager.requestConnectionInfo(channel) { info ->
-                if (info != null && info.groupFormed) {
-                    isOwner = info.isGroupOwner
-                    Log.d("P2P_BG", "📋 Group info: isGroupOwner=$isOwner, groupFormed=${info.groupFormed}")
-                } else {
-                    Log.d("P2P_BG", "📋 No active group found")
-                    isOwner = false
+            // 🔥 FIX: Добавляем retry логику для случая, когда группа ещё формируется
+            var retryCount = 0
+            val maxRetries = 3
+            
+            fun checkGroupInfo() {
+                wifiP2pManager.requestConnectionInfo(channel) { info ->
+                    if (info != null && info.groupFormed && info.groupOwnerAddress != null) {
+                        isOwner = info.isGroupOwner
+                        Log.d("P2P_BG", "📋 Group info: isGroupOwner=$isOwner, groupFormed=${info.groupFormed}")
+                        deferred.complete(isOwner)
+                    } else {
+                        // Группа ещё не сформирована - retry
+                        if (retryCount < maxRetries) {
+                            retryCount++
+                            Log.d("P2P_BG", "📋 Group not formed yet, retry $retryCount/$maxRetries...")
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                checkGroupInfo()
+                            }, 1000) // Retry через 1 секунду
+                        } else {
+                            Log.d("P2P_BG", "📋 No active group found after $maxRetries retries")
+                            isOwner = false
+                            deferred.complete(false)
+                        }
+                    }
                 }
-                deferred.complete(isOwner)
             }
+            
+            checkGroupInfo()
             
             // Ждем результат с таймаутом
             runBlocking {
                 try {
-                    isOwner = deferred.awaitWithTimeout(2000) ?: false
+                    isOwner = deferred.awaitWithTimeout(5000) ?: false  // Увеличен таймаут до 5 секунд
                 } catch (e: Exception) {
                     Log.w("P2P_BG", "⚠️ Timeout checking group owner status: ${e.message}")
                     isOwner = false
@@ -470,7 +485,7 @@ class MeshBackgroundService : Service() {
             isOwner
         } catch (e: Exception) {
             Log.e("P2P_BG", "❌ Error checking Group Owner status: ${e.message}")
-            false // По умолчанию считаем, что мы не GO
+            false
         }
     }
     

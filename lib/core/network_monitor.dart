@@ -13,6 +13,8 @@ import 'security_config.dart'; // 🔒 Certificate Pinning
 
 enum MeshRole { GHOST, BRIDGE }
 
+/// 🔒 P1: Гистерезис BRIDGE/GHOST — без демпфирования сеть дёргается и флапает.
+/// Переход в GHOST только после N подряд неудач ping; переход в BRIDGE после 1 успеха (не задерживаем восстановление).
 class NetworkMonitor {
   static final NetworkMonitor _instance = NetworkMonitor._internal();
   factory NetworkMonitor() => _instance;
@@ -26,6 +28,10 @@ class NetworkMonitor {
 
   final StreamController<MeshRole> _roleController = StreamController.broadcast();
   Stream<MeshRole> get onRoleChanged => _roleController.stream;
+
+  // 🔒 P1: Гистерезис — не переключаемся в GHOST по первому таймауту
+  int _consecutivePingFailures = 0;
+  static const int _roleSwitchFailuresRequired = 2;
 
   http.Client _createClient() {
     // 🔒 SECURITY FIX: Use centralized certificate validation
@@ -53,14 +59,14 @@ class NetworkMonitor {
     final connectedRouter = routerService.connectedRouter;
     
     if (connectedRouter != null && connectedRouter.hasInternet) {
-      // Роутер имеет интернет - мы BRIDGE
+      _consecutivePingFailures = 0;
       if (currentRole != MeshRole.BRIDGE) {
         print("🛰️ [NET-TRANSITION] ROUTER -> ONLINE (BRIDGE MODE via Router)");
         currentRole = MeshRole.BRIDGE;
         _roleController.add(currentRole);
         unawaited(locator<ApiService>().syncOutbox());
       }
-      return; // Роутер работает, не проверяем прямой интернет
+      return;
     }
 
     // 2. Проверяем прямой интернет (мобильный/проводной)
@@ -69,12 +75,12 @@ class NetworkMonitor {
           .timeout(const Duration(seconds: 3));
 
       if (response.statusCode == 200) {
+        _consecutivePingFailures = 0;
         if (currentRole != MeshRole.BRIDGE) {
           print("🌐 [NET-TRANSITION] OFFLINE -> ONLINE (BRIDGE MODE ACTIVE)");
           currentRole = MeshRole.BRIDGE;
           _roleController.add(currentRole);
 
-          // Проверяем Mesh-линк при выходе в онлайн
           final mesh = locator<MeshService>();
           if (mesh.isP2pConnected) {
             print("🔗 [PERSISTENCE-CHECK] P2P Link maintained during Cloud uplink.");
@@ -83,10 +89,16 @@ class NetworkMonitor {
           unawaited(locator<ApiService>().syncOutbox());
         }
       } else {
-        _goGhost();
+        _consecutivePingFailures++;
+        if (_consecutivePingFailures >= _roleSwitchFailuresRequired) {
+          _goGhost();
+        }
       }
     } catch (e) {
-      _goGhost();
+      _consecutivePingFailures++;
+      if (_consecutivePingFailures >= _roleSwitchFailuresRequired) {
+        _goGhost();
+      }
     }
   }
 
@@ -94,6 +106,7 @@ class NetworkMonitor {
     if (currentRole == MeshRole.GHOST) return;
     currentRole = MeshRole.GHOST;
     _roleController.add(currentRole);
+    _consecutivePingFailures = 0;
 
     final mesh = locator<MeshService>();
     mesh.startDiscovery(SignalType.mesh);

@@ -12,6 +12,7 @@ import 'discovery_context_service.dart'; // 🔥 Discovery Context Service
 import 'connection_stabilizer.dart'; // 🔥 Connection Stabilizer
 import 'repeater_service.dart'; // 🔥 Repeater/Repair Service
 import 'ghost_transfer_manager.dart'; // 🔥 Оптимизированный Ghost Transfer Manager
+import 'peer_cache_service.dart'; // 🔥 Peer Cache Service
 
 
 final GetIt locator = GetIt.instance;
@@ -38,6 +39,9 @@ void setupLocator() {
   
   // 🔥 Ghost Transfer Manager - оптимизированная очередь передачи сообщений
   locator.registerLazySingleton(() => GhostTransferManager());
+  
+  // 🔥 Peer Cache Service - локальная память сети для метрик
+  locator.registerLazySingleton(() => PeerCacheService());
 
   // Оркестратор регистрируем ПОСЛЕДНИМ
   locator.registerLazySingleton(() => TacticalMeshOrchestrator());

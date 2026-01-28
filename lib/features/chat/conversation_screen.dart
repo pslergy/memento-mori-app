@@ -247,9 +247,9 @@ class _ConversationScreenState extends State<ConversationScreen> {
     final encryption = locator<EncryptionService>();
     final db = LocalDatabaseService();
 
-    // 1. ДЕДУПЛИКАЦИЯ (Критично для Mesh)
-    final String msgId = data['id']?.toString() ?? data['clientTempId'] ?? "m_${data['timestamp']}";
-    if (_processedIds.contains(msgId)) return;
+    // 1. ДЕДУПЛИКАЦИЯ: канонический ID = h
+    final String msgId = data['h']?.toString() ?? data['clientTempId']?.toString() ?? data['id']?.toString() ?? '';
+    if (msgId.isEmpty || _processedIds.contains(msgId)) return;
     _processedIds.add(msgId);
 
     // 2. ЗАЩИТА ОТ ЭХА
@@ -260,7 +260,6 @@ class _ConversationScreenState extends State<ConversationScreen> {
     // 3. РАСШИФРОВКА (E2EE)
     if (data['isEncrypted'] == true) {
       try {
-        // Мы используем _chatId как ключ для деривации (PBKDF2 внутри сервиса)
         final key = await encryption.getChatKey(_chatId!);
         content = await encryption.decrypt(content, key);
       } catch (e) {
@@ -268,12 +267,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
       }
     }
 
+    final int tsMs = data['ts'] ?? data['timestamp'] ?? DateTime.now().millisecondsSinceEpoch;
+    final createdAt = DateTime.fromMillisecondsSinceEpoch(tsMs);
+
     final newMessage = ChatMessage(
       id: msgId,
       content: content,
       senderId: data['senderId'] ?? "GHOST",
       senderUsername: data['senderUsername'] ?? "Nomad",
-      createdAt: DateTime.now(),
+      createdAt: createdAt,
       status: fromCloud ? "CLOUD" : "MESH",
     );
 
@@ -332,7 +334,9 @@ class _ConversationScreenState extends State<ConversationScreen> {
     final db = LocalDatabaseService();
     final encryption = locator<EncryptionService>();
 
-    final String msgId = data['id']?.toString() ?? data['clientTempId'] ?? "mesh_${data['timestamp']}";
+    // Канонический ID: h, alias clientTempId/id (не генерировать из timestamp)
+    final String msgId = data['h']?.toString() ?? data['clientTempId']?.toString() ?? data['id']?.toString() ?? '';
+    if (msgId.isEmpty) return;
     final String senderId = data['senderId'] ?? "Unknown";
 
     // Если это наше собственное сообщение, полученное обратно - обновляем статус
@@ -375,7 +379,9 @@ class _ConversationScreenState extends State<ConversationScreen> {
     }
 
     final now = DateTime.now();
-    final createdAt = DateTime.fromMillisecondsSinceEpoch(data['timestamp'] ?? now.millisecondsSinceEpoch);
+    // Сортировка по ts (время создания), не по времени приёма
+    final int tsMs = data['ts'] ?? data['timestamp'] ?? now.millisecondsSinceEpoch;
+    final createdAt = DateTime.fromMillisecondsSinceEpoch(tsMs);
     
     // Парсим vector clock если есть
     Map<String, int>? vectorClock;
@@ -397,7 +403,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
       senderId: senderId,
       senderUsername: data['senderUsername'] ?? "Nomad",
       createdAt: createdAt,
-      receivedAt: now, // 📊 receivedAt: только для статистики/отладки, НЕ для сортировки
+      receivedAt: now, // 📊 только для логов/статистики, НЕ для сортировки
       vectorClock: vectorClock, // 🔄 Только для синхронизации
       status: isFromCloud ? "SENT" : "MESH_LINK",
     );
@@ -408,7 +414,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
       HapticFeedback.lightImpact(); // Тактильный сигнал о приеме
       setState(() {
         _messages.add(newMessage);
-        // Сортировка по (created_at, author_id, message_id)
+        // Сортировка: 1) ts (createdAt), 2) senderId, 3) h (id)
         _messages.sort((a, b) {
           final timeCompare = a.createdAt.compareTo(b.createdAt);
           if (timeCompare != 0) return timeCompare;
