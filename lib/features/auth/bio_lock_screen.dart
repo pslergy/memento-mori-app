@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:local_auth/local_auth.dart';
- // Для красивых текстов на Android
+import 'package:memento_mori_app/core/decoy/gate_storage.dart';
 import 'package:memento_mori_app/core/panic_service.dart';
+import 'package:memento_mori_app/features/auth/set_access_codes_screen.dart';
 import 'package:memento_mori_app/main_screen.dart';
 import 'package:local_auth_android/local_auth_android.dart';
 
@@ -116,19 +117,30 @@ class _BioLockScreenState extends State<BioLockScreen> {
   }
 
   void _onSuccess() async {
-    // 🔥 ПАНИК-ПРОТОКОЛ: Сбрасываем флаг после успешной биометрической аутентификации
     if (widget.requireBiometric) {
       await PanicService.resetPanicFlag();
-      print("✅ [PANIC] Panic protocol flag reset after successful biometric authentication");
     }
-
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(
-      MaterialPageRoute(builder: (_) => MainScreen(
-        deathDate: widget.deathDate,
-        birthDate: widget.birthDate,
-      )),
-    );
+    final needCodes = !(await hasGateHashes());
+    if (needCodes) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => SetAccessCodesScreen(
+            deathDate: widget.deathDate,
+            birthDate: widget.birthDate,
+          ),
+        ),
+      );
+    } else {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => MainScreen(
+            deathDate: widget.deathDate,
+            birthDate: widget.birthDate,
+          ),
+        ),
+      );
+    }
   }
 
   void _onFailure() {

@@ -56,6 +56,19 @@ class DiscoveryContextService {
     }
   }
   
+  /// Получить все валидные RELAY кандидаты (призрак-релеятор с GATT)
+  List<UplinkCandidate> get validRelays {
+    final relays = validCandidates.where((c) => c.isRelay).toList();
+    relays.sort((a, b) => b.priority.compareTo(a.priority));
+    return relays;
+  }
+  
+  /// Лучший RELAY (для доставки при отсутствии BRIDGE)
+  UplinkCandidate? get bestRelay {
+    final relays = validRelays;
+    return relays.isNotEmpty ? relays.first : null;
+  }
+  
   /// Получить все валидные GHOST кандидаты (отсортированные по приоритету)
   List<UplinkCandidate> get validGhosts {
     final ghosts = validCandidates.where((c) => c.isGhost).toList();
@@ -79,6 +92,13 @@ class DiscoveryContextService {
     return null;
   }
   
+  /// Получить кандидата по стабильному device UUID (из manufacturerData, hex 16 chars).
+  /// Используется для BLE connect по UUID при ротации MAC.
+  UplinkCandidate? getCandidateByDeviceUuid(String deviceUuid) {
+    final c = _candidates[deviceUuid];
+    return c?.isValid == true ? c : null;
+  }
+  
   /// Обновить контекст из BLE scan результата
   /// 
   /// Это НЕ инициирует подключение, только обновляет контекст.
@@ -89,17 +109,16 @@ class DiscoveryContextService {
       final platformName = scanResult.device.platformName;
       final effectiveName = advName.isEmpty ? platformName : advName;
       
-      // Пропускаем если не mesh устройство
-      if (effectiveName.isEmpty && 
-          !scanResult.advertisementData.serviceUuids.any((uuid) => 
-            uuid.toString().toLowerCase().contains("bf27730d"))) {
-        // Проверяем manufacturerData как fallback
-        // manufacturerData в flutter_blue_plus имеет тип Map<int, List<int>>
-        final mfDataRaw = scanResult.advertisementData.manufacturerData[0xFFFF];
-        if (mfDataRaw == null || mfDataRaw.isEmpty || (mfDataRaw[0] != 0x42 && mfDataRaw[0] != 0x47)) {
-          return; // Не наше устройство
-        }
-      }
+      // 🔒 Только mesh: колонки/наушники/часы с BLE не добавляем. Требуем наш Service UUID или manufacturerData BR/GH/RL.
+      final hasOurUuid = scanResult.advertisementData.serviceUuids.any((uuid) =>
+          uuid.toString().toLowerCase().contains("bf27730d"));
+      final mfDataRaw = scanResult.advertisementData.manufacturerData[0xFFFF];
+      final isMeshByMfData = mfDataRaw != null &&
+          mfDataRaw.length >= 2 &&
+          ((mfDataRaw[0] == 0x42 && mfDataRaw[1] == 0x52) || // BR
+              (mfDataRaw[0] == 0x47 && mfDataRaw[1] == 0x48) || // GH
+              (mfDataRaw[0] == 0x52 && mfDataRaw[1] == 0x4C)); // RL
+      if (!hasOurUuid && !isMeshByMfData) return;
       
       // 🔥 FIX: Конвертируем manufacturerData из Map<int, List<int>> в Map<int, Uint8List>
       Map<int, Uint8List>? convertedManufacturerData;
@@ -185,12 +204,10 @@ class DiscoveryContextService {
   }
   
   /// Внутренний метод для обновления кандидата
-  /// 🔥 КРИТИЧНО: Группируем BRIDGE по logical ID (id), а не по MAC
-  /// Это решает проблему рандомизированных MAC на Huawei
+  /// 🔥 КРИТИЧНО: Группируем по стабильному ID: deviceUuid (GHOST/RELAY) или logical id (BRIDGE) или MAC
+  /// Так один и тот же узел с ротирующим MAC обновляет одну запись с актуальным mac
   void _updateCandidate(UplinkCandidate newCandidate, String source) {
-    // 🔥 КРИТИЧНО: Для BRIDGE используем id (logical ID) вместо MAC для группировки
-    // Это позволяет объединять одного и того же BRIDGE с разными MAC адресами
-    final candidateKey = newCandidate.isBridge ? newCandidate.id : newCandidate.mac;
+    final candidateKey = newCandidate.deviceUuid ?? (newCandidate.isBridge ? newCandidate.id : newCandidate.mac);
     final existing = _candidates[candidateKey];
     
     if (existing == null) {
@@ -213,18 +230,22 @@ class DiscoveryContextService {
       // Это предотвращает использование устаревших токенов при смене advertising
       final updatedToken = newCandidate.bridgeToken ?? existing.bridgeToken;
       
+      // При обновлении по deviceUuid обновляем mac (актуальный MAC из последнего скана)
       final updated = existing.copyWith(
+        mac: newCandidate.mac,
         role: newCandidate.role,
         hops: newCandidate.hops,
-        hasData: newCandidate.hasData || existing.hasData, // Сохраняем если было
+        hasData: newCandidate.hasData || existing.hasData,
         ip: newCandidate.ip ?? existing.ip,
         port: newCandidate.port ?? existing.port,
-        bridgeToken: updatedToken, // Используем самый свежий токен
+        bridgeToken: updatedToken,
+        wifiDirectPassphrase: newCandidate.wifiDirectPassphrase ?? existing.wifiDirectPassphrase,
+        wifiDirectNetworkName: newCandidate.wifiDirectNetworkName ?? existing.wifiDirectNetworkName,
         lastSeen: DateTime.now(),
         confidence: updatedConfidence,
         discoverySource: source,
         confirmationCount: existing.confirmationCount,
-        gattForbiddenUntil: existing.gattForbiddenUntil, // Сохраняем cooldown если был установлен
+        gattForbiddenUntil: existing.gattForbiddenUntil,
       );
       
       // 🔥 КРИТИЧНО: Обновляем MAC адрес в существующем кандидате (для рандомизированных MAC)

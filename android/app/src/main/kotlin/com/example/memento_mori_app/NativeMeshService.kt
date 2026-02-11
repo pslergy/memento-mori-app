@@ -81,15 +81,17 @@ class NativeMeshService(
 
             "connect" -> {
                 val addr = call.argument<String>("deviceAddress")
+                val networkName = call.argument<String>("networkName")
+                val passphrase = call.argument<String>("passphrase")
                 if (addr != null) {
-                    p2pHelper?.connect(addr)
+                    p2pHelper?.connect(addr, networkName, passphrase)
                     result.success(true)
                 } else result.error("ERR", "No address", null)
             }
 
             "sendTcp" -> {
                 val host = call.argument<String>("host") ?: "192.168.49.1"
-                val port = call.argument<Int>("port") ?: 55555 // MESH_PORT: BRIDGE слушает, GHOST шлёт
+                val port = call.argument<Int>("port") ?: 55556 // Единый порт: BRIDGE слушает, GHOST шлёт
                 val msg = call.argument<String>("message") ?: ""
                 p2pHelper?.sendTcp(host, port, msg)
                 result.success(true)

@@ -9,7 +9,7 @@ class RouterBridgeProtocol {
   RouterBridgeProtocol._internal();
 
   /// Передает данные через роутер по TCP
-  Future<bool> sendViaRouter(String data, String targetIp, {int port = 55555}) async {
+  Future<bool> sendViaRouter(String data, String targetIp, {int port = 55556}) async {
     try {
       final socket = await Socket.connect(targetIp, port, timeout: const Duration(seconds: 5));
       socket.add(utf8.encode('$data\n'));
@@ -43,7 +43,7 @@ class RouterBridgeProtocol {
         if (ip == localIp) continue; // Пропускаем свой IP
 
         try {
-          final socket = await Socket.connect(ip, 55555, timeout: const Duration(milliseconds: 500));
+          final socket = await Socket.connect(ip, 55556, timeout: const Duration(milliseconds: 500));
           devices.add(ip);
           socket.destroy();
         } catch (_) {

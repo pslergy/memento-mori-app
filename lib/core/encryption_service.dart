@@ -1,44 +1,50 @@
-import 'dart:typed_data'; // 🔥 ОБЯЗАТЕЛЬНО ДЛЯ Uint8List
+import 'dart:typed_data';
 import 'dart:math' as math;
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'dart:convert';
 
+import 'decoy/vault_interface.dart';
+
+/// SECURITY INVARIANT: Key derivation MUST include mode as entropy. When [VaultInterface]
+/// is injected (mode-scoped), salt is stored in that vault. No shared crypto singletons.
 class EncryptionService {
+  EncryptionService([VaultInterface? vault]) : _vault = vault;
+
+  final VaultInterface? _vault;
   final _algorithm = AesGcm.with256bits();
-  
-  // 🔒 SECURITY FIX: Secure storage for user-specific salt
+
   static const _secureStorage = FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
   );
-  
-  // 🔒 SECURITY FIX: Cache user salt in memory for performance
-  static String? _cachedUserSalt;
-  
-  // 🔒 SECURITY FIX: PBKDF2 iterations - OWASP recommendation for HMAC-SHA256
+
+  String? _cachedUserSalt;
   static const int _pbkdf2Iterations = 100000;
 
-  /// 🔒 SECURITY FIX: Generate or retrieve user-specific salt
-  /// Each user has a unique salt stored in secure storage
+  /// Mode exit: wipe in-memory crypto material. Call before DI reset.
+  void clearCachedSecrets() {
+    _cachedUserSalt = null;
+  }
+
   Future<String> _getUserSalt() async {
     if (_cachedUserSalt != null) return _cachedUserSalt!;
-    
-    String? salt = await _secureStorage.read(key: 'user_encryption_salt');
-    
+    String? salt;
+    if (_vault != null) {
+      salt = await _vault!.read('user_encryption_salt');
+    } else {
+      salt = await _secureStorage.read(key: 'user_encryption_salt');
+    }
     if (salt == null) {
-      // Generate new cryptographically secure salt (32 bytes = 256 bits)
       final random = math.Random.secure();
       final saltBytes = Uint8List(32);
-      for (int i = 0; i < 32; i++) {
-        saltBytes[i] = random.nextInt(256);
-      }
+      for (int i = 0; i < 32; i++) saltBytes[i] = random.nextInt(256);
       salt = base64.encode(saltBytes);
-      
-      // Store salt securely
-      await _secureStorage.write(key: 'user_encryption_salt', value: salt);
-      print("🔐 [Security] New user encryption salt generated");
+      if (_vault != null) {
+        await _vault!.write('user_encryption_salt', salt);
+      } else {
+        await _secureStorage.write(key: 'user_encryption_salt', value: salt);
+      }
     }
-    
     _cachedUserSalt = salt;
     return salt;
   }
@@ -48,7 +54,7 @@ class EncryptionService {
   Future<SecretKey> getChatKey(String chatId) async {
     // 🔒 Get user-specific salt (unique per device/user)
     final userSalt = await _getUserSalt();
-    
+
     String derivationId = chatId;
 
     if (chatId == "GLOBAL" || chatId == "THE_BEACON_GLOBAL") {
@@ -76,14 +82,14 @@ class EncryptionService {
   /// 🔒 SECURITY FIX: System key now uses user-specific derivation
   Future<SecretKey> getSystemKey() async {
     final userSalt = await _getUserSalt();
-    
+
     // 🔒 Derive system key from user salt with different context
     final pbkdf2 = Pbkdf2(
       macAlgorithm: Hmac.sha256(),
       iterations: _pbkdf2Iterations,
       bits: 256,
     );
-    
+
     return await pbkdf2.deriveKey(
       secretKey: SecretKey(base64.decode(userSalt)),
       nonce: utf8.encode('MEMENTO_MORI_SYSTEM_KEY_V2'),
@@ -114,7 +120,8 @@ class EncryptionService {
     // 🔒 Fix Ghost Identity collision: Add secure random to prevent collisions
     final random = math.Random.secure();
     final randomSuffix = random.nextInt(999999);
-    final String ghostId = "GHOST_${DateTime.now().millisecondsSinceEpoch}_${username.hashCode.abs()}_$randomSuffix";
+    final String ghostId =
+        "GHOST_${DateTime.now().millisecondsSinceEpoch}_${username.hashCode.abs()}_$randomSuffix";
 
     print("🛡️ [Security] Ghost Identity established locally for: $username");
 
@@ -162,7 +169,6 @@ class EncryptionService {
     });
   }
 
-
   // Расшифровка данных
   Future<String> decrypt(String cipherText, SecretKey key) async {
     // 1. Простейшая проверка: шифр не может содержать пробелов и должен быть длинным
@@ -174,13 +180,11 @@ class EncryptionService {
       // 2. Проверка на валидность Base64
       final bytes = base64.decode(cipherText);
 
-      final secretBox = SecretBox.fromConcatenation(
-          bytes,
-          nonceLength: 12,
-          macLength: 16
-      );
+      final secretBox =
+          SecretBox.fromConcatenation(bytes, nonceLength: 12, macLength: 16);
 
-      final decryptedBytes = await _algorithm.decrypt(secretBox, secretKey: key);
+      final decryptedBytes =
+          await _algorithm.decrypt(secretBox, secretKey: key);
       return utf8.decode(decryptedBytes);
     } catch (e) {
       // Если это не Base64 или ошибка ключа — не паникуем, отдаем оригинал
@@ -193,19 +197,19 @@ class EncryptionService {
   /// Creates unique "Landing Pass" for offline account legalization
   Future<String> generateLandingPass(String email, String ghostId) async {
     final userSalt = await _getUserSalt();
-    
+
     // 🔒 Use PBKDF2 for landing pass derivation
     final pbkdf2 = Pbkdf2(
       macAlgorithm: Hmac.sha256(),
       iterations: _pbkdf2Iterations,
       bits: 256,
     );
-    
+
     final key = await pbkdf2.deriveKey(
       secretKey: SecretKey(base64.decode(userSalt)),
       nonce: utf8.encode('$email:$ghostId:LANDING_PASS_V2'),
     );
-    
+
     final keyBytes = await key.extractBytes();
     return base64.encode(keyBytes);
   }

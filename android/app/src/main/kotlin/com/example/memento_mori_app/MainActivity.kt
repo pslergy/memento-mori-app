@@ -4,7 +4,10 @@ import android.Manifest
 import android.app.*
 import android.app.usage.UsageStats
 import android.app.usage.UsageStatsManager
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.*
+import android.provider.Settings
 import android.content.pm.PackageManager
 import android.media.*
 import android.net.wifi.p2p.WifiP2pManager
@@ -68,12 +71,13 @@ class MainActivity : FlutterFragmentActivity() {
     data class MicEvent(val ts: Long, val type: MicType, val hidden: Boolean)
 
     // Приемник сообщений из Mesh-сервиса
+    // WIFI_DIRECT_AUDIT: TCP-приём должен идти на memento/wifi_direct, т.к. Dart слушает только там
     private val messageReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val msg = intent.getStringExtra("message")
             val ip = intent.getStringExtra("senderIp")
             runOnUiThread {
-                p2pMethodChannel?.invokeMethod("onMessageReceived", mapOf("message" to msg, "senderIp" to ip))
+                meshMethodChannel?.invokeMethod("onMessageReceived", mapOf("message" to msg, "senderIp" to ip))
             }
         }
     }
@@ -141,7 +145,8 @@ class MainActivity : FlutterFragmentActivity() {
         gattServerHelper = GattServerHelper(this, gattMethodChannel)
 
         // 3. Привязка нативного сервиса Mesh к каналу Wi-Fi Direct
-        p2pHelper = WifiP2pHelper(this, this, p2pMethodChannel!!)
+        // WIFI_DIRECT_AUDIT: P2P-колбэки (onConnected, onPeersFound, onGroupCreated и т.д.) должны идти на memento/wifi_direct
+        p2pHelper = WifiP2pHelper(this, this, meshMethodChannel!!)
         // 🔥 КРИТИЧНО: Регистрируем receiver для обработки Wi-Fi Direct событий
         p2pHelper?.registerReceiver()
         val nativeMeshService = NativeMeshService(this, manager, wifiP2pChannel!!, p2pHelper)
@@ -153,7 +158,8 @@ class MainActivity : FlutterFragmentActivity() {
             when (call.method) {
                 "startGattServer" -> {
                     val success = gattServerHelper?.startGattServer() ?: false
-                    result.success(success)
+                    val gen = gattServerHelper?.getGattServerGeneration() ?: 0
+                    result.success(mapOf("success" to success, "generation" to gen))
                 }
                 "stopGattServer" -> {
                     gattServerHelper?.stopGattServer()
@@ -198,6 +204,22 @@ class MainActivity : FlutterFragmentActivity() {
                     
                     val success = gattServerHelper?.sendMessageToClient(deviceAddress, message) ?: false
                     result.success(success)
+                }
+                "getLocalBluetoothAddress" -> {
+                    // Tie-breaker: lower MAC = PERIPHERAL, higher MAC = CENTRAL
+                    // Android 10+ may return "02:00:00:00:00:00" (masked MAC) — use stable ID fallback
+                    try {
+                        val manager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+                        val adapter: BluetoothAdapter? = manager?.adapter
+                        var address = adapter?.address?.trim() ?: ""
+                        if (address.isEmpty() || address.equals("02:00:00:00:00:00", ignoreCase = true)) {
+                            val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: ""
+                            address = if (androidId.isNotEmpty()) "S:$androidId" else ""
+                        }
+                        result.success(if (address.isNotEmpty()) address else null)
+                    } catch (e: Exception) {
+                        result.success(null)
+                    }
                 }
                 else -> result.notImplemented()
             }

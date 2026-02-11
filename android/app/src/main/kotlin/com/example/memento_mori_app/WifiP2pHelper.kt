@@ -28,6 +28,25 @@ class WifiP2pHelper(
     private val activity: android.app.Activity,
     private val methodChannel: MethodChannel
 ) {
+    companion object {
+        // 🔥 Статический логгер для MeshBackgroundService и других компонентов
+        private var staticLogCallback: ((String, String) -> Unit)? = null
+        
+        /**
+         * Отправляет лог в Flutter UI терминал (вызывается из любого места)
+         * Если Activity не активна, лог пишется только в Logcat
+         */
+        fun sendLogToFlutter(tag: String, message: String) {
+            Log.d(tag, message)
+            staticLogCallback?.invoke(tag, message)
+        }
+        
+        /**
+         * Shorthand для логирования с тегом P2P
+         */
+        fun log(message: String) = sendLogToFlutter("P2P", message)
+    }
+    
     private var manager: WifiP2pManager? = null
     private var channel: WifiP2pManager.Channel? = null
     private var receiver: BroadcastReceiver? = null
@@ -56,6 +75,8 @@ class WifiP2pHelper(
     private var currentGroupName: String? = null  // Имя текущей группы
     private var groupCreationRetries = 0  // Количество попыток создания группы
     private val MAX_GROUP_RETRIES = 3     // Максимум попыток
+    /** Huawei/Honor: после сбоя createGroup не ретраить сразу (cooldown 60s). */
+    private var lastGroupCreateFailureTimeMs: Long = 0
 
     init {
         intentFilter.addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
@@ -78,6 +99,20 @@ class WifiP2pHelper(
         
         // Проверяем начальное состояние Wi-Fi Direct
         checkP2pState()
+        
+        // 🔥 УСТАНАВЛИВАЕМ СТАТИЧЕСКИЙ ЛОГГЕР ДЛЯ ДОСТУПА ИЗ MeshBackgroundService
+        staticLogCallback = { tag, message ->
+            runOnMain {
+                try {
+                    methodChannel.invokeMethod("onNativeLog", mapOf(
+                        "tag" to tag,
+                        "message" to message
+                    ))
+                } catch (e: Exception) {
+                    // Activity может быть не активна - игнорируем
+                }
+            }
+        }
     }
     
     /**
@@ -378,6 +413,10 @@ class WifiP2pHelper(
                                     "metadata" to hashedMac
                                 )
                             } ?: emptyList()
+                            // Логируем в UI терминал
+                            if (deviceList.isNotEmpty()) {
+                                logP2P("📡 [PEERS] Found ${deviceList.size} device(s)")
+                            }
                             runOnMain { methodChannel.invokeMethod("onPeersFound", deviceList) }
                         }
                     }
@@ -389,7 +428,7 @@ class WifiP2pHelper(
                             intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO)
                         }
 
-                        Log.d("P2P", "🔗 [CONNECTION_CHANGED] Network state: ${networkInfo?.state}, Connected: ${networkInfo?.isConnected}")
+                        logP2P("🔗 [CONNECTION] State: ${networkInfo?.state}, Connected: ${networkInfo?.isConnected}")
 
                         if (networkInfo?.isConnected == true) {
                             // 🔥 КРИТИЧНО: Проверяем, что P2P инициализирован перед запросом информации
@@ -404,18 +443,18 @@ class WifiP2pHelper(
                                     return@requestConnectionInfo
                                 }
                                 
-                                Log.d("P2P", "📋 [CONNECTION_CHANGED] Connection info:")
-                                Log.d("P2P", "   - Group formed: ${info.groupFormed}")
-                                Log.d("P2P", "   - Is group owner: ${info.isGroupOwner}")
-                                Log.d("P2P", "   - Group owner address: ${info.groupOwnerAddress?.hostAddress}")
+                                logP2P("📋 [CONNECTION] Info received")
+                                logP2P("   - Group formed: ${info.groupFormed}")
+                                logP2P("   - Is group owner: ${info.isGroupOwner}")
+                                logP2P("   - GO address: ${info.groupOwnerAddress?.hostAddress}")
                                 
                                 if (info.groupFormed && info.groupOwnerAddress != null) {
                                     val isHost = info.isGroupOwner
                                     val hostAddress = info.groupOwnerAddress.hostAddress
                                     
-                                    Log.d("P2P", "✅ [CONNECTION_CHANGED] Connection established!")
-                                    Log.d("P2P", "   - Role: ${if (isHost) "HOST (Group Owner)" else "CLIENT"}")
-                                    Log.d("P2P", "   - Host address: $hostAddress")
+                                    logP2P("✅ [CONNECTION] Established!")
+                                    logP2P("   - Role: ${if (isHost) "HOST (GO)" else "CLIENT"}")
+                                    logP2P("   - Host IP: $hostAddress")
                                     
                                     if (wakeLock?.isHeld == false) {
                                         wakeLock?.acquire(10 * 60 * 1000L)
@@ -441,7 +480,7 @@ class WifiP2pHelper(
                                                 val isHost = retryInfo.isGroupOwner
                                                 val hostAddress = retryInfo.groupOwnerAddress.hostAddress
                                                 
-                                                Log.d("P2P", "✅ [CONNECTION_CHANGED] Connection established after retry!")
+                                                logP2P("✅ [CONNECTION] Established after retry!")
                                                 
                                                 if (wakeLock?.isHeld == false) {
                                                     wakeLock?.acquire(10 * 60 * 1000L)
@@ -467,7 +506,7 @@ class WifiP2pHelper(
                                 }
                             }
                         } else {
-                            Log.d("P2P", "🔌 [CONNECTION_CHANGED] Connection disconnected")
+                            logP2P("🔌 [CONNECTION] Disconnected")
                             if (wakeLock?.isHeld == true) {
                                 wakeLock?.release()
                                 Log.d("P2P", "🔓 WakeLock released")
@@ -538,7 +577,7 @@ class WifiP2pHelper(
         
         manager?.discoverPeers(channel, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                Log.d("P2P", "✅ Discovery started successfully")
+                logP2P("✅ [SCAN] Discovery started")
                 // Discovery автоматически останавливается через ~10 секунд, сбрасываем флаг
                 scope.launch {
                     delay(12000) // Немного больше чем стандартный таймаут
@@ -561,23 +600,23 @@ class WifiP2pHelper(
                 releaseMulticastLock()
                 stopHeartbeat()
                 
-                Log.e("P2P", "❌ Discovery failed: $reason")
+                logP2P("❌ [SCAN] Discovery failed: $reason")
                 // Коды ошибок:
                 // P2P_UNSUPPORTED = 1
                 // BUSY = 2
                 // ERROR = 0 (обычно означает что discovery уже запущен или система занята)
                 when (reason) {
                     WifiP2pManager.P2P_UNSUPPORTED -> {
-                        Log.e("P2P", "Device does not support Wi-Fi Direct")
+                        logP2P("❌ Device not support Wi-Fi Direct")
                     }
                     WifiP2pManager.BUSY -> {
-                        Log.w("P2P", "P2P is busy, will retry later")
+                        logP2P("⚠️ P2P busy, retry later")
                     }
                     0 -> {
                         // ERROR = 0 часто означает что discovery уже активен или система занята
                         // В этом случае считаем discovery активным (Android может не дать запустить повторно)
                         _isDiscoveryActive = true
-                        Log.d("P2P", "ℹ️ Discovery error 0 (likely already active or system busy) - marking as active")
+                        logP2P("ℹ️ [SCAN] Error 0 - likely already active")
                         // Сбрасываем флаг через 12 секунд (стандартный таймаут discovery)
                         scope.launch {
                             delay(12000)
@@ -629,7 +668,7 @@ class WifiP2pHelper(
     }
 
     @SuppressLint("MissingPermission")
-    fun connect(hashedAddress: String) {
+    fun connect(hashedAddress: String, networkName: String? = null, passphrase: String? = null) {
         if (!ensureP2pInitialized()) {
             Log.e("P2P", "❌ [CONNECT] P2P not initialized")
             runOnMain {
@@ -665,12 +704,24 @@ class WifiP2pHelper(
         }
         
         Log.d("P2P", "🔗 [CONNECT] Attempting connection to device: ${anonymize(realMac)}")
-        
-        val config = WifiP2pConfig().apply {
-            deviceAddress = realMac
-            groupOwnerIntent = 15 // Форсируем роль владельца для стабильности моста
+        if (passphrase != null && passphrase.isNotEmpty()) {
+            logP2P("   📋 Using passphrase for Wi-Fi Direct (GHOST will connect without dialog)")
         }
-        
+
+        val config = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && passphrase != null && passphrase.isNotEmpty()) {
+            // API 29+: Используем Builder с passphrase — GHOST подключается без диалога ввода пароля
+            val builder = android.net.wifi.p2p.WifiP2pConfig.Builder()
+            builder.setDeviceAddress(android.net.MacAddress.fromString(realMac))
+            networkName?.let { builder.setNetworkName(it) }
+            builder.setPassphrase(passphrase)
+            builder.build()
+        } else {
+            WifiP2pConfig().apply {
+                deviceAddress = realMac
+                groupOwnerIntent = 15
+            }
+        }
+
         manager?.connect(channel, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
                 Log.d("P2P", "✅ [CONNECT] Connection request sent successfully")
@@ -811,17 +862,59 @@ class WifiP2pHelper(
     }
     
     // ============================================================================
+    // 🔥 ОТПРАВКА ЛОГОВ В FLUTTER UI (ТЕРМИНАЛ ПРИЛОЖЕНИЯ)
+    // ============================================================================
+    
+    /**
+     * Отправляет лог в Flutter терминал приложения.
+     * Вызывайте эту функцию вместо Log.d() где нужно видеть логи в UI.
+     * 
+     * @param tag Тег для логирования (также записывается в Android Logcat)
+     * @param msg Сообщение для отображения
+     * @param alsoLogcat Если true, дублирует в Logcat (по умолчанию true)
+     */
+    fun logToFlutter(tag: String, msg: String, alsoLogcat: Boolean = true) {
+        if (alsoLogcat) {
+            Log.d(tag, msg)
+        }
+        runOnMain {
+            try {
+                methodChannel.invokeMethod("onNativeLog", mapOf(
+                    "tag" to tag,
+                    "message" to msg
+                ))
+            } catch (e: Exception) {
+                Log.e("P2P", "Failed to send log to Flutter: ${e.message}")
+            }
+        }
+    }
+    
+    /**
+     * Shorthand для логирования с тегом P2P
+     */
+    fun logP2P(msg: String) = logToFlutter("P2P", msg)
+    
+    // ============================================================================
     // 🔥 АВТОМАТИЧЕСКОЕ УПРАВЛЕНИЕ WI-FI DIRECT ГРУППОЙ
     // ============================================================================
     
     /**
-     * Генерирует уникальное имя для Wi-Fi Direct группы
-     * Формат: MESH_<userId_short>_<timestamp_short>
+     * Генерирует уникальное имя для Wi-Fi Direct группы.
+     * На API 29+ Android требует префикс DIRECT-xy (Wi‑Fi Direct spec).
+     * Формат: DIRECT-<2 hex>_<short id>, например DIRECT-a1_7924.
      */
     private fun generateGroupName(): String {
-        val timestamp = (System.currentTimeMillis() / 1000) % 10000 // Последние 4 цифры timestamp
-        val random = (Math.random() * 1000).toInt()
-        return "MESH_${timestamp}_$random"
+        val hex = "0123456789abcdef"
+        val c1 = hex[(Math.random() * 16).toInt()]
+        val c2 = hex[(Math.random() * 16).toInt()]
+        val id = (System.currentTimeMillis() / 1000) % 10000
+        return "DIRECT-${c1}${c2}_$id"
+    }
+
+    /** Генерирует парольную фразу для группы (8–63 символа, WPA2). На API 29+ обязательна в Builder. */
+    private fun generateGroupPassphrase(): String {
+        val chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+        return (1..12).map { chars[(Math.random() * chars.length).toInt()] }.joinToString("")
     }
     
     /**
@@ -836,7 +929,7 @@ class WifiP2pHelper(
             return
         }
         
-        Log.d("P2P", "🔍 [GROUP] Проверяем существующую группу...")
+        Log.d("P2P", "🔍 [GROUP] Checking existing group...")
         
         manager?.requestGroupInfo(channel) { group ->
             if (group != null) {
@@ -847,16 +940,16 @@ class WifiP2pHelper(
                     ownerAddress = group.owner?.deviceAddress,
                     clientCount = group.clientList?.size ?: 0
                 )
-                Log.d("P2P", "✅ [GROUP] Найдена группа: ${info.networkName}")
-                Log.d("P2P", "   📋 Владелец: ${if (info.isGroupOwner) "Мы" else info.ownerAddress}")
-                Log.d("P2P", "   📋 Клиентов: ${info.clientCount}")
+                Log.d("P2P", "✅ [GROUP] Found group: ${info.networkName}")
+                Log.d("P2P", "   📋 Owner: ${if (info.isGroupOwner) "Us" else anonymize(info.ownerAddress ?: "")}")
+                Log.d("P2P", "   📋 Clients: ${info.clientCount}")
                 Log.d("P2P", "   📋 Passphrase: ${info.passphrase?.take(4)}...")
                 
                 isGroupOwner = info.isGroupOwner
                 currentGroupName = info.networkName
                 callback(info)
             } else {
-                Log.d("P2P", "ℹ️ [GROUP] Активная группа не найдена")
+                Log.d("P2P", "ℹ️ [GROUP] No active group found")
                 isGroupOwner = false
                 currentGroupName = null
                 callback(null)
@@ -903,17 +996,17 @@ class WifiP2pHelper(
             return
         }
         
-        Log.d("P2P", "🚀 [GROUP] Начинаем создание Wi-Fi Direct группы...")
+        Log.d("P2P", "🚀 [GROUP] Starting Wi-Fi Direct group creation...")
         Log.d("P2P", "   📋 forceCreate: $forceCreate")
         
         // Сначала проверяем существующую группу
         checkExistingGroup { existingGroup ->
             if (existingGroup != null && !forceCreate) {
                 // Группа уже есть и мы не хотим её пересоздавать
-                Log.d("P2P", "✅ [GROUP] Используем существующую группу: ${existingGroup.networkName}")
+                Log.d("P2P", "✅ [GROUP] Using existing group: ${existingGroup.networkName}")
                 
                 if (existingGroup.isGroupOwner) {
-                    // Мы владелец - отлично!
+                    // We are owner - OK
                     runOnMain {
                         methodChannel.invokeMethod("onGroupCreated", mapOf(
                             "networkName" to existingGroup.networkName,
@@ -926,7 +1019,7 @@ class WifiP2pHelper(
                     callback(existingGroup)
                 } else {
                     // Мы клиент в чужой группе - возможно нужно создать свою
-                    Log.d("P2P", "ℹ️ [GROUP] Мы клиент в чужой группе, пропускаем создание")
+                    Log.d("P2P", "ℹ️ [GROUP] We are client in another group, skipping creation")
                     callback(existingGroup)
                 }
                 return@checkExistingGroup
@@ -935,7 +1028,7 @@ class WifiP2pHelper(
             // Нужно создать новую группу
             if (existingGroup != null && forceCreate) {
                 // Удаляем старую группу перед созданием новой
-                Log.d("P2P", "🗑️ [GROUP] Удаляем существующую группу перед созданием новой...")
+                Log.d("P2P", "🗑️ [GROUP] Removing existing group before creating new one...")
                 removeGroup { removed ->
                     if (removed) {
                         // Небольшая задержка для стабилизации
@@ -944,35 +1037,50 @@ class WifiP2pHelper(
                             createNewGroup(callback)
                         }
                     } else {
-                        Log.e("P2P", "❌ [GROUP] Не удалось удалить старую группу")
+                        Log.e("P2P", "❌ [GROUP] Failed to remove old group")
                         callback(null)
                     }
                 }
             } else {
-                // Создаем новую группу
-                createNewGroup(callback)
+                // Создаем новую группу не сразу из onGroupInfoAvailable — откладываем 300–500 ms
+                // чтобы P2P стек успел стабилизироваться (особенно Huawei).
+                scope.launch {
+                    delay(400)
+                    createNewGroup(callback)
+                }
             }
         }
     }
     
     /**
-     * Внутренний метод создания новой группы
+     * Внутренний метод создания новой группы.
+     * @param try5GhzFirst На API 29+: сначала 5 GHz, при неудаче — fallback на 2.4 GHz (не все устройства поддерживают 5 GHz).
      */
     @SuppressLint("MissingPermission")
-    private fun createNewGroup(callback: (GroupInfo?) -> Unit) {
+    private fun createNewGroup(callback: (GroupInfo?) -> Unit, try5GhzFirst: Boolean = true) {
+        // Huawei/Honor: одна попытка за раз, после сбоя cooldown 60 s
+        val isHuaweiOrHonor = deviceInfo.brand == DeviceDetector.DeviceBrand.HUAWEI || deviceInfo.brand == DeviceDetector.DeviceBrand.HONOR
+        if (isHuaweiOrHonor && (System.currentTimeMillis() - lastGroupCreateFailureTimeMs) < 60_000L) {
+            Log.w("P2P", "⚠️ [GROUP] Huawei cooldown: skipping create (60s after last failure)")
+            callback(null)
+            return
+        }
         isGroupCreating = true
-        val groupName = generateGroupName()
-        
-        Log.d("P2P", "📡 [GROUP] Создаем группу: $groupName")
-        Log.d("P2P", "   📋 Устройство: ${deviceInfo.brand} ${deviceInfo.model}")
+        var groupName = generateGroupName().trim()
+        if (groupName.isEmpty() || !groupName.startsWith("DIRECT-")) {
+            val h = "0123456789abcdef"
+            groupName = "DIRECT-${h[(Math.random() * 16).toInt()]}${h[(Math.random() * 16).toInt()]}_${System.currentTimeMillis() % 10000}"
+        }
+        logP2P("📡 [GROUP] Creating: $groupName")
+        Log.d("P2P", "   📋 Device: ${deviceInfo.brand} ${deviceInfo.model}")
         
         // 🔥 ФИКС ДЛЯ КИТАЙСКИХ УСТРОЙСТВ: Захватываем locks перед созданием группы
         acquireMulticastLock()
         acquireWifiLock()
         
-        manager?.createGroup(channel, object : WifiP2pManager.ActionListener {
+        val listener = object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                Log.d("P2P", "✅ [GROUP] Команда создания группы успешна, ждем подтверждения...")
+                logP2P("✅ [GROUP] Create cmd OK, waiting...")
                 
                 // Группа создается асинхронно, ждем обновления через колбек
                 // Проверяем информацию о группе через небольшую задержку
@@ -995,10 +1103,10 @@ class WifiP2pHelper(
                             isGroupOwner = true
                             currentGroupName = info.networkName
                             
-                            Log.d("P2P", "✅ [GROUP] Группа создана успешно!")
-                            Log.d("P2P", "   📋 SSID: ${info.networkName}")
-                            Log.d("P2P", "   📋 Passphrase: ${info.passphrase}")
-                            Log.d("P2P", "   📋 Владелец: ${info.ownerAddress}")
+                            logP2P("✅ [GROUP] Created!")
+                            logP2P("   📋 SSID: ${info.networkName}")
+                            logP2P("   📋 Pass: ${info.passphrase?.take(4)}...")
+                            Log.d("P2P", "   📋 Owner: ${anonymize(info.ownerAddress ?: "")}")
                             
                             runOnMain {
                                 methodChannel.invokeMethod("onGroupCreated", mapOf(
@@ -1011,11 +1119,11 @@ class WifiP2pHelper(
                             }
                             callback(info)
                         } else {
-                            Log.e("P2P", "❌ [GROUP] Группа создана, но информация не получена")
+                            Log.e("P2P", "❌ [GROUP] Group created but info not received")
                             runOnMain {
                                 methodChannel.invokeMethod("onGroupCreationFailed", mapOf(
                                     "error" to "GROUP_INFO_UNAVAILABLE",
-                                    "message" to "Группа создана, но информация недоступна"
+                                    "message" to "Group created but info unavailable"
                                 ))
                             }
                             callback(null)
@@ -1026,6 +1134,7 @@ class WifiP2pHelper(
             
             override fun onFailure(reason: Int) {
                 isGroupCreating = false
+                lastGroupCreateFailureTimeMs = System.currentTimeMillis()
                 val errorMsg = when (reason) {
                     WifiP2pManager.P2P_UNSUPPORTED -> "Wi-Fi Direct не поддерживается"
                     WifiP2pManager.BUSY -> "Wi-Fi P2P занят"
@@ -1035,14 +1144,24 @@ class WifiP2pHelper(
                 
                 Log.e("P2P", "❌ [GROUP] Ошибка создания группы: $errorMsg (code: $reason)")
                 
-                // Retry логика для BUSY состояния
+                // 📡 Fallback: 5 GHz не поддерживается на части устройств — повтор с 2.4 GHz (API 29+)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && try5GhzFirst) {
+                    logP2P("   📡 Fallback: retrying on 2.4 GHz...")
+                    scope.launch {
+                        delay(1500)
+                        createNewGroup(callback, try5GhzFirst = false)
+                    }
+                    return
+                }
+                
+                // Retry логика для BUSY состояния (повтор с той же полосой)
                 if (reason == WifiP2pManager.BUSY && groupCreationRetries < MAX_GROUP_RETRIES) {
                     groupCreationRetries++
                     Log.d("P2P", "🔄 [GROUP] Повторная попытка ${groupCreationRetries}/$MAX_GROUP_RETRIES через 2 секунды...")
                     
                     scope.launch {
                         delay(2000)
-                        createNewGroup(callback)
+                        createNewGroup(callback, try5GhzFirst)
                     }
                     return
                 }
@@ -1059,7 +1178,35 @@ class WifiP2pHelper(
                 }
                 callback(null)
             }
-        })
+        }
+        val ch = channel
+        val ssid = groupName.trim()
+        if (ssid.isEmpty() || !ssid.startsWith("DIRECT-")) {
+            Log.e("P2P", "❌ [GROUP] Refusing to create: network name must be non-empty and start with DIRECT-xy")
+            isGroupCreating = false
+            callback(null)
+            return
+        }
+        when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && ch != null -> {
+                val band = if (try5GhzFirst) android.net.wifi.p2p.WifiP2pConfig.GROUP_OWNER_BAND_5GHZ
+                    else android.net.wifi.p2p.WifiP2pConfig.GROUP_OWNER_BAND_2GHZ
+                val passphrase = generateGroupPassphrase()
+                val config = android.net.wifi.p2p.WifiP2pConfig.Builder()
+                    .setNetworkName(ssid)
+                    .setPassphrase(passphrase)
+                    .setGroupOperatingBand(band)
+                    .build()
+                logP2P(if (try5GhzFirst) "   📡 Using 5 GHz band (API 29+)" else "   📡 Using 2.4 GHz band (fallback)")
+                manager?.createGroup(ch, config, listener)
+            }
+            ch != null -> manager?.createGroup(ch, listener)
+            else -> {
+                isGroupCreating = false
+                Log.e("P2P", "❌ [GROUP] Channel is null, cannot create group")
+                callback(null)
+            }
+        }
     }
     
     /**

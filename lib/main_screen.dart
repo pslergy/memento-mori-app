@@ -5,11 +5,15 @@ import 'package:provider/provider.dart';
 import 'package:animate_do/animate_do.dart';
 
 import 'package:memento_mori_app/core/api_service.dart';
+import 'package:memento_mori_app/core/decoy/app_mode.dart';
+import 'package:memento_mori_app/core/decoy/vault_interface.dart';
 import 'package:memento_mori_app/core/local_db_service.dart';
 import 'package:memento_mori_app/core/locator.dart';
 import 'package:memento_mori_app/core/mesh_service.dart';
 import 'package:memento_mori_app/core/native_mesh_service.dart';
 import 'package:memento_mori_app/core/network_monitor.dart';
+import 'package:memento_mori_app/core/decoy/timed_panic_lifecycle_bridge.dart'
+    show startTimedPanicAfterLogin;
 import 'package:memento_mori_app/core/panic_service.dart';
 import 'package:memento_mori_app/core/shake_detector.dart';
 
@@ -47,6 +51,17 @@ class _MainScreenState extends State<MainScreen> {
   void initState() {
     super.initState();
 
+    // Ensure SESSION (MeshService, etc.) is registered — do not reset when only MeshService was missing.
+    if (!locator.isRegistered<MeshService>()) {
+      if (!locator.isRegistered<VaultInterface>()) {
+        setupCoreLocator(AppMode.REAL);
+      }
+      setupSessionLocator(AppMode.REAL);
+    }
+    if (!locator.isRegistered<MeshService>()) {
+      logMissingFor('MainScreen', requireMesh: true);
+    }
+
     // 1. Инициализация ПАНИК-детектора (встряска)
     _shakeDetector = TacticalShakeDetector(
       onShake: () {
@@ -56,14 +71,18 @@ class _MainScreenState extends State<MainScreen> {
     );
     _shakeDetector.start();
 
-    // 2. Слушатель входящих запросов на связь через Сонар
-    _linkSubscription = locator<MeshService>().linkRequestStream.listen((senderId) {
-      _showTacticalLinkDialog(senderId);
-      // Опционально: показываем визуальный эффект SonarOverlay
-      SonarOverlay.show(context, senderId);
-    });
+    // 2. Слушатель входящих запросов на связь через Сонар (только если Mesh зарегистрирован)
+    if (locator.isRegistered<MeshService>()) {
+      _linkSubscription =
+          locator<MeshService>().linkRequestStream.listen((senderId) {
+        _showTacticalLinkDialog(senderId);
+        SonarOverlay.show(context, senderId);
+      });
+    }
 
     _loadInitialData();
+
+    startTimedPanicAfterLogin();
 
     _widgetOptions = <Widget>[
       TimerScreen(deathDate: widget.deathDate, birthDate: widget.birthDate),
@@ -84,7 +103,8 @@ class _MainScreenState extends State<MainScreen> {
           backgroundColor: AppColors.surface,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(20),
-            side: BorderSide(color: AppColors.sonarPurple.withOpacity(0.5), width: 1),
+            side: BorderSide(
+                color: AppColors.sonarPurple.withOpacity(0.5), width: 1),
           ),
           title: Row(
             children: [
@@ -108,7 +128,8 @@ class _MainScreenState extends State<MainScreen> {
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(ctx),
-              child: const Text("IGNORE", style: TextStyle(color: AppColors.warningRed)),
+              child: const Text("IGNORE",
+                  style: TextStyle(color: AppColors.warningRed)),
             ),
             ElevatedButton(
               style: ElevatedButton.styleFrom(
@@ -119,7 +140,8 @@ class _MainScreenState extends State<MainScreen> {
                 Navigator.pop(ctx);
                 _establishSecureLink(senderId);
               },
-              child: const Text("ACCEPT LINK", style: TextStyle(fontWeight: FontWeight.bold)),
+              child: const Text("ACCEPT LINK",
+                  style: TextStyle(fontWeight: FontWeight.bold)),
             ),
           ],
         ),
@@ -171,7 +193,8 @@ class _MainScreenState extends State<MainScreen> {
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(ctx),
-              child: const Text("ABORT", style: TextStyle(color: AppColors.warningRed)),
+              child: const Text("ABORT",
+                  style: TextStyle(color: AppColors.warningRed)),
             ),
             ElevatedButton(
               style: ElevatedButton.styleFrom(
@@ -182,7 +205,8 @@ class _MainScreenState extends State<MainScreen> {
                 Navigator.pop(ctx);
                 _establishSecureLink(senderId);
               },
-              child: const Text("ESTABLISH", style: TextStyle(fontWeight: FontWeight.bold)),
+              child: const Text("ESTABLISH",
+                  style: TextStyle(fontWeight: FontWeight.bold)),
             ),
           ],
         ),
@@ -191,8 +215,11 @@ class _MainScreenState extends State<MainScreen> {
   }
 
   void _establishSecureLink(String targetId) async {
+    if (!locator.isRegistered<MeshService>()) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text("Handshaking... Connecting to grid."), backgroundColor: AppColors.gridCyan),
+      const SnackBar(
+          content: Text("Handshaking... Connecting to grid."),
+          backgroundColor: AppColors.gridCyan),
     );
     await locator<MeshService>().connectToNode(targetId);
   }
@@ -212,7 +239,8 @@ class _MainScreenState extends State<MainScreen> {
             context: context,
             isScrollControlled: true,
             backgroundColor: Colors.transparent,
-            builder: (context) => TacticalBanner(ad: bannerAd, onClose: () => Navigator.pop(context)),
+            builder: (context) => TacticalBanner(
+                ad: bannerAd, onClose: () => Navigator.pop(context)),
           );
         }
       }
@@ -242,9 +270,12 @@ class _MainScreenState extends State<MainScreen> {
       body: _widgetOptions.elementAt(_selectedIndex),
       bottomNavigationBar: BottomNavigationBar(
         items: const <BottomNavigationBarItem>[
-          BottomNavigationBarItem(icon: Icon(Icons.hourglass_bottom), label: 'MEMENTO'),
-          BottomNavigationBarItem(icon: Icon(Icons.chat_bubble_outline), label: 'COMMS'),
-          BottomNavigationBarItem(icon: Icon(Icons.warning_amber_rounded), label: 'HOT ZONES'),
+          BottomNavigationBarItem(
+              icon: Icon(Icons.hourglass_bottom), label: 'MEMENTO'),
+          BottomNavigationBarItem(
+              icon: Icon(Icons.chat_bubble_outline), label: 'COMMS'),
+          BottomNavigationBarItem(
+              icon: Icon(Icons.warning_amber_rounded), label: 'HOT ZONES'),
           BottomNavigationBarItem(icon: Icon(Icons.hub), label: 'THE CHAIN'),
         ],
         currentIndex: _selectedIndex,
@@ -253,7 +284,8 @@ class _MainScreenState extends State<MainScreen> {
         selectedItemColor: AppColors.warningRed,
         unselectedItemColor: AppColors.textDim,
         type: BottomNavigationBarType.fixed,
-        selectedLabelStyle: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.1),
+        selectedLabelStyle: const TextStyle(
+            fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1.1),
         unselectedLabelStyle: const TextStyle(fontSize: 9, letterSpacing: 1.0),
       ),
     );
@@ -261,6 +293,20 @@ class _MainScreenState extends State<MainScreen> {
 
   // 🔥 ВИДЖЕТ ТАКТИЧЕСКОГО HUD (Вверху экрана)
   Widget _buildTacticalHUD() {
+    if (!locator.isRegistered<MeshService>()) {
+      return Container(
+        color: AppColors.surface,
+        padding: const EdgeInsets.only(top: 10),
+        child: Center(
+          child: Text('MODE: STEALTH',
+              style: TextStyle(
+                  color: AppColors.stealthOrange.withOpacity(0.8),
+                  fontSize: 10,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1)),
+        ),
+      );
+    }
     return StreamBuilder<MeshRole>(
       stream: NetworkMonitor().onRoleChanged,
       initialData: NetworkMonitor().currentRole,
@@ -268,8 +314,14 @@ class _MainScreenState extends State<MainScreen> {
         final bool isOnline = snapshot.data == MeshRole.BRIDGE;
         final mesh = context.watch<MeshService>();
 
-        Color themeColor = isOnline ? AppColors.cloudGreen : (mesh.isP2pConnected ? AppColors.gridCyan : AppColors.stealthOrange);
-        String label = isOnline ? "UPLINK: SECURED" : (mesh.isP2pConnected ? "GRID: ACTIVE (P2P)" : "MODE: STEALTH");
+        Color themeColor = isOnline
+            ? AppColors.cloudGreen
+            : (mesh.isP2pConnected
+                ? AppColors.gridCyan
+                : AppColors.stealthOrange);
+        String label = isOnline
+            ? "UPLINK: SECURED"
+            : (mesh.isP2pConnected ? "GRID: ACTIVE (P2P)" : "MODE: STEALTH");
 
         return Container(
           color: AppColors.surface,
@@ -277,7 +329,9 @@ class _MainScreenState extends State<MainScreen> {
           child: Container(
             decoration: BoxDecoration(
               color: themeColor.withOpacity(0.05),
-              border: Border(bottom: BorderSide(color: themeColor.withOpacity(0.3), width: 0.5)),
+              border: Border(
+                  bottom: BorderSide(
+                      color: themeColor.withOpacity(0.3), width: 0.5)),
             ),
             child: Center(
               child: Row(
@@ -285,7 +339,13 @@ class _MainScreenState extends State<MainScreen> {
                 children: [
                   _PulseIcon(color: themeColor),
                   const SizedBox(width: 8),
-                  Text(label, style: TextStyle(fontFamily: 'RobotoMono', color: themeColor, fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 1)),
+                  Text(label,
+                      style: TextStyle(
+                          fontFamily: 'RobotoMono',
+                          color: themeColor,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1)),
                 ],
               ),
             ),
@@ -304,24 +364,36 @@ class _PulseIcon extends StatefulWidget {
   State<_PulseIcon> createState() => _PulseIconState();
 }
 
-class _PulseIconState extends State<_PulseIcon> with SingleTickerProviderStateMixin {
+class _PulseIconState extends State<_PulseIcon>
+    with SingleTickerProviderStateMixin {
   late AnimationController _c;
   @override
   void initState() {
     super.initState();
-    _c = AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat(reverse: true);
+    _c = AnimationController(vsync: this, duration: const Duration(seconds: 2))
+      ..repeat(reverse: true);
   }
+
   @override
-  void dispose() { _c.dispose(); super.dispose(); }
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: _c,
       builder: (context, _) => Container(
-        width: 6, height: 6,
-        decoration: BoxDecoration(shape: BoxShape.circle, color: widget.color, boxShadow: [BoxShadow(color: widget.color, blurRadius: 4 * _c.value + 2)]),
+        width: 6,
+        height: 6,
+        decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: widget.color,
+            boxShadow: [
+              BoxShadow(color: widget.color, blurRadius: 4 * _c.value + 2)
+            ]),
       ),
     );
   }
 }
-

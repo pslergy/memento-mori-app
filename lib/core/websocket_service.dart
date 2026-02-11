@@ -10,6 +10,7 @@ import 'encryption_service.dart';
 import 'locator.dart';
 import 'mesh_service.dart';
 import 'network_monitor.dart';
+import 'security_config.dart';
 
 class WebSocketService {
   static final WebSocketService _instance = WebSocketService._internal();
@@ -17,19 +18,16 @@ class WebSocketService {
   WebSocketService._internal();
 
   IOWebSocketChannel? _channel;
-  final StreamController<Map<String, dynamic>> _streamController = StreamController.broadcast();
+  final StreamController<Map<String, dynamic>> _streamController =
+      StreamController.broadcast();
   Timer? _reconnectTimer;
 
   bool _isConnecting = false;
   bool _isAlive = false;
   String? _cachedToken;
 
-  final FlutterLocalNotificationsPlugin _notifications = FlutterLocalNotificationsPlugin();
-
-  // 🔥 ТАКТИКА: Используем прямой IP для обхода DNS-ошибок (Failed host lookup)
-  final String _serverIp = "89.125.131.63";
-  final int _serverPort = 3000;
-  final String _wsUrl = "wss://89.125.131.63:3000";
+  final FlutterLocalNotificationsPlugin _notifications =
+      FlutterLocalNotificationsPlugin();
 
   Stream<Map<String, dynamic>> get stream => _streamController.stream;
 
@@ -56,11 +54,8 @@ class WebSocketService {
         return;
       }
 
-      // ПРОВЕРКА: Если в URL всё еще домен, а не IP — это ловушка.
-      // Мы принудительно переписываем URL на IP прямо здесь для теста
-      final String secureWsUrl = "wss://89.125.131.63:3000?token=$_cachedToken";
-
-      _log("🌐 Handshaking with IP: 89.125.131.63");
+      final String secureWsUrl = "${SecurityConfig.backendWsOrigin}?token=$_cachedToken";
+      _log("🌐 Handshaking with ${SecurityConfig.backendHost}");
 
       // Используем runZonedGuarded или try-catch вокруг самого подключения
       _channel = IOWebSocketChannel.connect(
@@ -70,7 +65,7 @@ class WebSocketService {
 
       // ОШИБКА ГАСИТСЯ ЗДЕСЬ:
       _channel!.stream.listen(
-            (message) => _handleIncoming(message),
+        (message) => _handleIncoming(message),
         onDone: () => _cleanup(),
         onError: (error) {
           _log("📡 WebSocket unreachable (Handled): $error");
@@ -94,7 +89,9 @@ class WebSocketService {
         var msg = data['message'];
         final String chatId = msg['chatRoomId'] ?? "GLOBAL";
         final String senderId = msg['senderId'].toString();
-        final String myId = locator<ApiService>().currentUserId;
+        final String myId = locator.isRegistered<ApiService>()
+            ? locator<ApiService>().currentUserId
+            : '';
 
         // Расшифровка
         if (msg['isEncrypted'] == true) {
@@ -108,7 +105,8 @@ class WebSocketService {
         }
 
         if (senderId != myId && myId.isNotEmpty) {
-          _showStealthNotification(chatId, isDirect: !chatId.contains("GLOBAL"));
+          _showStealthNotification(chatId,
+              isDirect: !chatId.contains("GLOBAL"));
         }
       }
 
@@ -122,19 +120,22 @@ class WebSocketService {
     }
   }
 
-  Future<void> _showStealthNotification(String id, {bool isDirect = false}) async {
+  Future<void> _showStealthNotification(String id,
+      {bool isDirect = false}) async {
     String title = isDirect ? 'Incoming Secure Pulse' : 'System Sync';
     String nodeRef = id.length > 4 ? id.substring(0, 4) : id;
     String body = 'Security packet synchronized. Node: $nodeRef';
 
     const androidDetails = AndroidNotificationDetails(
-      'memento_channel', 'Security Updates',
+      'memento_channel',
+      'Security Updates',
       importance: Importance.max,
       priority: Priority.high,
       enableVibration: true,
       showWhen: true,
     );
-    await _notifications.show(DateTime.now().millisecond, title, body, const NotificationDetails(android: androidDetails));
+    await _notifications.show(DateTime.now().millisecond, title, body,
+        const NotificationDetails(android: androidDetails));
   }
 
   void _scheduleReconnect() {
@@ -162,7 +163,8 @@ class WebSocketService {
   }
 
   void _log(String msg) {
-    final timestamp = DateTime.now().toIso8601String().split('T').last.substring(0, 8);
+    final timestamp =
+        DateTime.now().toIso8601String().split('T').last.substring(0, 8);
     print("[$timestamp] 🌐 [WebSocket] $msg");
     try {
       locator<MeshService>().addLog("🌐 [Cloud] $msg");

@@ -1,7 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:math_expressions/math_expressions.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:memento_mori_app/features/auth/auth_gate_screen.dart'; // 🔥 Обязательно импортируй это
+import 'package:memento_mori_app/features/auth/auth_gate_screen.dart';
+import '../../core/decoy/app_mode.dart';
+import '../../core/decoy/gate_storage.dart';
+import '../../core/decoy/mode_resolver.dart';
+import '../../core/decoy/session_teardown.dart';
+import '../../core/locator.dart';
 import '../../core/panic_service.dart';
 import '../../core/storage_service.dart';
 import '../auth/bio_lock_screen.dart';
@@ -16,79 +21,119 @@ class CalculatorGate extends StatefulWidget {
 class _CalculatorGateState extends State<CalculatorGate> {
   String _expression = '';
   String _result = '0';
-  final _storage = const FlutterSecureStorage();
 
-  // 🔥 МОДИФИЦИРОВАННАЯ ЛОГИКА ДОСТУПА
+  /// Общий переход: разблокировка в выбранном режиме. Одинаковое поведение для REAL и DECOY (без логов режима).
+  /// Если auth_token нет, но есть user_id — считаем Ghost (на Huawei scoped может не вернуть токен).
+  Future<void> _unlockWithVault(BuildContext context, AppMode mode) async {
+    final String? token = await Vault.read('auth_token');
+    final String? userId = await Vault.read('user_id');
+    final String? deathStr = await Vault.read('user_deathDate');
+    final String? birthStr = await Vault.read('user_birthDate');
+    if (kDebugMode) {
+      debugPrint('[GATE] 3301 unlock: token=${token != null ? "***" : "null"}, userId=${userId != null ? "***" : "null"}, death=${deathStr != null}, birth=${birthStr != null}');
+    }
+    if (!mounted) return;
+    final bool hasIdentity = token != null && token.isNotEmpty;
+    final bool hasGhostIdentity = !hasIdentity &&
+        userId != null &&
+        userId.isNotEmpty &&
+        (deathStr != null || birthStr != null);
+    if (hasIdentity || hasGhostIdentity) {
+      if (hasGhostIdentity) {
+        await Vault.write('auth_token', 'GHOST_MODE_ACTIVE');
+      }
+      final DateTime death = DateTime.tryParse(deathStr ?? '')
+          ?? DateTime.now().add(const Duration(days: 365 * 50));
+      final DateTime birth = DateTime.tryParse(birthStr ?? '')
+          ?? DateTime(2000, 1, 1);
+      final bool isPanicActivated = await PanicService.isPanicProtocolActivated();
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => BioLockScreen(
+            deathDate: death,
+            birthDate: birth,
+            requireBiometric: isPanicActivated,
+          ),
+        ),
+      );
+    } else {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const AuthGateScreen()),
+      );
+    }
+  }
+
   Future<void> _handleAccess() async {
-    // 1. Код Принуждения (Silent Wipe)
     if (_expression == '9111') {
-      print("☢️ [GATE] Silent Wipe PIN triggered.");
+      if (kDebugMode) debugPrint('[GATE] Silent Wipe PIN triggered.');
       if (mounted) await PanicService.killSwitch(context);
       return;
     }
 
-    // 2. Обычный вход (3301)
-    if (_expression == '3301') {
-      // Читаем всё через наш единый Vault
-      final String? token = await Vault.read('auth_token');
-      final String? deathStr = await Vault.read('user_deathDate');
-      final String? birthStr = await Vault.read('user_birthDate');
-
-      print("🕵️ [Gate-Debug] Vault Status -> Token: ${token != null}, Death: ${deathStr != null}, Birth: ${birthStr != null}");
-
-      if (!mounted) return;
-
-      // 🔥 ПАНИК-ПРОТОКОЛ: Проверяем, был ли активирован паник-протокол
-      final bool isPanicActivated = await PanicService.isPanicProtocolActivated();
-      
-      // КРИТИЧЕСКИЙ ФИКС: Если токен есть - мы пускаем.
-      // Даже если даты потерялись из-за бага Tecno, мы подставим фолбек.
-      if (token != null) {
-        final bool isGhost = token == 'GHOST_MODE_ACTIVE';
-        print("🔓 [Access] ${isGhost ? 'Ghost Node' : 'Cloud Node'} identified. Unlocking...");
-
-        // Парсим даты с защитой от null/error
-        final DateTime death = DateTime.tryParse(deathStr ?? '')
-            ?? DateTime.now().add(const Duration(days: 365 * 50));
-        final DateTime birth = DateTime.tryParse(birthStr ?? '')
-            ?? DateTime(2000, 1, 1);
-
-        // 🔥 ПАНИК-ПРОТОКОЛ: Если активирован - ВСЕГДА требуем биометрию
-        if (isPanicActivated) {
-          print("🚩 [PANIC] Panic protocol active - requiring biometric authentication");
+    final hashes = await getGateHashes();
+    if (hashes == null) {
+      if (_expression == '3301') {
+        final String? token = await Vault.read('auth_token');
+        final String? userId = await Vault.read('user_id');
+        final String? deathStr = await Vault.read('user_deathDate');
+        final String? birthStr = await Vault.read('user_birthDate');
+        if (!mounted) return;
+        final bool hasIdentity = token != null && token.isNotEmpty;
+        final bool hasGhostIdentity = !hasIdentity &&
+            userId != null &&
+            userId.isNotEmpty &&
+            (deathStr != null || birthStr != null);
+        if (hasIdentity || hasGhostIdentity) {
+          if (hasGhostIdentity) {
+            await Vault.write('auth_token', 'GHOST_MODE_ACTIVE');
+          }
+          final DateTime death = DateTime.tryParse(deathStr ?? '')
+              ?? DateTime.now().add(const Duration(days: 365 * 50));
+          final DateTime birth = DateTime.tryParse(birthStr ?? '')
+              ?? DateTime(2000, 1, 1);
+          final bool isPanicActivated = await PanicService.isPanicProtocolActivated();
+          if (!mounted) return;
           Navigator.of(context).pushReplacement(
             MaterialPageRoute(
               builder: (_) => BioLockScreen(
                 deathDate: death,
                 birthDate: birth,
-                requireBiometric: true, // Принудительно требуем биометрию
+                requireBiometric: isPanicActivated,
               ),
             ),
           );
         } else {
-          // Обычный вход - биометрия опциональна
           Navigator.of(context).pushReplacement(
-            MaterialPageRoute(
-              builder: (_) => BioLockScreen(
-                deathDate: death,
-                birthDate: birth,
-                requireBiometric: false,
-              ),
-            ),
+            MaterialPageRoute(builder: (_) => const AuthGateScreen()),
           );
         }
       } else {
-        // Если токена нет совсем - значит регистрации не было
-        print("🔑 [Access] No identity found in Vault. To Auth Gate.");
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => const AuthGateScreen()),
-        );
+        _calculate();
       }
       return;
     }
 
-    // Обычная арифметика
-    _calculate();
+    final inputHash = hashAccessCode(_expression);
+    final resolved = resolveMode(
+      inputHash: inputHash,
+      primaryAccessHash: hashes.primary,
+      alternativeAccessHash: hashes.alternative,
+    );
+    if (resolved == AppMode.INVALID) {
+      _calculate();
+      return;
+    }
+
+    final currentMode = await getGateMode();
+    if (currentMode != resolved) {
+      await teardownSession();
+      ensureCoreLocator(resolved);
+      if (!isMeshReady) setupSessionLocator(resolved);
+      await saveGateMode(resolved);
+    }
+    if (!mounted) return;
+    await _unlockWithVault(context, resolved);
   }
 
   void _calculate() {

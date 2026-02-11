@@ -1,40 +1,71 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
+
+import 'package:get_it/get_it.dart';
 import 'package:path/path.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
 
-import '../features/chat/conversation_screen.dart'; // Модель ChatMessage
+import '../features/chat/conversation_screen.dart';
 import 'api_service.dart';
+import 'decoy/vault_interface.dart';
 import 'locator.dart';
-import 'models/ad_packet.dart'; // Модель AdPacket
+import 'models/ad_packet.dart';
 import 'room_events.dart' show RoomEvent, EventOrigin;
 import 'encryption_service.dart';
+import 'storage_service.dart';
 
+/// SECURITY INVARIANT: REAL and DECOY use separate directories and DB files (no shared WAL/journals).
+/// When [dbDirectorySuffix] is set, DB lives in <databases>/<suffix>/<fileName>; no path reuse across modes.
+/// On logout, call [closeAndCheckpoint] before teardown so no orphaned WAL/handles remain.
+///
+/// ⚠️ НЕ УДАЛЯТЬ таблицы и поля: messages (ownerId, chatRoomId), outbox (senderId), getMessages/saveMessage/addToOutbox,
+/// getPendingFromOutbox, THE_BEACON_GLOBAL seed — всё используется Beacon/Ghost и mesh.
 class LocalDatabaseService {
-  // ==========================================
-  // 🛡️ Singleton & Concurrency Guard
-  // ==========================================
-  static final LocalDatabaseService _instance = LocalDatabaseService._internal();
-  factory LocalDatabaseService() => _instance;
-  LocalDatabaseService._internal();
+  factory LocalDatabaseService() {
+    if (GetIt.instance.isRegistered<LocalDatabaseService>()) {
+      return GetIt.instance<LocalDatabaseService>();
+    }
+    return LocalDatabaseService.raw(dbFileName: 'memento_mori_v5.db');
+  }
+
+  LocalDatabaseService.raw({
+    String? dbFileName,
+    VaultInterface? vault,
+    String? dbDirectorySuffix,
+  })  : _dbFileName = dbFileName ?? 'memento_mori_v5.db',
+        _vault = vault,
+        _dbDirectorySuffix = dbDirectorySuffix;
+
+  final String _dbFileName;
+  final VaultInterface? _vault;
+  final String? _dbDirectorySuffix;
+
   static const String _firstLaunchKey = 'first_launch_done';
 
   Database? _database;
   Completer<Database>? _dbCompleter;
 
-  /// Проверяет, первый ли запуск
+  /// Проверяет, первый ли запуск (для текущего режима / хранилища).
   Future<bool> isFirstLaunch() async {
+    if (_vault != null) {
+      final v = await _vault!.read(_firstLaunchKey);
+      return v != '1';
+    }
     final prefs = await SharedPreferences.getInstance();
     return !(prefs.getBool(_firstLaunchKey) ?? false);
   }
 
-  /// Помечает, что первый запуск завершён
+  /// Помечает, что первый запуск завершён.
   Future<void> setFirstLaunchDone() async {
+    if (_vault != null) {
+      await _vault!.write(_firstLaunchKey, '1');
+      return;
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_firstLaunchKey, true);
   }
-
 
   /// Главная точка входа: гарантирует атомарную инициализацию базы
   Future<Database> get database async {
@@ -57,14 +88,35 @@ class LocalDatabaseService {
   // ==========================================
   // ⚙️ Initialization & Lifecycle
   // ==========================================
+
+  /// FORENSIC: Close DB and checkpoint WAL so no orphaned files. Call before session teardown.
+  Future<void> closeAndCheckpoint() async {
+    final db = _database;
+    _database = null;
+    _dbCompleter = null;
+    if (db == null) return;
+    try {
+      await db.rawQuery('PRAGMA wal_checkpoint(TRUNCATE)');
+    } catch (_) {}
+    try {
+      await db.close();
+    } catch (_) {}
+  }
+
   Future<Database> _initDB() async {
     final dbPath = await getDatabasesPath();
-    // Мы используем v5 для гарантированного применения новой схемы с ownerId
-    final path = join(dbPath, 'memento_mori_v5.db');
+    final String path;
+    if (_dbDirectorySuffix != null && _dbDirectorySuffix!.isNotEmpty) {
+      final dir = Directory(join(dbPath, _dbDirectorySuffix!));
+      if (!await dir.exists()) await dir.create(recursive: true);
+      path = join(dir.path, _dbFileName);
+    } else {
+      path = join(dbPath, _dbFileName);
+    }
 
     return await openDatabase(
       path,
-      version: 14, // Версия с expiresAt для outbox (TTL для payload)
+      version: 16, // v16: outbox sentFragmentIndex для BLE resume по фрагментам
       onConfigure: (db) async {
         try {
           // WAL через rawQuery
@@ -86,10 +138,12 @@ class LocalDatabaseService {
           try {
             // Защитная миграция: добавляем ownerId если его не было
             var tableInfo = await db.rawQuery('PRAGMA table_info(messages)');
-            bool hasOwner = tableInfo.any((column) => column['name'] == 'ownerId');
+            bool hasOwner =
+                tableInfo.any((column) => column['name'] == 'ownerId');
             if (!hasOwner) {
               await db.execute('ALTER TABLE messages ADD COLUMN ownerId TEXT');
-              await db.execute('ALTER TABLE chat_rooms ADD COLUMN ownerId TEXT');
+              await db
+                  .execute('ALTER TABLE chat_rooms ADD COLUMN ownerId TEXT');
             }
           } catch (_) {}
         }
@@ -97,46 +151,62 @@ class LocalDatabaseService {
           try {
             // Миграция v8: Расширение friends, добавление полей для глобального чата и личных сообщений
             var friendsInfo = await db.rawQuery('PRAGMA table_info(friends)');
-            var friendsColumns = friendsInfo.map((c) => c['name'] as String).toList();
-            
+            var friendsColumns =
+                friendsInfo.map((c) => c['name'] as String).toList();
+
             if (!friendsColumns.contains('status')) {
-              await db.execute('ALTER TABLE friends ADD COLUMN status TEXT DEFAULT \'pending\'');
+              await db.execute(
+                  'ALTER TABLE friends ADD COLUMN status TEXT DEFAULT \'pending\'');
             }
             if (!friendsColumns.contains('tactical_name')) {
-              await db.execute('ALTER TABLE friends ADD COLUMN tactical_name TEXT');
+              await db
+                  .execute('ALTER TABLE friends ADD COLUMN tactical_name TEXT');
             }
             if (!friendsColumns.contains('requested_at')) {
-              await db.execute('ALTER TABLE friends ADD COLUMN requested_at INTEGER');
+              await db.execute(
+                  'ALTER TABLE friends ADD COLUMN requested_at INTEGER');
             }
             if (!friendsColumns.contains('accepted_at')) {
-              await db.execute('ALTER TABLE friends ADD COLUMN accepted_at INTEGER');
+              await db.execute(
+                  'ALTER TABLE friends ADD COLUMN accepted_at INTEGER');
             }
             if (!friendsColumns.contains('karma')) {
-              await db.execute('ALTER TABLE friends ADD COLUMN karma INTEGER DEFAULT 0');
+              await db.execute(
+                  'ALTER TABLE friends ADD COLUMN karma INTEGER DEFAULT 0');
             }
-            
+
             var messagesInfo = await db.rawQuery('PRAGMA table_info(messages)');
-            var messagesColumns = messagesInfo.map((c) => c['name'] as String).toList();
-            
+            var messagesColumns =
+                messagesInfo.map((c) => c['name'] as String).toList();
+
             if (!messagesColumns.contains('gossip_hash')) {
-              await db.execute('ALTER TABLE messages ADD COLUMN gossip_hash TEXT');
-              await db.execute('CREATE INDEX IF NOT EXISTS idx_messages_gossip_hash ON messages(gossip_hash)');
+              await db
+                  .execute('ALTER TABLE messages ADD COLUMN gossip_hash TEXT');
+              await db.execute(
+                  'CREATE INDEX IF NOT EXISTS idx_messages_gossip_hash ON messages(gossip_hash)');
             }
             if (!messagesColumns.contains('ttl')) {
-              await db.execute('ALTER TABLE messages ADD COLUMN ttl INTEGER DEFAULT 7');
+              await db.execute(
+                  'ALTER TABLE messages ADD COLUMN ttl INTEGER DEFAULT 7');
             }
             if (!messagesColumns.contains('delivered')) {
-              await db.execute('ALTER TABLE messages ADD COLUMN delivered INTEGER DEFAULT 0');
-              await db.execute('CREATE INDEX IF NOT EXISTS idx_messages_delivered ON messages(delivered)');
+              await db.execute(
+                  'ALTER TABLE messages ADD COLUMN delivered INTEGER DEFAULT 0');
+              await db.execute(
+                  'CREATE INDEX IF NOT EXISTS idx_messages_delivered ON messages(delivered)');
             }
             if (!messagesColumns.contains('delivered_at')) {
-              await db.execute('ALTER TABLE messages ADD COLUMN delivered_at INTEGER');
+              await db.execute(
+                  'ALTER TABLE messages ADD COLUMN delivered_at INTEGER');
             }
-            
-            await db.execute('CREATE INDEX IF NOT EXISTS idx_friends_status ON friends(status)');
-            await db.execute('CREATE INDEX IF NOT EXISTS idx_friends_tactical ON friends(tactical_name)');
-            
-            print("✅ [DB] Migration v8 completed: Friends and messaging enhancements");
+
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_friends_status ON friends(status)');
+            await db.execute(
+                'CREATE INDEX IF NOT EXISTS idx_friends_tactical ON friends(tactical_name)');
+
+            print(
+                "✅ [DB] Migration v8 completed: Friends and messaging enhancements");
           } catch (e) {
             print("⚠️ [DB] Migration v8 error: $e");
           }
@@ -144,7 +214,8 @@ class LocalDatabaseService {
         if (oldVersion < 9) {
           try {
             // Миграция v9: Добавление таблицы SOS сигналов
-            var tables = await db.rawQuery("SELECT name FROM sqlite_master WHERE type='table' AND name='sos_signals'");
+            var tables = await db.rawQuery(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='sos_signals'");
             if (tables.isEmpty) {
               await db.execute('''
                 CREATE TABLE sos_signals(
@@ -158,9 +229,12 @@ class LocalDatabaseService {
                   count INTEGER DEFAULT 1
                 )
               ''');
-              await db.execute('CREATE INDEX idx_sos_sector ON sos_signals(sectorId)');
-              await db.execute('CREATE INDEX idx_sos_timestamp ON sos_signals(timestamp)');
-              await db.execute('CREATE INDEX idx_sos_synced ON sos_signals(synced)');
+              await db.execute(
+                  'CREATE INDEX idx_sos_sector ON sos_signals(sectorId)');
+              await db.execute(
+                  'CREATE INDEX idx_sos_timestamp ON sos_signals(timestamp)');
+              await db.execute(
+                  'CREATE INDEX idx_sos_synced ON sos_signals(synced)');
             }
             print("✅ [DB] Migration v9 completed: SOS signals table added");
           } catch (e) {
@@ -170,30 +244,39 @@ class LocalDatabaseService {
         if (oldVersion < 11) {
           try {
             // Миграция v11: Добавление полей для комнат и сообщений
-            var chatRoomsInfo = await db.rawQuery('PRAGMA table_info(chat_rooms)');
-            var chatRoomsColumns = chatRoomsInfo.map((c) => c['name'] as String).toList();
-            
+            var chatRoomsInfo =
+                await db.rawQuery('PRAGMA table_info(chat_rooms)');
+            var chatRoomsColumns =
+                chatRoomsInfo.map((c) => c['name'] as String).toList();
+
             if (!chatRoomsColumns.contains('room_type')) {
-              await db.execute('ALTER TABLE chat_rooms ADD COLUMN room_type TEXT');
+              await db
+                  .execute('ALTER TABLE chat_rooms ADD COLUMN room_type TEXT');
             }
             if (!chatRoomsColumns.contains('creator')) {
-              await db.execute('ALTER TABLE chat_rooms ADD COLUMN creator TEXT');
+              await db
+                  .execute('ALTER TABLE chat_rooms ADD COLUMN creator TEXT');
             }
             if (!chatRoomsColumns.contains('participants')) {
-              await db.execute('ALTER TABLE chat_rooms ADD COLUMN participants TEXT');
+              await db.execute(
+                  'ALTER TABLE chat_rooms ADD COLUMN participants TEXT');
             }
-            
+
             var messagesInfo = await db.rawQuery('PRAGMA table_info(messages)');
-            var messagesColumns = messagesInfo.map((c) => c['name'] as String).toList();
-            
+            var messagesColumns =
+                messagesInfo.map((c) => c['name'] as String).toList();
+
             if (!messagesColumns.contains('receivedAt')) {
-              await db.execute('ALTER TABLE messages ADD COLUMN receivedAt INTEGER');
+              await db.execute(
+                  'ALTER TABLE messages ADD COLUMN receivedAt INTEGER');
             }
             if (!messagesColumns.contains('vectorClock')) {
-              await db.execute('ALTER TABLE messages ADD COLUMN vectorClock TEXT');
+              await db
+                  .execute('ALTER TABLE messages ADD COLUMN vectorClock TEXT');
             }
-            
-            print("✅ [DB] Migration v11 completed: Rooms and messages enhancements");
+
+            print(
+                "✅ [DB] Migration v11 completed: Rooms and messages enhancements");
           } catch (e) {
             print("⚠️ [DB] Migration v11 error: $e");
           }
@@ -201,7 +284,8 @@ class LocalDatabaseService {
         if (oldVersion < 12) {
           try {
             // Миграция v12: Добавление таблицы room_events
-            var tables = await db.rawQuery("SELECT name FROM sqlite_master WHERE type='table' AND name='room_events'");
+            var tables = await db.rawQuery(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='room_events'");
             if (tables.isEmpty) {
               await db.execute('''
                 CREATE TABLE room_events(
@@ -214,15 +298,20 @@ class LocalDatabaseService {
                   PRIMARY KEY (roomId, id)
                 )
               ''');
-              await db.execute('CREATE INDEX idx_room_events_roomId ON room_events(roomId)');
-              await db.execute('CREATE INDEX idx_room_events_timestamp ON room_events(timestamp)');
+              await db.execute(
+                  'CREATE INDEX idx_room_events_roomId ON room_events(roomId)');
+              await db.execute(
+                  'CREATE INDEX idx_room_events_timestamp ON room_events(timestamp)');
             } else {
               // Миграция: если таблица существует с PRIMARY KEY только на id, пересоздаем
               try {
-                var tableInfo = await db.rawQuery("PRAGMA table_info(room_events)");
-                var hasCompositeKey = tableInfo.any((col) => col['name'] == 'roomId' && col['pk'] == 1);
-                var hasOrigin = tableInfo.any((col) => col['name'] == 'event_origin');
-                
+                var tableInfo =
+                    await db.rawQuery("PRAGMA table_info(room_events)");
+                var hasCompositeKey = tableInfo
+                    .any((col) => col['name'] == 'roomId' && col['pk'] == 1);
+                var hasOrigin =
+                    tableInfo.any((col) => col['name'] == 'event_origin');
+
                 if (!hasCompositeKey || !hasOrigin) {
                   // Пересоздаем таблицу с составным ключом и event_origin
                   await db.execute('DROP TABLE IF EXISTS room_events');
@@ -238,16 +327,22 @@ class LocalDatabaseService {
                       PRIMARY KEY (roomId, id)
                     )
                   ''');
-                  await db.execute('CREATE INDEX idx_room_events_roomId ON room_events(roomId)');
-                  await db.execute('CREATE INDEX idx_room_events_timestamp ON room_events(timestamp)');
-                  await db.execute('CREATE INDEX idx_room_events_origin ON room_events(event_origin)');
+                  await db.execute(
+                      'CREATE INDEX idx_room_events_roomId ON room_events(roomId)');
+                  await db.execute(
+                      'CREATE INDEX idx_room_events_timestamp ON room_events(timestamp)');
+                  await db.execute(
+                      'CREATE INDEX idx_room_events_origin ON room_events(event_origin)');
                 } else if (!hasOrigin) {
                   // Добавляем только event_origin если его нет
-                  await db.execute('ALTER TABLE room_events ADD COLUMN event_origin TEXT DEFAULT \'LOCAL\'');
-                  await db.execute('CREATE INDEX IF NOT EXISTS idx_room_events_origin ON room_events(event_origin)');
+                  await db.execute(
+                      'ALTER TABLE room_events ADD COLUMN event_origin TEXT DEFAULT \'LOCAL\'');
+                  await db.execute(
+                      'CREATE INDEX IF NOT EXISTS idx_room_events_origin ON room_events(event_origin)');
                 }
               } catch (e) {
-                print("⚠️ [DB] Migration v12: Error checking room_events structure: $e");
+                print(
+                    "⚠️ [DB] Migration v12: Error checking room_events structure: $e");
               }
             }
             print("✅ [DB] Migration v12 completed: Room events table added");
@@ -259,11 +354,14 @@ class LocalDatabaseService {
           try {
             // Миграция v13: Добавление поля event_origin для диагностики
             var tableInfo = await db.rawQuery("PRAGMA table_info(room_events)");
-            var hasOrigin = tableInfo.any((col) => col['name'] == 'event_origin');
-            
+            var hasOrigin =
+                tableInfo.any((col) => col['name'] == 'event_origin');
+
             if (!hasOrigin) {
-              await db.execute('ALTER TABLE room_events ADD COLUMN event_origin TEXT DEFAULT \'LOCAL\'');
-              await db.execute('CREATE INDEX IF NOT EXISTS idx_room_events_origin ON room_events(event_origin)');
+              await db.execute(
+                  'ALTER TABLE room_events ADD COLUMN event_origin TEXT DEFAULT \'LOCAL\'');
+              await db.execute(
+                  'CREATE INDEX IF NOT EXISTS idx_room_events_origin ON room_events(event_origin)');
             }
             print("✅ [DB] Migration v13 completed: event_origin field added");
           } catch (e) {
@@ -272,18 +370,45 @@ class LocalDatabaseService {
         }
         if (oldVersion < 14) {
           try {
-            // Миграция v14: Добавление expiresAt для outbox (TTL для payload)
             var outboxInfo = await db.rawQuery('PRAGMA table_info(outbox)');
-            var outboxColumns = outboxInfo.map((c) => c['name'] as String).toList();
-            
+            var outboxColumns =
+                outboxInfo.map((c) => c['name'] as String).toList();
             if (!outboxColumns.contains('expiresAt')) {
-              await db.execute('ALTER TABLE outbox ADD COLUMN expiresAt INTEGER');
-              print("✅ [DB] Migration v14 completed: Added expiresAt column to outbox");
-            } else {
-              print("✅ [DB] Migration v14: expiresAt column already exists");
+              await db
+                  .execute('ALTER TABLE outbox ADD COLUMN expiresAt INTEGER');
+              print("✅ [DB] Migration v14 completed");
             }
           } catch (e) {
             print("⚠️ [DB] Migration v14 error: $e");
+          }
+        }
+        if (oldVersion < 15) {
+          try {
+            var outboxInfo = await db.rawQuery('PRAGMA table_info(outbox)');
+            var outboxColumns =
+                outboxInfo.map((c) => c['name'] as String).toList();
+            if (!outboxColumns.contains('senderId')) {
+              await db.execute('ALTER TABLE outbox ADD COLUMN senderId TEXT');
+              print(
+                  "✅ [DB] Migration v15 completed: Added senderId to outbox (relay/ephemeral)");
+            }
+          } catch (e) {
+            print("⚠️ [DB] Migration v15 error: $e");
+          }
+        }
+        if (oldVersion < 16) {
+          try {
+            var outboxInfo = await db.rawQuery('PRAGMA table_info(outbox)');
+            var outboxColumns =
+                outboxInfo.map((c) => c['name'] as String).toList();
+            if (!outboxColumns.contains('sentFragmentIndex')) {
+              await db.execute(
+                  'ALTER TABLE outbox ADD COLUMN sentFragmentIndex INTEGER DEFAULT -1');
+              print(
+                  "✅ [DB] Migration v16 completed: Added sentFragmentIndex to outbox (BLE fragment resume)");
+            }
+          } catch (e) {
+            print("⚠️ [DB] Migration v16 error: $e");
           }
         }
       },
@@ -293,7 +418,8 @@ class LocalDatabaseService {
           // Вызов внутреннего обслуживания без рекурсии геттера
           await _performInternalMaintenance(db);
 
-          await db.rawInsert("INSERT OR IGNORE INTO system_stats(key, value) VALUES('karma', 0)");
+          await db.rawInsert(
+              "INSERT OR IGNORE INTO system_stats(key, value) VALUES('karma', 0)");
 
           await db.insert(
             'chat_rooms',
@@ -316,11 +442,15 @@ class LocalDatabaseService {
     );
   }
 
+  /// Лимит записей в outbox на устройство (контроль памяти). При переполнении вытесняются самые старые по createdAt.
+  static const int maxOutboxSize = 300;
+
   Future<int> getOutboxCount() async {
     try {
       final db = await database;
       // Считаем количество записей в таблице outbox
-      final List<Map<String, dynamic>> res = await db.rawQuery("SELECT COUNT(*) as count FROM outbox");
+      final List<Map<String, dynamic>> res =
+          await db.rawQuery("SELECT COUNT(*) as count FROM outbox");
       return Sqflite.firstIntValue(res) ?? 0;
     } catch (e) {
       print("⚠️ [DB] Error counting outbox: $e");
@@ -328,7 +458,34 @@ class LocalDatabaseService {
     }
   }
 
-  /// Полная структура таблиц (9 тактических модулей)
+  /// Вытесняет самые старые записи из outbox, пока количество не станет <= [maxCount]. Вызывается перед addToOutbox при переполнении.
+  Future<void> _evictOutboxIfOverLimit(Database db, int maxCount) async {
+    final count = Sqflite.firstIntValue(
+            await db.rawQuery("SELECT COUNT(*) as c FROM outbox")) ??
+        0;
+    if (count < maxCount) return;
+    final toRemove = count - maxCount + 1;
+    if (toRemove <= 0) return;
+    final rows = await db.query('outbox',
+        columns: ['id'],
+        orderBy: 'createdAt ASC',
+        limit: toRemove);
+    final ids = rows.map((r) => r['id'] as String?).whereType<String>().toList();
+    if (ids.isEmpty) return;
+    for (final id in ids) {
+      await db.delete('outbox', where: 'id = ?', whereArgs: [id]);
+    }
+    print("🧹 [OUTBOX] Evicted ${ids.length} oldest (limit: $maxCount)");
+  }
+
+  /// Полная структура таблиц. Порядок создания (приоритет зависимостей):
+  /// 1. messages — история чатов, ownerId, chatRoomId (THE_BEACON_GLOBAL и др.)
+  /// 2. message_fragments — фрагменты для Gossip/Sonar (FK → messages)
+  /// 3. friends — доверенные контакты
+  /// 4. seen_pulses — дедупликация gossip
+  /// 5. outbox — очередь relay для GHOST (senderId v15)
+  /// 6. ads, 7. licenses, 8. chat_rooms, 8.1. room_events, 9. system_stats
+  /// 10. known_routers, 11. sos_signals
   Future<void> _createTacticalSchema(Database db) async {
     await db.transaction((txn) async {
       // 1. Мессенджер (History)
@@ -380,9 +537,11 @@ class LocalDatabaseService {
       ''');
 
       // 4. Gossip Deduplicator (Seen Pulses)
-      await txn.execute('CREATE TABLE IF NOT EXISTS seen_pulses(id TEXT PRIMARY KEY, seenAt INTEGER)');
+      await txn.execute(
+          'CREATE TABLE IF NOT EXISTS seen_pulses(id TEXT PRIMARY KEY, seenAt INTEGER)');
 
       // 5. Outbox (Viral Relay Queue + Smart Routing)
+      // v15: senderId for relay attribution and ephemeral token
       await txn.execute('''
         CREATE TABLE IF NOT EXISTS outbox(
           id TEXT PRIMARY KEY,
@@ -393,15 +552,18 @@ class LocalDatabaseService {
           expiresAt INTEGER,
           preferred_uplink TEXT,
           hop_path TEXT,
-          routing_state TEXT DEFAULT 'PENDING'
+          routing_state TEXT DEFAULT 'PENDING',
+          senderId TEXT
         )
       ''');
 
       // 6. Ad-Pool (Gossip Ads)
-      await txn.execute('CREATE TABLE IF NOT EXISTS ads(id TEXT PRIMARY KEY, title TEXT, content TEXT, imageUrl TEXT, priority INTEGER, isInterstitial INTEGER, expiresAt INTEGER)');
+      await txn.execute(
+          'CREATE TABLE IF NOT EXISTS ads(id TEXT PRIMARY KEY, title TEXT, content TEXT, imageUrl TEXT, priority INTEGER, isInterstitial INTEGER, expiresAt INTEGER)');
 
       // 7. Identity & Licenses (Landing Pass)
-      await txn.execute('CREATE TABLE IF NOT EXISTS licenses(id TEXT PRIMARY KEY, signedToken TEXT, status TEXT, expiresAt INTEGER)');
+      await txn.execute(
+          'CREATE TABLE IF NOT EXISTS licenses(id TEXT PRIMARY KEY, signedToken TEXT, status TEXT, expiresAt INTEGER)');
 
       // 8. Grid Rooms (Metadata)
       await txn.execute('''
@@ -432,12 +594,16 @@ class LocalDatabaseService {
           FOREIGN KEY(roomId) REFERENCES chat_rooms(id) ON DELETE CASCADE
         )
       ''');
-      await txn.execute('CREATE INDEX IF NOT EXISTS idx_room_events_roomId ON room_events(roomId)');
-      await txn.execute('CREATE INDEX IF NOT EXISTS idx_room_events_timestamp ON room_events(timestamp)');
-      await txn.execute('CREATE INDEX IF NOT EXISTS idx_room_events_origin ON room_events(event_origin)');
+      await txn.execute(
+          'CREATE INDEX IF NOT EXISTS idx_room_events_roomId ON room_events(roomId)');
+      await txn.execute(
+          'CREATE INDEX IF NOT EXISTS idx_room_events_timestamp ON room_events(timestamp)');
+      await txn.execute(
+          'CREATE INDEX IF NOT EXISTS idx_room_events_origin ON room_events(event_origin)');
 
       // 9. System Stats
-      await txn.execute('CREATE TABLE IF NOT EXISTS system_stats(key TEXT PRIMARY KEY, value INTEGER)');
+      await txn.execute(
+          'CREATE TABLE IF NOT EXISTS system_stats(key TEXT PRIMARY KEY, value INTEGER)');
 
       // 10. Known Routers (Протокол захвата роутера)
       await txn.execute('''
@@ -457,8 +623,10 @@ class LocalDatabaseService {
         )
       ''');
       await txn.execute('CREATE INDEX idx_routers_ssid ON known_routers(ssid)');
-      await txn.execute('CREATE INDEX idx_routers_priority ON known_routers(priority)');
-      await txn.execute('CREATE INDEX idx_routers_trusted ON known_routers(is_trusted)');
+      await txn.execute(
+          'CREATE INDEX idx_routers_priority ON known_routers(priority)');
+      await txn.execute(
+          'CREATE INDEX idx_routers_trusted ON known_routers(is_trusted)');
 
       // 11. SOS Signals (Emergency signals для оффлайн работы)
       await txn.execute('''
@@ -475,9 +643,12 @@ class LocalDatabaseService {
       ''');
       // Создаем индексы только если их еще нет (SQLite не поддерживает IF NOT EXISTS для индексов, но можно игнорировать ошибку)
       try {
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_sos_sector ON sos_signals(sectorId)');
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_sos_timestamp ON sos_signals(timestamp)');
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_sos_synced ON sos_signals(synced)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_sos_sector ON sos_signals(sectorId)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_sos_timestamp ON sos_signals(timestamp)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_sos_synced ON sos_signals(synced)');
       } catch (e) {
         // Игнорируем ошибки создания индексов (они могут уже существовать)
         print("⚠️ [DB] Index creation warning (may already exist): $e");
@@ -485,21 +656,31 @@ class LocalDatabaseService {
 
       // Индексы для O(1) и плавной прокрутки (с защитой от дубликатов)
       try {
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_messages_chatroom ON messages(chatRoomId)');
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_seen_pulses_time ON seen_pulses(seenAt)');
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_fragments_msg ON message_fragments(messageId)');
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_messages_owner ON messages(ownerId)');
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(createdAt)');
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_friends_status ON friends(status)');
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_friends_tactical ON friends(tactical_name)');
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_routers_ssid ON known_routers(ssid)');
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_routers_priority ON known_routers(priority)');
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_routers_trusted ON known_routers(is_trusted)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_messages_chatroom ON messages(chatRoomId)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_seen_pulses_time ON seen_pulses(seenAt)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_fragments_msg ON message_fragments(messageId)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_messages_owner ON messages(ownerId)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(createdAt)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_friends_status ON friends(status)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_friends_tactical ON friends(tactical_name)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_routers_ssid ON known_routers(ssid)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_routers_priority ON known_routers(priority)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_routers_trusted ON known_routers(is_trusted)');
       } catch (e) {
         // Игнорируем ошибки создания индексов (они могут уже существовать)
         print("⚠️ [DB] Index creation warning (may already exist): $e");
       }
-      
+
       // Глобальный чат: TTL и gossip hash для дедупликации (ALTER TABLE с защитой)
       try {
         await txn.execute('ALTER TABLE messages ADD COLUMN gossip_hash TEXT');
@@ -507,29 +688,34 @@ class LocalDatabaseService {
         // Колонка может уже существовать
       }
       try {
-        await txn.execute('ALTER TABLE messages ADD COLUMN ttl INTEGER DEFAULT 7');
+        await txn
+            .execute('ALTER TABLE messages ADD COLUMN ttl INTEGER DEFAULT 7');
       } catch (e) {
         // Колонка может уже существовать
       }
       try {
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_messages_gossip_hash ON messages(gossip_hash)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_messages_gossip_hash ON messages(gossip_hash)');
       } catch (e) {
         // Индекс может уже существовать
       }
-      
+
       // Личные сообщения: индикатор доставки (ALTER TABLE с защитой)
       try {
-        await txn.execute('ALTER TABLE messages ADD COLUMN delivered INTEGER DEFAULT 0');
+        await txn.execute(
+            'ALTER TABLE messages ADD COLUMN delivered INTEGER DEFAULT 0');
       } catch (e) {
         // Колонка может уже существовать
       }
       try {
-        await txn.execute('ALTER TABLE messages ADD COLUMN delivered_at INTEGER');
+        await txn
+            .execute('ALTER TABLE messages ADD COLUMN delivered_at INTEGER');
       } catch (e) {
         // Колонка может уже существовать
       }
       try {
-        await txn.execute('CREATE INDEX IF NOT EXISTS idx_messages_delivered ON messages(delivered)');
+        await txn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_messages_delivered ON messages(delivered)');
       } catch (e) {
         // Индекс может уже существовать
       }
@@ -542,23 +728,47 @@ class LocalDatabaseService {
   // 💬 MESSAGE OPERATIONS
   // ==========================================
 
-  Future<void> saveMessage(ChatMessage msg, String chatId) async {
-    final db = await database;
-    final currentUserId = locator<ApiService>().currentUserId;
-    if (msg.clientTempId != null) {
-      await db.delete('messages', where: 'id = ?', whereArgs: [msg.clientTempId]);
+  /// Ghost/Offline: current user id from ApiService when registered, else from Vault.
+  /// 🔒 BEACON/GHOST FIX: Fallback to global Vault if scoped returns empty (persistence after app restart).
+  Future<String> _getCurrentUserId() async {
+    if (locator.isRegistered<ApiService>()) {
+      return locator<ApiService>().currentUserId;
     }
-    
-    // 🔒 SECURITY: Encrypt sensitive content before storing
-    final encryptionService = EncryptionService();
+    if (_vault != null) {
+      final id = await _vault!.read('user_id');
+      if (id != null && id.isNotEmpty) return id;
+      // Fallback: global Vault (same key) in case scoped vault missed on cold start
+      final fallback = await Vault.read('user_id');
+      return fallback ?? '';
+    }
+    final id = await Vault.read('user_id');
+    return id ?? '';
+  }
+
+  /// [contentAlreadyEncrypted] — true when saving mesh/received message that
+  /// is already encrypted (do not double-encrypt). Default false = encrypt before store.
+  Future<void> saveMessage(ChatMessage msg, String chatId,
+      {bool contentAlreadyEncrypted = false}) async {
+    final db = await database;
+    final currentUserId = await _getCurrentUserId();
+    if (msg.clientTempId != null) {
+      await db
+          .delete('messages', where: 'id = ?', whereArgs: [msg.clientTempId]);
+    }
+
+    // 🔒 SECURITY: Store encrypted. Use same EncryptionService as app (vault) so decrypt in getMessages succeeds.
+    final encryptionService = locator.isRegistered<EncryptionService>()
+        ? locator<EncryptionService>()
+        : EncryptionService();
     final chatKey = await encryptionService.getChatKey(chatId);
-    final encryptedContent = await encryptionService.encrypt(msg.content, chatKey);
-    
+    final String encryptedContent = contentAlreadyEncrypted
+        ? msg.content
+        : await encryptionService.encrypt(msg.content, chatKey);
+
     // Импортируем jsonEncode для vectorClock
-    final vectorClockJson = msg.vectorClock != null 
-        ? jsonEncode(msg.vectorClock) 
-        : null;
-    
+    final vectorClockJson =
+        msg.vectorClock != null ? jsonEncode(msg.vectorClock) : null;
+
     await db.insert(
       'messages',
       {
@@ -582,7 +792,7 @@ class LocalDatabaseService {
   /// Обновляет статус сообщения
   Future<void> updateMessageStatus(String messageId, String newStatus) async {
     final db = await database;
-    final currentUserId = locator<ApiService>().currentUserId;
+    final currentUserId = await _getCurrentUserId();
     await db.update(
       'messages',
       {'status': newStatus},
@@ -593,18 +803,22 @@ class LocalDatabaseService {
 
   Future<List<ChatMessage>> getMessages(String chatId) async {
     final db = await database;
-    final currentUserId = locator<ApiService>().currentUserId;
+    final currentUserId = await _getCurrentUserId();
+    if (currentUserId.isEmpty) return [];
     final List<Map<String, dynamic>> maps = await db.query(
       'messages',
       where: 'chatRoomId = ? AND ownerId = ?',
       whereArgs: [chatId, currentUserId],
-      orderBy: 'createdAt ASC, senderId ASC, id ASC', // 🔥 Сортировка по (created_at, author_id, message_id)
+      orderBy:
+          'createdAt ASC, senderId ASC, id ASC', // 🔥 Сортировка по (created_at, author_id, message_id)
       // НЕ используем receivedAt или vectorClock для сортировки
     );
-    // 🔒 SECURITY: Decrypt content when reading from database
-    final encryptionService = EncryptionService();
+    // 🔒 SECURITY: Decrypt with same key as encrypt (use locator EncryptionService when available).
+    final encryptionService = locator.isRegistered<EncryptionService>()
+        ? locator<EncryptionService>()
+        : EncryptionService();
     final chatKey = await encryptionService.getChatKey(chatId);
-    
+
     // 🔒 Fix Database N+1: Convert dates efficiently (could be optimized further by storing DateTime directly)
     // Note: Current approach converts int → DateTime → ISO String for each message
     // Future optimization: Store DateTime in ChatMessage model directly, convert only in UI layer
@@ -612,14 +826,17 @@ class LocalDatabaseService {
     for (final m in maps) {
       // Decrypt content
       final encryptedContent = m['content'] as String? ?? '';
-      final decryptedContent = await encryptionService.decrypt(encryptedContent, chatKey);
-      
+      final decryptedContent =
+          await encryptionService.decrypt(encryptedContent, chatKey);
+
       final json = {
         ...m,
         'content': decryptedContent, // 🔒 Decrypted content
-        'createdAt': DateTime.fromMillisecondsSinceEpoch(m['createdAt'] as int).toIso8601String(),
-        'receivedAt': m['receivedAt'] != null 
-            ? DateTime.fromMillisecondsSinceEpoch(m['receivedAt'] as int).toIso8601String()
+        'createdAt': DateTime.fromMillisecondsSinceEpoch(m['createdAt'] as int)
+            .toIso8601String(),
+        'receivedAt': m['receivedAt'] != null
+            ? DateTime.fromMillisecondsSinceEpoch(m['receivedAt'] as int)
+                .toIso8601String()
             : null,
         'vectorClock': m['vectorClock'] as String?,
       };
@@ -631,7 +848,8 @@ class LocalDatabaseService {
   /// Получить все чаты пользователя
   Future<List<Map<String, dynamic>>> getAllChatRooms() async {
     final db = await database;
-    final currentUserId = locator<ApiService>().currentUserId;
+    final currentUserId = await _getCurrentUserId();
+    if (currentUserId.isEmpty) return [];
     final List<Map<String, dynamic>> maps = await db.query(
       'chat_rooms',
       where: 'ownerId = ?',
@@ -641,9 +859,11 @@ class LocalDatabaseService {
     return maps;
   }
 
-  Future<List<ChatMessage>> getMessagesPaged(String chatId, int limit, int offset) async {
+  Future<List<ChatMessage>> getMessagesPaged(
+      String chatId, int limit, int offset) async {
     final db = await database;
-    final currentUserId = locator<ApiService>().currentUserId;
+    final currentUserId = await _getCurrentUserId();
+    if (currentUserId.isEmpty) return [];
     final List<Map<String, dynamic>> maps = await db.query(
       'messages',
       where: 'chatRoomId = ? AND ownerId = ?',
@@ -652,21 +872,25 @@ class LocalDatabaseService {
       limit: limit,
       offset: offset,
     );
-    
-    // 🔒 SECURITY: Decrypt content when reading from database
-    final encryptionService = EncryptionService();
+
+    // 🔒 SECURITY: Decrypt with same key as encrypt (use locator EncryptionService when available).
+    final encryptionService = locator.isRegistered<EncryptionService>()
+        ? locator<EncryptionService>()
+        : EncryptionService();
     final chatKey = await encryptionService.getChatKey(chatId);
-    
+
     final decryptedMessages = <ChatMessage>[];
     for (final m in maps) {
       // Decrypt content
       final encryptedContent = m['content'] as String? ?? '';
-      final decryptedContent = await encryptionService.decrypt(encryptedContent, chatKey);
-      
+      final decryptedContent =
+          await encryptionService.decrypt(encryptedContent, chatKey);
+
       final json = {
         ...m,
         'content': decryptedContent, // 🔒 Decrypted content
-        'createdAt': DateTime.fromMillisecondsSinceEpoch(m['createdAt'] as int).toIso8601String(),
+        'createdAt': DateTime.fromMillisecondsSinceEpoch(m['createdAt'] as int)
+            .toIso8601String(),
       };
       decryptedMessages.add(ChatMessage.fromJson(json));
     }
@@ -676,13 +900,15 @@ class LocalDatabaseService {
   /// Удаляет сообщения за последние 24 часа (паник-протокол)
   Future<int> deleteMessagesLast24Hours() async {
     final db = await database;
-    final currentUserId = locator<ApiService>().currentUserId;
+    final currentUserId = await _getCurrentUserId();
+    if (currentUserId.isEmpty) return 0;
     final now = DateTime.now();
     final yesterday = now.subtract(const Duration(hours: 24));
     final yesterdayTimestamp = yesterday.millisecondsSinceEpoch;
-    
-    print("🧹 [PANIC] Deleting messages from last 24 hours (after ${yesterday.toIso8601String()})...");
-    
+
+    print(
+        "🧹 [PANIC] Deleting messages from last 24 hours (after ${yesterday.toIso8601String()})...");
+
     // Сначала получаем ID сообщений для удаления фрагментов
     final messagesToDelete = await db.query(
       'messages',
@@ -690,9 +916,9 @@ class LocalDatabaseService {
       where: 'ownerId = ? AND createdAt >= ?',
       whereArgs: [currentUserId, yesterdayTimestamp],
     );
-    
+
     final messageIds = messagesToDelete.map((m) => m['id'] as String).toList();
-    
+
     // Удаляем фрагменты сообщений
     if (messageIds.isNotEmpty) {
       final placeholders = List.filled(messageIds.length, '?').join(',');
@@ -702,14 +928,14 @@ class LocalDatabaseService {
         whereArgs: messageIds,
       );
     }
-    
+
     // Удаляем сами сообщения
     final deletedCount = await db.delete(
       'messages',
       where: 'ownerId = ? AND createdAt >= ?',
       whereArgs: [currentUserId, yesterdayTimestamp],
     );
-    
+
     print("✅ [PANIC] Deleted $deletedCount message(s) from last 24 hours");
     return deletedCount;
   }
@@ -720,12 +946,15 @@ class LocalDatabaseService {
 
   Future<void> establishTrust(String id, String name, String? pubKey) async {
     final db = await database;
-    await db.insert('friends', {
-      'id': id,
-      'username': name,
-      'publicKey': pubKey,
-      'lastSeen': DateTime.now().millisecondsSinceEpoch,
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert(
+        'friends',
+        {
+          'id': id,
+          'username': name,
+          'publicKey': pubKey,
+          'lastSeen': DateTime.now().millisecondsSinceEpoch,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<List<Map<String, dynamic>>> getTrustedFriends() async {
@@ -739,59 +968,76 @@ class LocalDatabaseService {
 
   Future<bool> isPacketSeen(String packetId) async {
     final db = await database;
-    final maps = await db.query('seen_pulses', where: 'id=?', whereArgs: [packetId]);
+    final maps =
+        await db.query('seen_pulses', where: 'id=?', whereArgs: [packetId]);
     if (maps.isNotEmpty) return true;
 
-    await db.insert('seen_pulses', {
-      'id': packetId,
-      'seenAt': DateTime.now().millisecondsSinceEpoch,
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
+    await db.insert(
+        'seen_pulses',
+        {
+          'id': packetId,
+          'seenAt': DateTime.now().millisecondsSinceEpoch,
+        },
+        conflictAlgorithm: ConflictAlgorithm.ignore);
     return false;
   }
 
   /// 🔥 MESH FRAGMENT PROTECTION: Лимиты на фрагментацию
-  static const int maxFragmentsPerMessage = 100; // Максимум 100 фрагментов на сообщение
+  static const int maxFragmentsPerMessage =
+      100; // Максимум 100 фрагментов на сообщение
   static const int maxFragmentDataSize = 500; // Максимум 500 байт на фрагмент
-  static const int fragmentTtlMs = 1000 * 60 * 30; // 30 минут TTL для фрагментов
-  
+  static const int fragmentTtlMs =
+      1000 * 60 * 30; // 30 минут TTL для фрагментов
+
   // 🔒 SECURITY FIX: Global limit on pending fragments to prevent OOM
-  static const int maxGlobalPendingFragments = 1000; // Max 1000 fragments globally
-  static const int maxPendingMessages = 50; // Max 50 incomplete messages at a time
-  
-  Future<bool> saveFragment({required String messageId, required int index, required int total, required String data}) async {
+  static const int maxGlobalPendingFragments =
+      1000; // Max 1000 fragments globally
+  static const int maxPendingMessages =
+      50; // Max 50 incomplete messages at a time
+
+  Future<bool> saveFragment(
+      {required String messageId,
+      required int index,
+      required int total,
+      required String data}) async {
     // 🛡️ FRAGMENT FLOODING PROTECTION
     if (total > maxFragmentsPerMessage) {
-      print("⚠️ [FRAGMENT] Rejected: too many fragments ($total > $maxFragmentsPerMessage) for $messageId");
+      print(
+          "⚠️ [FRAGMENT] Rejected: too many fragments ($total > $maxFragmentsPerMessage) for $messageId");
       return false;
     }
     if (index < 0 || index >= total) {
-      print("⚠️ [FRAGMENT] Rejected: invalid index ($index/$total) for $messageId");
+      print(
+          "⚠️ [FRAGMENT] Rejected: invalid index ($index/$total) for $messageId");
       return false;
     }
     if (data.length > maxFragmentDataSize) {
-      print("⚠️ [FRAGMENT] Rejected: fragment too large (${data.length} > $maxFragmentDataSize) for $messageId");
+      print(
+          "⚠️ [FRAGMENT] Rejected: fragment too large (${data.length} > $maxFragmentDataSize) for $messageId");
       return false;
     }
-    
+
     final db = await database;
     final now = DateTime.now().millisecondsSinceEpoch;
-    
+
     // 🔒 SECURITY FIX: Check global fragment limit
     final globalCount = Sqflite.firstIntValue(
-      await db.rawQuery('SELECT COUNT(*) FROM message_fragments')
-    ) ?? 0;
-    
+            await db.rawQuery('SELECT COUNT(*) FROM message_fragments')) ??
+        0;
+
     if (globalCount >= maxGlobalPendingFragments) {
-      print("🛡️ [FRAGMENT] Global limit reached ($globalCount >= $maxGlobalPendingFragments). Cleaning up oldest fragments...");
+      print(
+          "🛡️ [FRAGMENT] Global limit reached ($globalCount >= $maxGlobalPendingFragments). Cleaning up oldest fragments...");
       // Clean up oldest fragments to make room
-      await _cleanupOldestFragments(db, maxGlobalPendingFragments ~/ 4); // Remove 25%
+      await _cleanupOldestFragments(
+          db, maxGlobalPendingFragments ~/ 4); // Remove 25%
     }
-    
+
     // 🔒 SECURITY FIX: Check pending message count (unique messageIds)
-    final pendingMessages = Sqflite.firstIntValue(
-      await db.rawQuery('SELECT COUNT(DISTINCT messageId) FROM message_fragments')
-    ) ?? 0;
-    
+    final pendingMessages = Sqflite.firstIntValue(await db.rawQuery(
+            'SELECT COUNT(DISTINCT messageId) FROM message_fragments')) ??
+        0;
+
     // Check if this is a new message
     final existingForMessage = await db.query(
       'message_fragments',
@@ -799,14 +1045,15 @@ class LocalDatabaseService {
       whereArgs: [messageId],
       limit: 1,
     );
-    
+
     if (existingForMessage.isEmpty && pendingMessages >= maxPendingMessages) {
-      print("🛡️ [FRAGMENT] Max pending messages reached ($pendingMessages >= $maxPendingMessages). Rejecting new message: $messageId");
+      print(
+          "🛡️ [FRAGMENT] Max pending messages reached ($pendingMessages >= $maxPendingMessages). Rejecting new message: $messageId");
       // Clean up oldest incomplete messages
       await _cleanupOldestIncompleteMessages(db, maxPendingMessages ~/ 4);
       return false;
     }
-    
+
     // 🔥 ДЕДУПЛИКАЦИЯ: Проверяем, не получали ли мы уже этот фрагмент
     final existing = await db.query(
       'message_fragments',
@@ -817,20 +1064,24 @@ class LocalDatabaseService {
       print("ℹ️ [FRAGMENT] Duplicate fragment ignored: ${messageId}_$index");
       return false; // Дубликат
     }
-    
-    await db.insert('message_fragments', {
-      'fragmentId': "${messageId}_$index",
-      'messageId': messageId,
-      'index_num': index,
-      'total': total,
-      'data': data,
-      'receivedAt': now,
-    }, conflictAlgorithm: ConflictAlgorithm.ignore);
-    
-    print("📦 [FRAGMENT] Stored: ${messageId}_$index ($index/$total), ${data.length} bytes");
+
+    await db.insert(
+        'message_fragments',
+        {
+          'fragmentId': "${messageId}_$index",
+          'messageId': messageId,
+          'index_num': index,
+          'total': total,
+          'data': data,
+          'receivedAt': now,
+        },
+        conflictAlgorithm: ConflictAlgorithm.ignore);
+
+    print(
+        "📦 [FRAGMENT] Stored: ${messageId}_$index ($index/$total), ${data.length} bytes");
     return true;
   }
-  
+
   /// 🔒 SECURITY FIX: Clean up oldest fragments when limit exceeded
   Future<void> _cleanupOldestFragments(Database db, int count) async {
     await db.rawDelete('''
@@ -843,7 +1094,7 @@ class LocalDatabaseService {
     ''', [count]);
     print("🧹 [FRAGMENT] Cleaned up $count oldest fragments");
   }
-  
+
   /// 🔒 SECURITY FIX: Clean up oldest incomplete messages
   Future<void> _cleanupOldestIncompleteMessages(Database db, int count) async {
     // Find oldest incomplete messages
@@ -854,14 +1105,15 @@ class LocalDatabaseService {
       ORDER BY oldest ASC 
       LIMIT ?
     ''', [count]);
-    
+
     for (var msg in oldestMessages) {
       final messageId = msg['messageId'] as String;
-      await db.delete('message_fragments', where: 'messageId = ?', whereArgs: [messageId]);
+      await db.delete('message_fragments',
+          where: 'messageId = ?', whereArgs: [messageId]);
       print("🧹 [FRAGMENT] Cleaned up incomplete message: $messageId");
     }
   }
-  
+
   /// 🔥 Проверяет, собрано ли сообщение полностью
   Future<bool> isMessageComplete(String messageId) async {
     final db = await database;
@@ -878,57 +1130,82 @@ class LocalDatabaseService {
 
   Future<List<Map<String, dynamic>>> getFragments(String messageId) async {
     final db = await database;
-    return await db.query('message_fragments', where: 'messageId = ?', whereArgs: [messageId]);
+    return await db.query('message_fragments',
+        where: 'messageId = ?', whereArgs: [messageId]);
   }
 
   Future<void> clearFragments(String messageId) async {
     final db = await database;
-    await db.delete('message_fragments', where: 'messageId = ?', whereArgs: [messageId]);
+    await db.delete('message_fragments',
+        where: 'messageId = ?', whereArgs: [messageId]);
   }
 
   // ==========================================
   // 📦 OUTBOX & RELAY
   // ==========================================
 
-  Future<void> addToOutbox(ChatMessage msg, String chatId, {int? expiresAt}) async {
+  /// 🛡️ ANTICENSORSHIP: contentAlreadyEncrypted=true when content is already encrypted (relay);
+  /// false when plain — we encrypt before store (device seizure won't reveal plaintext).
+  Future<void> addToOutbox(ChatMessage msg, String chatId,
+      {int? expiresAt, bool contentAlreadyEncrypted = false}) async {
     final db = await database;
-    // 🔥 УЛУЧШЕНИЕ: TTL для payload - старые сообщения автоматически истекают (по умолчанию 1 час)
-    final defaultExpiresAt = expiresAt ?? DateTime.now().add(const Duration(hours: 1)).millisecondsSinceEpoch;
-    await db.insert('outbox', {
-      'id': msg.id,
-      'chatRoomId': chatId,
-      'content': msg.content,
-      'isEncrypted': 1,
-      'createdAt': msg.createdAt.millisecondsSinceEpoch,
-      'expiresAt': defaultExpiresAt,
-      'routing_state': 'PENDING'
-    }, conflictAlgorithm: ConflictAlgorithm.replace);
+    await _evictOutboxIfOverLimit(db, maxOutboxSize);
+    String contentToStore = msg.content;
+    if (!contentAlreadyEncrypted) {
+      final encryptionService = locator.isRegistered<EncryptionService>()
+          ? locator<EncryptionService>()
+          : EncryptionService();
+      final chatKey = await encryptionService.getChatKey(chatId);
+      contentToStore = await encryptionService.encrypt(msg.content, chatKey);
+    }
+    final defaultExpiresAt = expiresAt ??
+        DateTime.now().add(const Duration(hours: 1)).millisecondsSinceEpoch;
+    final senderIdVal = msg.senderId;
+    await db.insert(
+        'outbox',
+        {
+          'id': msg.id,
+          'chatRoomId': chatId,
+          'content': contentToStore,
+          'isEncrypted': 1,
+          'createdAt': msg.createdAt.millisecondsSinceEpoch,
+          'expiresAt': defaultExpiresAt,
+          'routing_state': 'PENDING',
+          'senderId': senderIdVal,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<List<Map<String, dynamic>>> getPendingFromOutbox() async {
     final db = await database;
     final now = DateTime.now().millisecondsSinceEpoch;
     // 🔥 УЛУЧШЕНИЕ: Фильтруем просроченные payload (TTL > 1 час)
-    final results = await db.query(
-      'outbox',
-      where: 'expiresAt IS NULL OR expiresAt > ?',
-      whereArgs: [now],
-      orderBy: 'createdAt ASC'
-    );
-    
+    final results = await db.query('outbox',
+        where: 'expiresAt IS NULL OR expiresAt > ?',
+        whereArgs: [now],
+        orderBy: 'createdAt ASC');
+
     // Удаляем просроченные записи из базы
-    await db.delete(
-      'outbox',
-      where: 'expiresAt IS NOT NULL AND expiresAt <= ?',
-      whereArgs: [now]
-    );
-    
+    await db.delete('outbox',
+        where: 'expiresAt IS NOT NULL AND expiresAt <= ?', whereArgs: [now]);
+
     return results;
   }
 
   Future<void> removeFromOutbox(String id) async {
     final db = await database;
     await db.delete('outbox', where: 'id=?', whereArgs: [id]);
+  }
+
+  /// Обновляет прогресс отправки фрагментов по BLE (resume). Вызывать после каждой успешно отправленного фрагмента.
+  Future<void> updateOutboxSentFragmentIndex(String messageId, int index) async {
+    final db = await database;
+    await db.update(
+      'outbox',
+      {'sentFragmentIndex': index},
+      where: 'id = ?',
+      whereArgs: [messageId],
+    );
   }
 
   /// Получает недавние сообщения из чата за указанный период
@@ -938,7 +1215,7 @@ class LocalDatabaseService {
   }) async {
     final db = await database;
     final sinceMs = since.millisecondsSinceEpoch;
-    
+
     final results = await db.query(
       'messages',
       where: 'chatRoomId = ? AND createdAt >= ?',
@@ -946,7 +1223,7 @@ class LocalDatabaseService {
       orderBy: 'createdAt DESC',
       limit: 50, // Ограничиваем последними 50 сообщениями
     );
-    
+
     return results.map((row) => ChatMessage.fromJson(row)).toList();
   }
 
@@ -961,16 +1238,15 @@ class LocalDatabaseService {
 
     await db.transaction((txn) async {
       // 🔥 FRAGMENT GC: Удаляем старые несобранные фрагменты
-      final deletedFragments = await txn.delete(
-        'message_fragments', 
-        where: 'receivedAt < ?', 
-        whereArgs: [fragmentTtl]
-      );
+      final deletedFragments = await txn.delete('message_fragments',
+          where: 'receivedAt < ?', whereArgs: [fragmentTtl]);
       if (deletedFragments > 0) {
-        print("🧹 [GC] Cleaned $deletedFragments stale message fragments (TTL: 30min)");
+        print(
+            "🧹 [GC] Cleaned $deletedFragments stale message fragments (TTL: 30min)");
       }
-      
-      await txn.delete('seen_pulses', where: 'seenAt < ?', whereArgs: [pulseTtl]);
+
+      await txn
+          .delete('seen_pulses', where: 'seenAt < ?', whereArgs: [pulseTtl]);
       await txn.delete('ads', where: 'expiresAt < ?', whereArgs: [now]);
 
       // Ограничиваем историю (2000 последних), но сохраняем SOS
@@ -1009,18 +1285,15 @@ class LocalDatabaseService {
 
   Future<void> saveAd(AdPacket ad) async {
     final db = await database;
-    await db.insert('ads', ad.toJson(), conflictAlgorithm: ConflictAlgorithm.replace);
+    await db.insert('ads', ad.toJson(),
+        conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<List<AdPacket>> getActiveAds() async {
     final db = await database;
     final now = DateTime.now().millisecondsSinceEpoch;
-    final List<Map<String, dynamic>> maps = await db.query(
-        'ads',
-        where: 'expiresAt > ?',
-        whereArgs: [now],
-        orderBy: 'priority DESC'
-    );
+    final List<Map<String, dynamic>> maps = await db.query('ads',
+        where: 'expiresAt > ?', whereArgs: [now], orderBy: 'priority DESC');
     return maps.map((e) => AdPacket.fromJson(e)).toList();
   }
 
@@ -1107,7 +1380,9 @@ class LocalDatabaseService {
       GROUP BY sectorId
       HAVING SUM(count) >= 3
       ORDER BY SUM(count) DESC, MAX(timestamp) DESC
-    ''', [DateTime.now().subtract(const Duration(days: 7)).millisecondsSinceEpoch]);
+    ''', [
+      DateTime.now().subtract(const Duration(days: 7)).millisecondsSinceEpoch
+    ]);
 
     return result;
   }
@@ -1134,8 +1409,15 @@ class LocalDatabaseService {
     final db = await database;
     await db.transaction((txn) async {
       final tables = [
-        'messages', 'message_fragments', 'friends', 'seen_pulses',
-        'outbox', 'ads', 'licenses', 'chat_rooms', 'system_stats'
+        'messages',
+        'message_fragments',
+        'friends',
+        'seen_pulses',
+        'outbox',
+        'ads',
+        'licenses',
+        'chat_rooms',
+        'system_stats'
       ];
       for (var t in tables) await txn.delete(t);
     });
@@ -1180,7 +1462,8 @@ class LocalDatabaseService {
   Future<List<Map<String, dynamic>>> getFriends({String? status}) async {
     final db = await database;
     if (status != null) {
-      return await db.query('friends', where: 'status = ?', whereArgs: [status]);
+      return await db
+          .query('friends', where: 'status = ?', whereArgs: [status]);
     }
     return await db.query('friends', orderBy: 'lastSeen DESC');
   }
@@ -1188,12 +1471,14 @@ class LocalDatabaseService {
   /// Получает друга по ID
   Future<Map<String, dynamic>?> getFriend(String friendId) async {
     final db = await database;
-    final results = await db.query('friends', where: 'id = ?', whereArgs: [friendId], limit: 1);
+    final results = await db.query('friends',
+        where: 'id = ?', whereArgs: [friendId], limit: 1);
     return results.isNotEmpty ? results.first : null;
   }
 
   /// Обновляет статус друга
-  Future<void> updateFriendStatus(String friendId, String status, {int? acceptedAt}) async {
+  Future<void> updateFriendStatus(String friendId, String status,
+      {int? acceptedAt}) async {
     final db = await database;
     await db.update(
       'friends',
@@ -1257,7 +1542,8 @@ class LocalDatabaseService {
   }
 
   /// Получает сообщения из глобального чата (с лимитом и TTL фильтрацией)
-  Future<List<Map<String, dynamic>>> getGlobalChatMessages({int limit = 100}) async {
+  Future<List<Map<String, dynamic>>> getGlobalChatMessages(
+      {int limit = 100}) async {
     final db = await database;
     final now = DateTime.now().millisecondsSinceEpoch;
     // Очищаем старые сообщения (TTL истек)
@@ -1315,8 +1601,10 @@ class LocalDatabaseService {
       return true; // Событие сохранено
     } catch (e) {
       // Если событие уже существует (уникальное ограничение) - это нормально
-      if (e.toString().contains('UNIQUE constraint') || e.toString().contains('PRIMARY KEY')) {
-        print("ℹ️ [DB] Room event already exists: ${event.roomId}/${event.id} (origin: ${event.origin.name}) - skipping");
+      if (e.toString().contains('UNIQUE constraint') ||
+          e.toString().contains('PRIMARY KEY')) {
+        print(
+            "ℹ️ [DB] Room event already exists: ${event.roomId}/${event.id} (origin: ${event.origin.name}) - skipping");
         return false; // Событие уже было
       }
       rethrow;
@@ -1332,7 +1620,7 @@ class LocalDatabaseService {
       whereArgs: [roomId],
       orderBy: 'timestamp ASC',
     );
-    
+
     return maps.map((m) {
       // Парсим event_origin
       EventOrigin origin = EventOrigin.LOCAL;
@@ -1343,14 +1631,14 @@ class LocalDatabaseService {
           orElse: () => EventOrigin.LOCAL,
         );
       }
-      
+
       return RoomEvent(
         id: m['id'] as String,
         roomId: m['roomId'] as String,
         type: m['type'] as String,
         userId: m['userId'] as String,
         timestamp: DateTime.fromMillisecondsSinceEpoch(m['timestamp'] as int),
-        payload: m['payload'] != null 
+        payload: m['payload'] != null
             ? jsonDecode(m['payload'] as String) as Map<String, dynamic>
             : null,
         origin: origin,
@@ -1405,7 +1693,8 @@ class LocalDatabaseService {
   }
 
   /// Получает личные сообщения для чата
-  Future<List<Map<String, dynamic>>> getDirectMessages(String chatId, {int limit = 100}) async {
+  Future<List<Map<String, dynamic>>> getDirectMessages(String chatId,
+      {int limit = 100}) async {
     final db = await database;
     return await db.query(
       'messages',

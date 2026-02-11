@@ -4,6 +4,8 @@ import '../../core/room_service.dart';
 import '../../core/local_db_service.dart';
 import '../../core/locator.dart';
 import '../../core/api_service.dart';
+import '../../ghost_input/ghost_controller.dart';
+import '../../ghost_input/ghost_keyboard.dart';
 import 'conversation_screen.dart';
 import '../friends/friends_list_screen.dart';
 
@@ -18,8 +20,8 @@ class CreateRoomScreen extends StatefulWidget {
 class _CreateRoomScreenState extends State<CreateRoomScreen> {
   final RoomService _roomService = RoomService();
   final LocalDatabaseService _db = LocalDatabaseService();
-  final TextEditingController _groupNameController = TextEditingController();
-  
+  final GhostController _groupNameGhost = GhostController();
+
   List<Map<String, dynamic>> _friends = [];
   bool _isLoading = false;
   String? _selectedStep; // 'select' or 'person' or 'group'
@@ -29,12 +31,6 @@ class _CreateRoomScreenState extends State<CreateRoomScreen> {
     super.initState();
     _loadFriends();
     _selectedStep = 'select';
-  }
-
-  @override
-  void dispose() {
-    _groupNameController.dispose();
-    super.dispose();
   }
 
   Future<void> _loadFriends() async {
@@ -91,8 +87,8 @@ class _CreateRoomScreenState extends State<CreateRoomScreen> {
 
   Future<void> _createGroupRoom() async {
     if (_isLoading) return;
-    
-    final name = _groupNameController.text.trim();
+
+    final name = _groupNameGhost.value.trim();
     if (name.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Enter group name')),
@@ -304,28 +300,38 @@ class _CreateRoomScreenState extends State<CreateRoomScreen> {
             style: TextStyle(color: Colors.white24, fontSize: 12),
           ),
           const SizedBox(height: 8),
-          TextField(
-            controller: _groupNameController,
-            style: const TextStyle(color: Colors.white),
-            decoration: InputDecoration(
-              hintText: 'Group',
-              hintStyle: const TextStyle(color: Colors.white24),
-              filled: true,
-              fillColor: const Color(0xFF1A1A1A),
-              border: OutlineInputBorder(
+          GestureDetector(
+            onTap: () {
+              showModalBottomSheet(
+                context: context,
+                isScrollControlled: true,
+                backgroundColor: Colors.transparent,
+                builder: (context) => GhostKeyboard(
+                  controller: _groupNameGhost,
+                  onSend: () {
+                    setState(() {});
+                    Navigator.pop(context);
+                  },
+                ),
+              );
+            },
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1A1A1A),
                 borderRadius: BorderRadius.circular(12),
-                borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
+                border: Border.all(color: Colors.white.withOpacity(0.1)),
               ),
-              enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-                borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
-              ),
-              focusedBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-                borderSide: const BorderSide(color: Colors.redAccent),
+              child: AnimatedBuilder(
+                animation: _groupNameGhost,
+                builder: (_, __) => Text(
+                  _groupNameGhost.value.isEmpty ? 'Group' : _groupNameGhost.value,
+                  style: TextStyle(
+                    color: _groupNameGhost.value.isEmpty ? Colors.white24 : Colors.white,
+                  ),
+                ),
               ),
             ),
-            textCapitalization: TextCapitalization.words,
           ),
           const SizedBox(height: 40),
           ElevatedButton(

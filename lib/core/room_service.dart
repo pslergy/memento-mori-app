@@ -4,7 +4,8 @@ import 'package:sqflite/sqflite.dart';
 import 'package:memento_mori_app/core/local_db_service.dart';
 import 'package:memento_mori_app/core/locator.dart';
 import 'package:memento_mori_app/core/api_service.dart';
-import 'package:memento_mori_app/core/room_events.dart' show RoomEvent, EventOrigin, RoomParticipantsRebuilder;
+import 'package:memento_mori_app/core/room_events.dart'
+    show RoomEvent, EventOrigin, RoomParticipantsRebuilder;
 
 /// Service for working with rooms (chats)
 class RoomService {
@@ -13,7 +14,9 @@ class RoomService {
   RoomService._internal();
 
   final LocalDatabaseService _db = LocalDatabaseService();
-  final ApiService _api = locator<ApiService>();
+
+  ApiService? get _apiOrNull =>
+      locator.isRegistered<ApiService>() ? locator<ApiService>() : null;
 
   /// Creates deterministic room_id for direct chat (1-on-1)
   /// room_id = hash(userA + userB) where userA < userB (lexicographically)
@@ -29,13 +32,15 @@ class RoomService {
   /// Creates direct room (1-on-1)
   /// For user it looks like a regular chat
   Future<Map<String, dynamic>> createDirectRoom(String otherUserId) async {
-    final currentUserId = _api.currentUserId;
+    final api = _apiOrNull;
+    if (api == null) throw Exception('User not authenticated');
+    final currentUserId = api.currentUserId;
     if (currentUserId.isEmpty) {
       throw Exception('User not authenticated');
     }
 
     final roomId = _createDirectRoomId(currentUserId, otherUserId);
-    
+
     // Get friend name from friends list
     final friends = await _db.getFriends();
     final friend = friends.firstWhere(
@@ -63,16 +68,17 @@ class RoomService {
       'type': 'DIRECT',
       'room_type': 'DIRECT',
       'creator': currentUserId,
-      'participants': jsonEncode([currentUserId, otherUserId]), // Cache, not truth
+      'participants':
+          jsonEncode([currentUserId, otherUserId]), // Cache, not truth
       'lastMessage': '',
       'lastActivity': DateTime.now().millisecondsSinceEpoch,
     };
 
     await _db.database.then((db) => db.insert(
-      'chat_rooms',
-      room,
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    ));
+          'chat_rooms',
+          room,
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        ));
 
     // 🔥 CRITICAL: Create JOIN_ROOM events for both participants
     // This is the truth about room state
@@ -95,14 +101,17 @@ class RoomService {
     required String name,
     List<String>? participantIds,
   }) async {
-    final currentUserId = _api.currentUserId;
+    final api = _apiOrNull;
+    if (api == null) throw Exception('User not authenticated');
+    final currentUserId = api.currentUserId;
     if (currentUserId.isEmpty) {
       throw Exception('User not authenticated');
     }
 
     // Generate random UUID for group
-    final roomId = 'group_${DateTime.now().millisecondsSinceEpoch}_${currentUserId.substring(0, 8)}';
-    
+    final roomId =
+        'group_${DateTime.now().millisecondsSinceEpoch}_${currentUserId.substring(0, 8)}';
+
     final participants = participantIds ?? [currentUserId];
     if (!participants.contains(currentUserId)) {
       participants.add(currentUserId);
@@ -121,10 +130,10 @@ class RoomService {
     };
 
     await _db.database.then((db) => db.insert(
-      'chat_rooms',
-      room,
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    ));
+          'chat_rooms',
+          room,
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        ));
 
     // 🔥 CRITICAL: Create JOIN_ROOM events for all participants
     // This is the truth about room state
@@ -165,15 +174,15 @@ class RoomService {
     // 🔄 CACHE: Update participants (best-effort)
     final participantsJson = room['participants'] as String? ?? '[]';
     final participants = List<String>.from(jsonDecode(participantsJson));
-    
+
     if (!participants.contains(userId)) {
       participants.add(userId);
       await _db.database.then((db) => db.update(
-        'chat_rooms',
-        {'participants': jsonEncode(participants)},
-        where: 'id = ?',
-        whereArgs: [roomId],
-      ));
+            'chat_rooms',
+            {'participants': jsonEncode(participants)},
+            where: 'id = ?',
+            whereArgs: [roomId],
+          ));
     }
   }
 
@@ -192,15 +201,15 @@ class RoomService {
     if (room != null) {
       final participantsJson = room['participants'] as String? ?? '[]';
       final participants = List<String>.from(jsonDecode(participantsJson));
-      
+
       if (participants.contains(userId)) {
         participants.remove(userId);
         await _db.database.then((db) => db.update(
-          'chat_rooms',
-          {'participants': jsonEncode(participants)},
-          where: 'id = ?',
-          whereArgs: [roomId],
-        ));
+              'chat_rooms',
+              {'participants': jsonEncode(participants)},
+              where: 'id = ?',
+              whereArgs: [roomId],
+            ));
       }
     }
   }
@@ -222,7 +231,9 @@ class RoomService {
   }
 
   /// Creates MESSAGE event for room
-  Future<void> recordMessageEvent(String roomId, String userId, String messageId, {EventOrigin origin = EventOrigin.LOCAL}) async {
+  Future<void> recordMessageEvent(
+      String roomId, String userId, String messageId,
+      {EventOrigin origin = EventOrigin.LOCAL}) async {
     await _saveRoomEvent(RoomEvent.message(
       roomId: roomId,
       userId: userId,
@@ -230,7 +241,7 @@ class RoomService {
       origin: origin, // 📊 Specify event source
     ));
   }
-  
+
   /// Saves event from mesh network
   Future<bool> saveEventFromMesh(RoomEvent event) async {
     // Set origin = MESH for diagnostics
@@ -245,7 +256,7 @@ class RoomService {
     );
     return await _db.saveRoomEvent(meshEvent);
   }
-  
+
   /// Saves event from server
   Future<bool> saveEventFromServer(RoomEvent event) async {
     // Set origin = SERVER for diagnostics

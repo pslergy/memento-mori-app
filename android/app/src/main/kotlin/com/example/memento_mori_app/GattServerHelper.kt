@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -23,6 +24,14 @@ class GattServerHelper(
     private val context: Context,
     private val resultChannel: MethodChannel?
 ) {
+    companion object {
+        private const val MESH_DIAGNOSTICS = false
+        /** Скрывает начало MAC в логах (только последние 5 символов, чтобы нельзя было отследить устройство). */
+        private fun maskMacForLog(address: String?): String {
+            if (address.isNullOrBlank()) return "••••"
+            return if (address.length >= 5) "••:••:••:••:${address.takeLast(5)}" else "••••"
+        }
+    }
     private val TAG = "GATT_SERVER"
     
     private val SERVICE_UUID = UUID.fromString("bf27730d-860a-4e09-889c-2d8b6a9e0fe7")
@@ -66,7 +75,16 @@ class GattServerHelper(
     private val gattServerCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             super.onConnectionStateChange(device, status, newState)
-            
+            if (MESH_DIAGNOSTICS) {
+                val stateStr = when (newState) {
+                    BluetoothProfile.STATE_CONNECTED -> "CONNECTED"
+                    BluetoothProfile.STATE_CONNECTING -> "CONNECTING"
+                    BluetoothProfile.STATE_DISCONNECTED -> "DISCONNECTED"
+                    BluetoothProfile.STATE_DISCONNECTING -> "DISCONNECTING"
+                    else -> "UNKNOWN($newState)"
+                }
+                Log.d(TAG, "MESH_DIAG onConnectionStateChange status=$status newState=$stateStr deviceAddress=${maskMacForLog(device.address)} deviceName=${device.name ?: "Unknown"} manufacturer=${Build.MANUFACTURER} androidVersion=${Build.VERSION.SDK_INT}")
+            }
             // 🔥 DETAILED LOGGING: Log ALL connection state changes
             val stateStr = when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> "CONNECTED"
@@ -82,7 +100,7 @@ class GattServerHelper(
             }
             
             Log.d(TAG, "🔔 [GATT-SERVER] Connection state change:")
-            Log.d(TAG, "   📋 Device: ${device.address}")
+            Log.d(TAG, "   📋 Device: ${maskMacForLog(device.address)}")
             Log.d(TAG, "   📋 Device name: ${device.name ?: "Unknown"}")
             Log.d(TAG, "   📋 New state: $stateStr")
             Log.d(TAG, "   📋 Status: $statusStr")
@@ -91,7 +109,7 @@ class GattServerHelper(
             
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Log.d(TAG, "✅ [GATT-SERVER] Device connected: ${device.address}")
+                    Log.d(TAG, "✅ [GATT-SERVER] Device connected: ${maskMacForLog(device.address)}")
                     connectedDevices.add(device)
                     
                     // Уведомляем Flutter о подключении (на главном потоке)
@@ -104,10 +122,10 @@ class GattServerHelper(
                 }
                 BluetoothProfile.STATE_CONNECTING -> {
                     // 🔥 NEW: Log connection attempts
-                    Log.d(TAG, "🔄 [GATT-SERVER] Device CONNECTING: ${device.address}")
+                    Log.d(TAG, "🔄 [GATT-SERVER] Device CONNECTING: ${maskMacForLog(device.address)}")
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    Log.d(TAG, "❌ [GATT-SERVER] Device disconnected: ${device.address}")
+                    Log.d(TAG, "❌ [GATT-SERVER] Device disconnected: ${maskMacForLog(device.address)}")
                     connectedDevices.remove(device)
                     
                     // 🔥 Очищаем буфер для отключившегося устройства
@@ -135,46 +153,41 @@ class GattServerHelper(
             super.onCharacteristicWriteRequest(device, requestId, characteristic, preparedWrite, responseNeeded, offset, value)
             
             val chunkSize = value?.size ?: 0
-            Log.d(TAG, "📥 [GATT-SERVER] Write request from ${device.address}, size: $chunkSize")
+            Log.d(TAG, "📥 [GATT-SERVER] Write request from ${maskMacForLog(device.address)}, size: $chunkSize")
             
             if (characteristic.uuid == CHAR_UUID && value != null && value.isNotEmpty()) {
-                try {
-                    // 🔥 LENGTH-PREFIXED FRAMING: Накапливаем чанки в буфер
-                    processIncomingChunk(device.address, value)
-                    
-                    // BLE-level ACK (hardware confirmation, NOT app-level)
-                    if (responseNeeded && gattServer != null) {
-                        gattServer?.sendResponse(
-                            device,
-                            requestId,
-                            BluetoothGatt.GATT_SUCCESS,
-                            offset,
-                            null
-                        )
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "❌ [GATT-SERVER] Error processing write request: $e")
-                    
-                    if (responseNeeded && gattServer != null) {
-                        gattServer?.sendResponse(
-                            device,
-                            requestId,
-                            BluetoothGatt.GATT_FAILURE,
-                            offset,
-                            null
-                        )
+                // 🔥 Send BLE response FIRST on main thread (Huawei/Tecno call callback from binder thread — response must be on main)
+                if (responseNeeded && gattServer != null) {
+                    val server = gattServer
+                    val dev = device
+                    val id = requestId
+                    val off = offset
+                    mainHandler.post {
+                        try {
+                            server?.sendResponse(dev, id, BluetoothGatt.GATT_SUCCESS, off, null)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "❌ [GATT-SERVER] sendResponse failed: $e")
+                        }
                     }
                 }
+                try {
+                    processIncomingChunk(device.address, value)
+                } catch (e: Exception) {
+                    Log.e(TAG, "❌ [GATT-SERVER] Error processing write request: $e")
+                }
             } else {
-                // Неизвестная характеристика или пустые данные
                 if (responseNeeded && gattServer != null) {
-                    gattServer?.sendResponse(
-                        device,
-                        requestId,
-                        BluetoothGatt.GATT_FAILURE,
-                        offset,
-                        null
-                    )
+                    val server = gattServer
+                    val dev = device
+                    val id = requestId
+                    val off = offset
+                    mainHandler.post {
+                        try {
+                            server?.sendResponse(dev, id, BluetoothGatt.GATT_FAILURE, off, null)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "❌ [GATT-SERVER] sendResponse(fail) failed: $e")
+                        }
+                    }
                 }
             }
         }
@@ -187,7 +200,7 @@ class GattServerHelper(
         ) {
             super.onCharacteristicReadRequest(device, requestId, offset, characteristic)
             
-            Log.d(TAG, "📤 [GATT-SERVER] Read request from ${device.address}")
+            Log.d(TAG, "📤 [GATT-SERVER] Read request from ${maskMacForLog(device.address)}")
             
             if (characteristic.uuid == CHAR_UUID && gattServer != null) {
                 // Отправляем пустой ответ (или можно добавить логику для чтения)
@@ -355,6 +368,9 @@ class GattServerHelper(
     }
     
     fun isRunning(): Boolean = isServerRunning
+
+    /** Current GATT server generation — returned to Flutter so onGattReady can reject stale events. */
+    fun getGattServerGeneration(): Int = gattServerGeneration
     
     fun getConnectedDevicesCount(): Int = connectedDevices.size
     
@@ -399,7 +415,7 @@ class GattServerHelper(
         if (connectedDevices.isNotEmpty()) {
             Log.d(TAG, "   📋 Connected device addresses:")
             connectedDevices.forEach { device ->
-                Log.d(TAG, "      - ${device.address} (${device.name ?: "Unknown"})")
+                Log.d(TAG, "      - ${maskMacForLog(device.address)} (${device.name ?: "Unknown"})")
             }
         }
     }
@@ -414,14 +430,14 @@ class GattServerHelper(
      * В будущем: GHOST должен подписаться на notify и ждать ACK перед disconnect.
      */
     fun sendAppAck(deviceAddress: String, messageId: String, timestamp: Long): Boolean {
-        Log.d(TAG, "📤 [ACK] Attempting to send app-level ACK to $deviceAddress")
+        Log.d(TAG, "📤 [ACK] Attempting to send app-level ACK to ${maskMacForLog(deviceAddress)}")
         Log.d(TAG, "   📋 Message ID: $messageId")
         Log.d(TAG, "   📋 Timestamp: $timestamp")
         
         // Проверяем, подключено ли устройство
         val device = connectedDevices.find { it.address == deviceAddress }
         if (device == null) {
-            Log.w(TAG, "⚠️ [ACK] Device $deviceAddress not connected - ACK cannot be delivered")
+            Log.w(TAG, "⚠️ [ACK] Device ${maskMacForLog(deviceAddress)} not connected - ACK cannot be delivered")
             Log.w(TAG, "   💡 GHOST disconnected before ACK could be sent")
             Log.w(TAG, "   💡 Message was processed successfully on BRIDGE side")
             // Возвращаем true т.к. сообщение обработано, просто ACK не доставлен
@@ -455,7 +471,7 @@ class GattServerHelper(
         msgBuffer.buffer.write(chunk)
         
         val currentSize = msgBuffer.buffer.size()
-        Log.d(TAG, "📦 [FRAMING] Chunk received: ${chunk.size} bytes, buffer: $currentSize bytes (device: ${deviceAddress.takeLast(8)})")
+        Log.d(TAG, "📦 [FRAMING] Chunk received: ${chunk.size} bytes, buffer: $currentSize bytes (device: ${maskMacForLog(deviceAddress)})")
         
         // Пытаемся извлечь полные сообщения из буфера
         while (tryExtractMessage(deviceAddress, msgBuffer)) {
@@ -492,7 +508,7 @@ class GattServerHelper(
             }
             
             msgBuffer.expectedLength = lengthHeader
-            Log.d(TAG, "📦 [FRAMING] Length header: $lengthHeader bytes expected (device: ${deviceAddress.takeLast(8)})")
+            Log.d(TAG, "📦 [FRAMING] Length header: $lengthHeader bytes expected (device: ${maskMacForLog(deviceAddress)})")
         }
         
         // 2. Проверяем, есть ли полное сообщение (header + payload)
@@ -508,8 +524,9 @@ class GattServerHelper(
         
         Log.d(TAG, "✅ [FRAMING] Complete message: ${msgBuffer.expectedLength} bytes")
         Log.d(TAG, "📦 [FRAMING] JSON preview: ${jsonString.take(100)}...")
+        Log.d(TAG, "📤 [GATT-SERVER] Sending assembled message to Flutter (onGattDataReceived) from GHOST ${maskMacForLog(deviceAddress)}")
         
-        // 4. Отправляем полное сообщение во Flutter
+        // 4. Send complete message to Flutter
         mainHandler.post {
             resultChannel?.invokeMethod("onGattDataReceived", mapOf(
                 "deviceAddress" to deviceAddress,
@@ -542,7 +559,7 @@ class GattServerHelper(
             msgBuffer.buffer.write(bufferData.copyOfRange(offset, bufferData.size))
             Log.w(TAG, "⚠️ [FRAMING] Buffer reset with ${bufferData.size - offset} bytes remaining")
         } else {
-            Log.w(TAG, "⚠️ [FRAMING] Buffer completely cleared for ${deviceAddress.takeLast(8)}")
+            Log.w(TAG, "⚠️ [FRAMING] Buffer completely cleared for ${maskMacForLog(deviceAddress)}")
         }
     }
     
@@ -570,7 +587,7 @@ class GattServerHelper(
     fun clearBufferForDevice(deviceAddress: String) {
         val buffer = deviceBuffers.remove(deviceAddress)
         if (buffer != null && buffer.buffer.size() > 0) {
-            Log.w(TAG, "🧹 [FRAMING] Cleared buffer for ${deviceAddress.takeLast(8)} on disconnect (${buffer.buffer.size()} bytes)")
+            Log.w(TAG, "🧹 [FRAMING] Cleared buffer for ${maskMacForLog(deviceAddress)} on disconnect (${buffer.buffer.size()} bytes)")
         }
     }
     
@@ -594,13 +611,13 @@ class GattServerHelper(
      * Используется BRIDGE для отправки сообщений GHOST устройствам
      */
     fun sendMessageToClient(deviceAddress: String, messageJson: String): Boolean {
-        Log.d(TAG, "📤 [GATT-SERVER] Sending message to client: $deviceAddress")
+        Log.d(TAG, "📤 [GATT-SERVER] Sending message to client: ${maskMacForLog(deviceAddress)}")
         Log.d(TAG, "   📋 Message length: ${messageJson.length} bytes")
         
         // Проверяем, подключено ли устройство
         val device = connectedDevices.find { it.address == deviceAddress }
         if (device == null) {
-            Log.w(TAG, "⚠️ [GATT-SERVER] Device $deviceAddress not connected")
+            Log.w(TAG, "⚠️ [GATT-SERVER] Device ${maskMacForLog(deviceAddress)} not connected")
             return false
         }
         
@@ -664,7 +681,7 @@ class GattServerHelper(
                 }
             }
             
-            Log.d(TAG, "✅ [GATT-SERVER] Message sent successfully to $deviceAddress")
+            Log.d(TAG, "✅ [GATT-SERVER] Message sent successfully to ${maskMacForLog(deviceAddress)}")
             return true
         } catch (e: Exception) {
             Log.e(TAG, "❌ [GATT-SERVER] Error sending message: ${e.message}", e)

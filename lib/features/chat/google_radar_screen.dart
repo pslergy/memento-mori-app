@@ -2,6 +2,8 @@
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:nearby_connections/nearby_connections.dart';
+import 'package:memento_mori_app/ghost_input/ghost_controller.dart';
+import 'package:memento_mori_app/ghost_input/ghost_keyboard.dart';
 
 class GoogleRadarScreen extends StatefulWidget {
   final String myUsername;
@@ -16,7 +18,7 @@ class _GoogleRadarScreenState extends State<GoogleRadarScreen> {
   Map<String, String> endpointMap = {};
   String? connectedEndpointId;
   List<String> logs = [];
-  final TextEditingController _msgController = TextEditingController();
+  final GhostController _msgGhost = GhostController();
 
   void _startRadar() async {
     try {
@@ -99,9 +101,11 @@ class _GoogleRadarScreenState extends State<GoogleRadarScreen> {
 
   void _sendMessage() {
     if (connectedEndpointId == null) return;
-    Nearby().sendBytesPayload(connectedEndpointId!, Uint8List.fromList(_msgController.text.codeUnits));
-    _log("Me: ${_msgController.text}");
-    _msgController.clear();
+    final text = _msgGhost.value;
+    if (text.isEmpty) return;
+    Nearby().sendBytesPayload(connectedEndpointId!, Uint8List.fromList(text.codeUnits));
+    _log("Me: $text");
+    _msgGhost.clear();
   }
 
   void _log(String text) => setState(() => logs.insert(0, text));
@@ -143,10 +147,49 @@ class _GoogleRadarScreenState extends State<GoogleRadarScreen> {
           if (connectedEndpointId != null)
             Padding(
               padding: const EdgeInsets.all(8.0),
-              child: Row(children: [
-                Expanded(child: TextField(controller: _msgController, style: const TextStyle(color: Colors.white))),
-                IconButton(icon: const Icon(Icons.send, color: Colors.green), onPressed: _sendMessage)
-              ]),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: () {
+                        showModalBottomSheet(
+                          context: context,
+                          isScrollControlled: true,
+                          backgroundColor: Colors.transparent,
+                          builder: (context) => GhostKeyboard(
+                            controller: _msgGhost,
+                            onSend: () {
+                              _sendMessage();
+                              setState(() {});
+                              Navigator.pop(context);
+                            },
+                          ),
+                        );
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[850],
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: AnimatedBuilder(
+                          animation: _msgGhost,
+                          builder: (_, __) => Text(
+                            _msgGhost.value.isEmpty ? 'Сообщение...' : _msgGhost.value,
+                            style: TextStyle(
+                              color: _msgGhost.value.isEmpty ? Colors.white38 : Colors.white,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.send, color: Colors.green),
+                    onPressed: _sendMessage,
+                  ),
+                ],
+              ),
             )
         ],
       ),

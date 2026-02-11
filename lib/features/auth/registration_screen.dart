@@ -6,8 +6,11 @@ import 'package:animate_do/animate_do.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/api_service.dart';
+import '../../core/decoy/app_mode.dart';
+import '../../core/encryption_service.dart';
 import '../../core/locator.dart';
 import '../../core/network_monitor.dart';
+import '../../core/storage_service.dart';
 
 import '../../ghost_input/ghost_controller.dart';
 import '../../ghost_input/ghost_keyboard.dart';
@@ -36,7 +39,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
   bool _isLoading = false;
   String? _currentError;
   int _registrationStep = 0; // 0: input, 1: date, 2: finalize, 3: processing
-  
+
   // Validation states
   String? _usernameError;
   String? _emailError;
@@ -66,7 +69,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     setState(() {
       _usernameError = ValidationHelper.validateUsername(_usernameGhost.value);
     });
-    
+
     if (_debounce?.isActive ?? false) _debounce!.cancel();
     _debounce = Timer(const Duration(milliseconds: 500), () {
       if (_usernameError == null) {
@@ -74,13 +77,13 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
       }
     });
   }
-  
+
   void _onEmailChanged() {
     setState(() {
       _emailError = ValidationHelper.validateEmail(_emailGhost.value);
     });
   }
-  
+
   void _onPasswordChanged() {
     setState(() {
       _passwordError = ValidationHelper.validatePassword(_passwordGhost.value);
@@ -112,19 +115,31 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
   Future<void> _handleFinalStep() async {
     if (_isLoading) return;
-    setState(() => _isLoading = true);
     HapticFeedback.mediumImpact();
 
     final bool isOffline = NetworkMonitor().currentRole == MeshRole.GHOST;
 
     if (isOffline) {
+      // FSM: if ghost identity already in Vault, START always proceeds — no online/retry guard.
+      final String? token = await Vault.read('auth_token');
+      final String? userId = await Vault.read('user_id');
+      if (token == 'GHOST_MODE_ACTIVE' && userId != null && userId.isNotEmpty) {
+        setState(() {
+          _currentError = null;
+          _isLoading = false;
+        });
+        _finalizeAndNavigate(null);
+        return;
+      }
+      setState(() => _isLoading = true);
       await _initGhostProtocol();
     } else {
+      setState(() => _isLoading = true);
       await _performCloudRegistration();
     }
   }
 
-  // 👻 КЕЙС 1: Оффлайн регистрация (Ghost Mode)
+  // 👻 КЕЙС 1: Оффлайн регистрация (Ghost Mode). OFFLINE FIRST: only Vault + Encryption, no ApiService.
   Future<void> _initGhostProtocol() async {
     setState(() {
       _isLoading = true;
@@ -132,42 +147,74 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
       _currentError = null;
     });
 
-    try {
-      final api = locator<ApiService>();
-      final String username = _usernameGhost.value.trim();
-      final String email = _emailGhost.value.trim();
+    final String username = _usernameGhost.value.trim();
+    final String email = _emailGhost.value.trim();
 
-      // Создаем локальную личность и Landing Pass
-      await api.initGhostMode(username, email);
-      
-      // Show success message
+    try {
+      // Ensure CORE is set (Vault + EncryptionService). Fallback if we opened Registration without going through PostPermissions.
+      if (!locator.isRegistered<EncryptionService>()) {
+        setupCoreLocator(AppMode.REAL);
+        setupSessionLocator(AppMode.REAL);
+      }
+      // OFFLINE FIRST: create ghost locally; never depends on network or ApiService.
+      await createGhostIdentityLocal(username, email);
+
+      // FSM: local success = SUCCESS state; clear error and navigate. No guard on online.
+      if (!mounted) return;
+      setState(() {
+        _currentError = null;
+      });
+      await _finalizeAndNavigate(null);
+
+      // ONLINE OPTIONAL: after navigation; must not block or throw into outer catch.
+      if (mounted && locator.isRegistered<ApiService>()) {
+        try {
+          await locator<ApiService>().loadSavedIdentity();
+        } catch (_) {}
+        try {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const TerminalText(
+                'Ghost ID created successfully! Legalize it when internet is available.',
+                color: Colors.white,
+              ),
+              backgroundColor: Colors.greenAccent.withOpacity(0.2),
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        } catch (_) {}
+      }
+    } catch (e, st) {
+      // Log so logcat shows root cause (e.g. EncryptionService not registered, Vault write failure).
+      print('⚠️ [Ghost] createGhostIdentityLocal failed: $e');
+      print('⚠️ [Ghost] stack: $st');
+      setState(() => _currentError = _getUserFriendlyError(e));
+      // If ghost is already in Vault (e.g. creation succeeded but later step threw, or previous attempt), still let user in.
+      try {
+        final String? token = await Vault.read('auth_token');
+        final String? userId = await Vault.read('user_id');
+        if (token == 'GHOST_MODE_ACTIVE' &&
+            userId != null &&
+            userId.isNotEmpty &&
+            mounted) {
+          setState(() => _currentError = null);
+          _finalizeAndNavigate(null);
+          return;
+        }
+      } catch (_) {}
+      // OFFLINE FIRST: do not block with "Check your internet"; soft info only.
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: const TerminalText(
-              'Ghost ID created successfully! Legalize it when internet is available.',
-              color: Colors.white,
+            content: TerminalText(
+              _getUserFriendlyError(e),
+              color: Colors.white70,
             ),
-            backgroundColor: Colors.greenAccent.withOpacity(0.2),
-            duration: const Duration(seconds: 3),
+            backgroundColor: Colors.orange.withOpacity(0.3),
+            duration: const Duration(seconds: 4),
           ),
         );
       }
-
-      _finalizeAndNavigate(null); // Фраза восстановления в оффлайне не генерится сервером
-    } catch (e) {
-      setState(() {
-        _currentError = _getUserFriendlyError(e);
-      });
-      _showErrorDialog(
-        title: "Ghost Identity Creation Failed",
-        message: _getUserFriendlyError(e),
-        solution: "Check your internet connection or try again later.",
-        onRetry: () {
-          setState(() => _currentError = null);
-          _initGhostProtocol();
-        },
-      );
     } finally {
       setState(() => _isLoading = false);
     }
@@ -194,12 +241,15 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     } catch (e) {
       // Если во время регистрации инет пропал — фолбек на Ghost
       final errorMsg = e.toString().toLowerCase();
-      if (errorMsg.contains('network') || errorMsg.contains('timeout') || errorMsg.contains('connection')) {
+      if (errorMsg.contains('network') ||
+          errorMsg.contains('timeout') ||
+          errorMsg.contains('connection')) {
         // Network error - fallback to Ghost
         setState(() {
-          _currentError = "Internet connection lost. Switching to Ghost Mode...";
+          _currentError =
+              "Internet connection lost. Switching to Ghost Mode...";
         });
-        
+
         // Show informative dialog
         if (mounted) {
           showDialog(
@@ -207,7 +257,8 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
             barrierDismissible: false,
             builder: (context) => AlertDialog(
               backgroundColor: const Color(0xFF0D0D0D),
-              title: const TerminalTitle('Connection Lost', color: Colors.orangeAccent),
+              title: const TerminalTitle('Connection Lost',
+                  color: Colors.orangeAccent),
               content: const Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -233,10 +284,10 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
             ),
           );
         }
-        
+
         await Future.delayed(const Duration(seconds: 2));
         if (mounted) Navigator.pop(context); // Close dialog
-        
+
         await _initGhostProtocol();
       } else {
         // Other error - show dialog
@@ -305,7 +356,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     );
   }
 
-  void _finalizeAndNavigate(String? phrase) async {
+  Future<void> _finalizeAndNavigate(String? phrase) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('isFirstRun', false);
 
@@ -313,7 +364,8 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
     if (phrase != null) {
       Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => RecoveryPhraseScreen(phrase: phrase, isFlow: true)),
+        MaterialPageRoute(
+            builder: (_) => RecoveryPhraseScreen(phrase: phrase, isFlow: true)),
       );
     } else {
       // Ghost mode - show tutorial then survival guide
@@ -335,8 +387,11 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new, color: Colors.white24, size: 18),
-          onPressed: () => _pageController.previousPage(duration: const Duration(milliseconds: 300), curve: Curves.easeOut),
+          icon: const Icon(Icons.arrow_back_ios_new,
+              color: Colors.white24, size: 18),
+          onPressed: () => _pageController.previousPage(
+              duration: const Duration(milliseconds: 300),
+              curve: Curves.easeOut),
         ),
       ),
       body: Column(
@@ -360,7 +415,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
   Widget _buildStep1() {
     final bool isOffline = NetworkMonitor().currentRole == MeshRole.GHOST;
-    
+
     return _buildPageWrapper(
       title: "INITIALIZE IDENTITY",
       desc: "Choose your callsign and secure your communication link.",
@@ -375,7 +430,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
           color: isOffline ? AppColors.stealthOrange : AppColors.cloudGreen,
         ),
         const SizedBox(height: 24),
-        
+
         // Username
         _buildGhostInput(
           controller: _usernameGhost,
@@ -389,7 +444,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
           TerminalText(_usernameError!, color: Colors.redAccent, fontSize: 11),
         ],
         const SizedBox(height: 16),
-        
+
         // Email
         _buildGhostInput(
           controller: _emailGhost,
@@ -402,7 +457,7 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
           TerminalText(_emailError!, color: Colors.redAccent, fontSize: 11),
         ],
         const SizedBox(height: 16),
-        
+
         // Password
         _buildGhostInput(
           controller: _passwordGhost,
@@ -426,7 +481,8 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
               ),
               TerminalText(
                 _passwordStrength!,
-                color: ValidationHelper.getPasswordStrengthColor(_passwordGhost.value),
+                color: ValidationHelper.getPasswordStrengthColor(
+                    _passwordGhost.value),
                 fontSize: 11,
                 fontWeight: FontWeight.bold,
               ),
@@ -436,18 +492,24 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
       ],
       onNext: () {
         // Validate all fields
-        _usernameError = ValidationHelper.validateUsername(_usernameGhost.value);
+        _usernameError =
+            ValidationHelper.validateUsername(_usernameGhost.value);
         _emailError = ValidationHelper.validateEmail(_emailGhost.value);
-        _passwordError = ValidationHelper.validatePassword(_passwordGhost.value);
-        
+        _passwordError =
+            ValidationHelper.validatePassword(_passwordGhost.value);
+
         setState(() {});
-        
-        if (_usernameError != null || _emailError != null || _passwordError != null) {
+
+        if (_usernameError != null ||
+            _emailError != null ||
+            _passwordError != null) {
           _showError("Please fix the errors above");
           return;
         }
-        
-        _pageController.nextPage(duration: const Duration(milliseconds: 400), curve: Curves.easeInOut);
+
+        _pageController.nextPage(
+            duration: const Duration(milliseconds: 400),
+            curve: Curves.easeInOut);
       },
     );
   }
@@ -470,13 +532,14 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
           ),
         ),
       ],
-      onNext: () => _pageController.nextPage(duration: const Duration(milliseconds: 400), curve: Curves.easeInOut),
+      onNext: () => _pageController.nextPage(
+          duration: const Duration(milliseconds: 400), curve: Curves.easeInOut),
     );
   }
 
   Widget _buildStep3() {
     final bool isOffline = NetworkMonitor().currentRole == MeshRole.GHOST;
-    
+
     return _buildPageWrapper(
       title: "FINALIZE",
       desc: "Your data will be encrypted and stored in the local grid.",
@@ -506,9 +569,11 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
                 padding: const EdgeInsets.all(30),
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  border: Border.all(color: AppColors.gridCyan.withOpacity(0.2), width: 2),
+                  border: Border.all(
+                      color: AppColors.gridCyan.withOpacity(0.2), width: 2),
                 ),
-                child: const Icon(Icons.shield_outlined, color: AppColors.gridCyan, size: 50),
+                child: const Icon(Icons.shield_outlined,
+                    color: AppColors.gridCyan, size: 50),
               ),
             ),
           ),
@@ -529,7 +594,12 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
 
   // --- ВСПОМОГАТЕЛЬНЫЕ КОМПОНЕНТЫ ---
 
-  Widget _buildPageWrapper({required String title, required String desc, required List<Widget> children, required VoidCallback onNext, bool isLast = false}) {
+  Widget _buildPageWrapper(
+      {required String title,
+      required String desc,
+      required List<Widget> children,
+      required VoidCallback onNext,
+      bool isLast = false}) {
     return SingleChildScrollView(
       padding: const EdgeInsets.symmetric(horizontal: 30),
       child: Column(
@@ -567,7 +637,8 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
               backgroundColor: Colors.greenAccent,
               foregroundColor: Colors.black,
               padding: const EdgeInsets.symmetric(vertical: 18),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
             ),
             onPressed: _isLoading ? null : onNext,
             child: _isLoading
@@ -586,12 +657,21 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     );
   }
 
-  Widget _buildGhostInput({required GhostController controller, required String hint, required IconData icon, bool isPassword = false, Widget? suffix, required VoidCallback onTap}) {
+  Widget _buildGhostInput(
+      {required GhostController controller,
+      required String hint,
+      required IconData icon,
+      bool isPassword = false,
+      Widget? suffix,
+      required VoidCallback onTap}) {
     return GestureDetector(
       onTap: onTap,
       child: Container(
         padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(12), border: Border.all(color: AppColors.white05)),
+        decoration: BoxDecoration(
+            color: AppColors.surface,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: AppColors.white05)),
         child: Row(
           children: [
             Icon(icon, color: AppColors.textDim, size: 20),
@@ -600,8 +680,14 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
               child: AnimatedBuilder(
                 animation: controller,
                 builder: (context, _) => Text(
-                  controller.value.isEmpty ? hint : (isPassword ? controller.masked : controller.value),
-                  style: TextStyle(color: controller.value.isEmpty ? AppColors.textDim : Colors.white, fontSize: 14),
+                  controller.value.isEmpty
+                      ? hint
+                      : (isPassword ? controller.masked : controller.value),
+                  style: TextStyle(
+                      color: controller.value.isEmpty
+                          ? AppColors.textDim
+                          : Colors.white,
+                      fontSize: 14),
                 ),
               ),
             ),
@@ -621,18 +707,28 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         return Container(
           width: double.infinity,
           padding: const EdgeInsets.symmetric(vertical: 10),
-          color: isOffline ? AppColors.stealthOrange.withOpacity(0.1) : AppColors.cloudGreen.withOpacity(0.1),
+          color: isOffline
+              ? AppColors.stealthOrange.withOpacity(0.1)
+              : AppColors.cloudGreen.withOpacity(0.1),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(isOffline ? Icons.wifi_off : Icons.cloud_done, size: 12, color: isOffline ? AppColors.stealthOrange : AppColors.cloudGreen),
+              Icon(isOffline ? Icons.wifi_off : Icons.cloud_done,
+                  size: 12,
+                  color: isOffline
+                      ? AppColors.stealthOrange
+                      : AppColors.cloudGreen),
               const SizedBox(width: 8),
               Text(
-                isOffline ? "GHOST PROTOCOL ACTIVE (OFFLINE)" : "CLOUD UPLINK SECURED",
+                isOffline
+                    ? "GHOST PROTOCOL ACTIVE (OFFLINE)"
+                    : "CLOUD UPLINK SECURED",
                 style: TextStyle(
                   fontSize: 9,
                   fontWeight: FontWeight.bold,
-                  color: isOffline ? AppColors.stealthOrange : AppColors.cloudGreen,
+                  color: isOffline
+                      ? AppColors.stealthOrange
+                      : AppColors.cloudGreen,
                   letterSpacing: 0.8,
                 ),
               ),
@@ -648,7 +744,8 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
     if (_isUsernameAvailable == null) return null;
     return Icon(
       _isUsernameAvailable! ? Icons.check_circle_outline : Icons.error_outline,
-      color: _isUsernameAvailable! ? AppColors.cloudGreen : AppColors.warningRed,
+      color:
+          _isUsernameAvailable! ? AppColors.cloudGreen : AppColors.warningRed,
       size: 18,
     );
   }
@@ -658,7 +755,8 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
-      builder: (context) => GhostKeyboard(controller: controller, onSend: () => Navigator.pop(context)),
+      builder: (context) => GhostKeyboard(
+          controller: controller, onSend: () => Navigator.pop(context)),
     );
   }
 

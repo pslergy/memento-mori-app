@@ -1,9 +1,10 @@
 // lib/features/chat/create_group_screen.dart
 import 'package:flutter/material.dart';
 import 'package:memento_mori_app/core/api_service.dart';
+import 'package:memento_mori_app/ghost_input/ghost_controller.dart';
+import 'package:memento_mori_app/ghost_input/ghost_keyboard.dart';
 
 import 'conversation_screen.dart';
-// TODO: Импортировать ConversationScreen
 
 class CreateGroupScreen extends StatefulWidget {
   final Set<String> memberIds;
@@ -14,20 +15,18 @@ class CreateGroupScreen extends StatefulWidget {
 }
 
 class _CreateGroupScreenState extends State<CreateGroupScreen> {
-  final _nameController = TextEditingController();
+  final GhostController _nameGhost = GhostController();
   final ApiService _apiService = ApiService();
   bool _isLoading = false;
 
   void _createGroup() async {
-    // --- ГЛАВНОЕ ИЗМЕНЕНИЕ ---
-    // Если имя пустое ИЛИ процесс уже запущен, ничего не делаем
-    if (_nameController.text.isEmpty || _isLoading) return;
+    if (_nameGhost.value.trim().isEmpty || _isLoading) return;
 
     setState(() => _isLoading = true);
 
     try {
       final newGroup = await _apiService.createGroupChat(
-        _nameController.text,
+        _nameGhost.value.trim(),
         widget.memberIds.toList(),
       );
 
@@ -60,9 +59,37 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
         padding: const EdgeInsets.all(20.0),
         child: Column(
           children: [
-            TextField(
-              controller: _nameController,
-              decoration: const InputDecoration(labelText: 'Enter group name'),
+            GestureDetector(
+              onTap: () {
+                showModalBottomSheet(
+                  context: context,
+                  isScrollControlled: true,
+                  backgroundColor: Colors.transparent,
+                  builder: (context) => GhostKeyboard(
+                    controller: _nameGhost,
+                    onSend: () {
+                      setState(() {});
+                      Navigator.pop(context);
+                    },
+                  ),
+                );
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.grey),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: AnimatedBuilder(
+                  animation: _nameGhost,
+                  builder: (_, __) => Text(
+                    _nameGhost.value.isEmpty ? 'Enter group name' : _nameGhost.value,
+                    style: TextStyle(
+                      color: _nameGhost.value.isEmpty ? Colors.grey : Colors.black,
+                    ),
+                  ),
+                ),
+              ),
             ),
             const SizedBox(height: 30),
             ElevatedButton(

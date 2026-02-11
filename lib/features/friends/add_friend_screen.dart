@@ -8,6 +8,8 @@ import '../../core/locator.dart';
 import '../../core/api_service.dart';
 import '../../core/native_mesh_service.dart';
 import '../../core/models/signal_node.dart';
+import '../../ghost_input/ghost_controller.dart';
+import '../../ghost_input/ghost_keyboard.dart';
 import 'dart:convert';
 
 class AddFriendScreen extends StatefulWidget {
@@ -18,7 +20,7 @@ class AddFriendScreen extends StatefulWidget {
 }
 
 class _AddFriendScreenState extends State<AddFriendScreen> {
-  final TextEditingController _searchController = TextEditingController();
+  final GhostController _searchGhost = GhostController();
   final MeshService _mesh = locator<MeshService>();
   final ApiService _api = locator<ApiService>();
   List<SignalNode> _foundNodes = [];
@@ -35,7 +37,6 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
   @override
   void dispose() {
     _scanTimer?.cancel();
-    _searchController.dispose();
     super.dispose();
   }
 
@@ -116,28 +117,53 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
           ? _buildQRView()
           : Column(
               children: [
-                // Поиск
+                // Поиск (Ghost-клавиатура для Tecno и др.)
                 Container(
                   padding: const EdgeInsets.all(16),
-                  child: TextField(
-                    controller: _searchController,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: InputDecoration(
-                      hintText: 'Search by tactical name or ID...',
-                      hintStyle: TextStyle(color: Colors.white38),
-                      prefixIcon: const Icon(Icons.search, color: Colors.cyanAccent),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
-                      ),
-                      filled: true,
-                      fillColor: const Color(0xFF1A1A1A),
-                    ),
-                    onChanged: (value) {
-                      setState(() {
-                        _isSearching = value.isNotEmpty;
-                      });
+                  child: GestureDetector(
+                    onTap: () {
+                      showModalBottomSheet(
+                        context: context,
+                        isScrollControlled: true,
+                        backgroundColor: Colors.transparent,
+                        builder: (context) => GhostKeyboard(
+                          controller: _searchGhost,
+                          onSend: () {
+                            setState(() {
+                              _isSearching = _searchGhost.value.isNotEmpty;
+                            });
+                            Navigator.pop(context);
+                          },
+                        ),
+                      );
                     },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1A1A1A),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.white.withOpacity(0.1)),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.search, color: Colors.cyanAccent, size: 22),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: AnimatedBuilder(
+                              animation: _searchGhost,
+                              builder: (_, __) => Text(
+                                _searchGhost.value.isEmpty
+                                    ? 'Search by tactical name or ID...'
+                                    : _searchGhost.value,
+                                style: TextStyle(
+                                  color: _searchGhost.value.isEmpty ? Colors.white38 : Colors.white,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
 
@@ -167,9 +193,10 @@ class _AddFriendScreenState extends State<AddFriendScreen> {
                           itemCount: _foundNodes.length,
                           itemBuilder: (context, index) {
                             final node = _foundNodes[index];
-                            final matchesSearch = _searchController.text.isEmpty ||
-                                node.name.toLowerCase().contains(_searchController.text.toLowerCase()) ||
-                                node.id.toLowerCase().contains(_searchController.text.toLowerCase());
+                            final searchVal = _searchGhost.value;
+                            final matchesSearch = searchVal.isEmpty ||
+                                node.name.toLowerCase().contains(searchVal.toLowerCase()) ||
+                                node.id.toLowerCase().contains(searchVal.toLowerCase());
 
                             if (!matchesSearch && _isSearching) return const SizedBox.shrink();
 

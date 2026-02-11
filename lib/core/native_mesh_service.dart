@@ -82,6 +82,19 @@ class NativeMeshService {
           }
           break;
           
+        // 🔥 ЛОГИ ИЗ НАТИВНОГО КОДА В UI ТЕРМИНАЛ
+        case 'onNativeLog':
+          final args = Map<String, dynamic>.from(call.arguments);
+          final String tag = args['tag'] ?? 'NATIVE';
+          final String message = args['message'] ?? '';
+          // Передаем лог в MeshService для отображения в UI терминале
+          try {
+            locator<MeshService>().addLog("[$tag] $message");
+          } catch (e) {
+            print("⚠️ [Native] Failed to add native log: $e");
+          }
+          break;
+          
         // 🔥 АВТОМАТИЧЕСКОЕ УПРАВЛЕНИЕ WI-FI DIRECT ГРУППОЙ
         case 'onGroupCreated':
           final args = Map<String, dynamic>.from(call.arguments);
@@ -91,12 +104,17 @@ class NativeMeshService {
           final clientCount = args['clientCount'] as int? ?? 0;
           final reused = args['reused'] as bool? ?? false;
           
-          print("✅ [Native] Wi-Fi Direct группа ${reused ? 'найдена' : 'создана'}:");
+          print("✅ [Native] Wi-Fi Direct group ${reused ? 'found' : 'created'}:");
           print("   📋 SSID: $networkName");
           print("   📋 Passphrase: ${passphrase?.substring(0, passphrase.length > 4 ? 4 : passphrase.length)}...");
-          print("   📋 Владелец: ${isGroupOwner ? 'Мы' : 'Другое устройство'}");
-          print("   📋 Клиентов: $clientCount");
-          
+          print("   📋 Owner: ${isGroupOwner ? 'Us' : 'Other device'}");
+          print("   📋 Clients: $clientCount");
+
+          // 🔥 Лог в UI терминал (MeshHybridScreen / LOG TERMINAL)
+          try {
+            locator<MeshService>().addLog("[WiFi-Direct] Group ${reused ? 'found' : 'created'}: SSID=$networkName, Pass=***");
+          } catch (_) {}
+
           // Уведомляем MeshService о созданной группе
           try {
             locator<MeshService>().onWifiDirectGroupCreated(
@@ -115,7 +133,7 @@ class NativeMeshService {
           final message = args['message'] as String?;
           final code = args['code'] as int?;
           
-          print("❌ [Native] Ошибка создания Wi-Fi Direct группы:");
+          print("❌ [Native] Wi-Fi Direct group creation failed:");
           print("   📋 Error: $error");
           print("   📋 Message: $message");
           if (code != null) print("   📋 Code: $code");
@@ -185,42 +203,21 @@ class NativeMeshService {
       }
     });
 
-    // --- 🦷 Настройка канала GATT Server ---
-    _gattChannel.setMethodCallHandler((call) async {
-      print("🦷 [Native -> GATT] Incoming Method: ${call.method}");
-      switch (call.method) {
-        case 'onGattReady':
-          print("✅ [Native] GATT Server ready event received");
-          if (_gattReadyCompleter != null && !_gattReadyCompleter!.isCompleted) {
-            _gattReadyCompleter!.complete(true);
-            _gattReadyCompleter = null;
-            print("✅ [Native] GATT ready completer completed");
-          } else {
-            print("⚠️ [Native] GATT ready event received but no active completer");
-          }
-          break;
-        case 'onGattClientConnected':
-          final args = Map<String, dynamic>.from(call.arguments);
-          final deviceAddress = args['deviceAddress'] as String?;
-          print("✅ [Native] GATT client connected: $deviceAddress");
-          break;
-        case 'onGattClientDisconnected':
-          final args = Map<String, dynamic>.from(call.arguments);
-          final deviceAddress = args['deviceAddress'] as String?;
-          print("❌ [Native] GATT client disconnected: $deviceAddress");
-          break;
-        case 'onGattDataReceived':
-          final args = Map<String, dynamic>.from(call.arguments);
-          final deviceAddress = args['deviceAddress'] as String?;
-          final data = args['data'] as String?;
-          print("📥 [Native] GATT data received from $deviceAddress: ${data?.length ?? 0} bytes");
-          // Примечание: BluetoothService обрабатывает данные через свой собственный канал
-          // Этот handler здесь только для логирования
-          break;
-        default:
-          print("⚠️ Unknown GATT method: ${call.method}");
-      }
-    });
+    // --- 🦷 GATT Server: handler НЕ ставим здесь ---
+    // 🔥 BLE AUDIT FIX: Канал memento/gatt_server обрабатывается ТОЛЬКО в BluetoothMeshService.
+    // Раньше setMethodCallHandler здесь перезаписывал handler и onGattDataReceived не доходил до
+    // processIncomingPacket. onGattReady для startGattServerAndWait завершается через
+    // completeGattReadyFromNative() из BluetoothMeshService.
+  }
+  
+  /// Вызывается из BluetoothMeshService при получении onGattReady с натива.
+  /// Нужно для startGattServerAndWait() — чтобы completer завершился при одном handler на канале.
+  static void completeGattReadyFromNative(bool value) {
+    if (_gattReadyCompleter != null && !_gattReadyCompleter!.isCompleted) {
+      _gattReadyCompleter!.complete(value);
+      _gattReadyCompleter = null;
+      print("✅ [Native] GATT ready completer completed from BluetoothMeshService");
+    }
   }
 
 
@@ -386,7 +383,7 @@ class NativeMeshService {
           clientCount: resultMap['clientCount'] as int? ?? 0,
         );
         
-        print("✅ [Native] Группа создана: ${info.networkName}");
+        print("✅ [Native] Group created: ${info.networkName}");
         return info;
       } else {
         print("❌ [Native] Не удалось создать группу");
@@ -443,7 +440,7 @@ class NativeMeshService {
   /// Идеально для автоматического mesh-режима
   static Future<WifiDirectGroupInfo?> ensureWifiDirectGroupExists() async {
     try {
-      print("🔍 [Native] Проверка/создание Wi-Fi Direct группы...");
+      print("🔍 [Native] Checking/creating Wi-Fi Direct group...");
       
       final result = await _channel.invokeMethod('ensureGroupExists');
       final Map<dynamic, dynamic> resultMap = Map<dynamic, dynamic>.from(result ?? {});
@@ -477,13 +474,17 @@ class NativeMeshService {
     }
   }
 
-  static Future<void> connect(String address) async {
+  static Future<void> connect(String address, {String? networkName, String? passphrase}) async {
     if (address.isEmpty || address == "null") {
       print("❌ [Native] Connection aborted: Target address is empty.");
       return;
     }
     try {
-      await _channel.invokeMethod('connect', {'deviceAddress': address});
+      await _channel.invokeMethod('connect', {
+        'deviceAddress': address,
+        if (networkName != null && networkName.isNotEmpty) 'networkName': networkName,
+        if (passphrase != null && passphrase.isNotEmpty) 'passphrase': passphrase,
+      });
     } catch (e) {
       print("❌ [Native] Connection Error: $e");
     }
@@ -495,8 +496,8 @@ class NativeMeshService {
       // Гарантируем терминатор строки для Kotlin BufferedReader
       final String payload = message.endsWith('\n') ? message : '$message\n';
       
-      // 🔥 Wi-Fi Direct Fix: единый порт MESH_PORT (55555) — BRIDGE слушает, GHOST шлёт
-      final int targetPort = port ?? 55555;
+      // 🔥 Wi-Fi Direct Fix: единый порт 55556 — BRIDGE слушает, GHOST шлёт
+      final int targetPort = port ?? 55556;
 
       await _channel.invokeMethod('sendTcp', {
         'host': host,

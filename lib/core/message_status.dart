@@ -1,11 +1,11 @@
 /// Message delivery statuses
 /// Local statuses for UI, even if server is unavailable
 class MessageStatus {
-  // Логические состояния (стабилизация хранения)
-  static const String localOnly = 'LOCAL_ONLY';   // Только локально, ещё не отправлено
-  static const String delivered = 'DELIVERED';    // Доставлено хотя бы по одному каналу
-  static const String synced = 'SYNCED';          // Подтверждено/синхронизировано с сетью
-  static const String archived = 'ARCHIVED';      // Старое, можно stub или удалить локально
+  // Logical states (storage stabilization)
+  static const String localOnly = 'LOCAL_ONLY';   // Local only, not yet sent
+  static const String delivered = 'DELIVERED';    // Delivered via at least one channel
+  static const String synced = 'SYNCED';          // Confirmed/synced with network
+  static const String archived = 'ARCHIVED';      // Old, can stub or delete locally
 
   // Local statuses (legacy / UI)
   static const String sentLocal = 'SENT_LOCAL'; // Sent locally

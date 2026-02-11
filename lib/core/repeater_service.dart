@@ -14,6 +14,7 @@ import 'network_monitor.dart';
 import 'local_db_service.dart';
 import 'api_service.dart';
 import 'gossip_manager.dart';
+import 'peer_cache_service.dart';
 
 /// Состояние соединения
 enum ConnectionState {
@@ -202,14 +203,14 @@ class RepeaterService with ChangeNotifier {
     }
     
     _isRunning = true;
-    _log("🚀 [REPEATER] Запуск Repeater/Repair режима...");
+    _log("🚀 [REPEATER] Starting Repeater/Repair mode...");
     
     // Запускаем таймеры
     _startHealthCheck();
     _startRepairCycle();
     _startQueueProcessor();
     
-    _log("✅ [REPEATER] Режим активен");
+    _log("✅ [REPEATER] Mode active");
     _log("   📋 Max connections: $MAX_CONCURRENT_CONNECTIONS");
     _log("   📋 Repair interval: ${REPAIR_INTERVAL_SECONDS}s");
     _log("   📋 Health check: ${HEALTH_CHECK_INTERVAL_SECONDS}s");
@@ -242,7 +243,7 @@ class RepeaterService with ChangeNotifier {
       }
     }
     
-    _log("✅ [REPEATER] Режим остановлен");
+    _log("✅ [REPEATER] Mode stopped");
     notifyListeners();
   }
   
@@ -516,15 +517,36 @@ class RepeaterService with ChangeNotifier {
         if (success) {
           successCount++;
           updateConnectionActivity(conn.deviceId);
+          try {
+            locator<PeerCacheService>().recordSuccess(
+              peerId: conn.deviceId,
+              latency: Duration.zero,
+              channel: conn.channelType.name,
+            );
+          } catch (_) {}
           // 📊 FORENSIC LOG: relay_forwarded
           _log("✅ [RELAY] relay_forwarded: $packetId -> ${conn.deviceId.substring(0, math.min(8, conn.deviceId.length))}... via ${conn.channelType.name}");
         } else {
           markConnectionFailure(conn.deviceId);
+          try {
+            locator<PeerCacheService>().recordFailure(
+              peerId: conn.deviceId,
+              channel: conn.channelType.name,
+              reason: null,
+            );
+          } catch (_) {}
           // 📊 FORENSIC LOG: relay_failed
           _log("⚠️ [RELAY] relay_failed: $packetId -> ${conn.deviceId.substring(0, math.min(8, conn.deviceId.length))}...");
         }
       } catch (e) {
         markConnectionFailure(conn.deviceId);
+        try {
+          locator<PeerCacheService>().recordFailure(
+            peerId: conn.deviceId,
+            channel: conn.channelType.name,
+            reason: e.toString(),
+          );
+        } catch (_) {}
         // 📊 FORENSIC LOG: relay_error
         _log("❌ [RELAY] relay_error: $packetId -> ${conn.deviceId.substring(0, math.min(8, conn.deviceId.length))}...: $e");
       }
@@ -617,7 +639,7 @@ class RepeaterService with ChangeNotifier {
     
     if (failedConnections.isEmpty) return;
     
-    _log("🔧 [REPAIR] Запуск восстановления ${failedConnections.length} соединений...");
+    _log("🔧 [REPAIR] Starting recovery of ${failedConnections.length} connection(s)...");
     
     for (final conn in failedConnections) {
       await _repairConnection(conn);
@@ -897,6 +919,7 @@ class RepeaterService with ChangeNotifier {
       'SOS',
       'MAGNET_WAVE',
       'MSG_FRAG',
+      'DELIVERED_TO_CLOUD',
     ];
     
     final bool shouldRepeat = relayableTypes.contains(packetType);

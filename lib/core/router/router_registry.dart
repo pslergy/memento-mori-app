@@ -59,7 +59,7 @@ class RouterRegistry {
     final storage = const FlutterSecureStorage();
 
     for (var map in maps) {
-      final router = RouterInfo.fromJson(map);
+      final router = RouterInfo.fromDbRow(map);
       // Загружаем пароль из SecureStorage (только если роутер не открытый)
       final password = router.isOpen ? null : await storage.read(key: 'router_password_${router.ssid}');
       routers.add(RouterInfo(
@@ -93,7 +93,7 @@ class RouterRegistry {
 
     if (maps.isEmpty) return null;
 
-    final router = RouterInfo.fromJson(maps.first);
+    final router = RouterInfo.fromDbRow(maps.first);
     final storage = const FlutterSecureStorage();
     final password = router.isOpen ? null : await storage.read(key: 'router_password_${router.ssid}');
 

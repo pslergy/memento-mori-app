@@ -5,8 +5,10 @@ import 'package:provider/provider.dart';
 import 'package:flutter/services.dart';
 import 'package:animate_do/animate_do.dart'; // Для анимаций
 
+import 'package:memento_mori_app/core/decoy/app_mode.dart';
 import 'package:memento_mori_app/core/locator.dart';
 import 'package:memento_mori_app/core/mesh_service.dart';
+import 'package:memento_mori_app/core/MeshOrchestrator.dart';
 import 'package:memento_mori_app/core/native_mesh_service.dart';
 import 'package:memento_mori_app/core/models/signal_node.dart';
 import 'package:memento_mori_app/core/network_monitor.dart';
@@ -23,9 +25,10 @@ class MeshHybridScreen extends StatefulWidget {
   State<MeshHybridScreen> createState() => _MeshHybridScreenState();
 }
 
-class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerProviderStateMixin {
-  final MeshService _meshService = locator<MeshService>();
-  final UltrasonicService _sonarService = locator<UltrasonicService>();
+class _MeshHybridScreenState extends State<MeshHybridScreen>
+    with SingleTickerProviderStateMixin {
+  MeshService? _meshService;
+  UltrasonicService? _sonarService;
   final ScrollController _logScrollController = ScrollController();
 
   late AnimationController _radarController;
@@ -39,21 +42,45 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
   @override
   void initState() {
     super.initState();
-    _radarController = AnimationController(vsync: this, duration: const Duration(seconds: 3))..repeat();
+    if (!locator.isRegistered<MeshService>() && isCoreReady) {
+      setupSessionLocator(AppMode.REAL);
+    }
+    _meshService =
+        locator.isRegistered<MeshService>() ? locator<MeshService>() : null;
+    _sonarService = locator.isRegistered<UltrasonicService>()
+        ? locator<UltrasonicService>()
+        : null;
+    if (_meshService == null && locator.isRegistered<MeshService>()) {
+      _meshService = locator<MeshService>();
+    }
+    _radarController =
+        AnimationController(vsync: this, duration: const Duration(seconds: 3))
+          ..repeat();
 
-    _logSubscription = _meshService.statusStream.listen((log) {
-      if (mounted) {
-        setState(() => _terminalLogs.add(log));
-        _scrollToBottom();
+    final mesh = _meshService;
+    if (mesh != null) {
+      const kMaxDisplayLogs = 1300;
+      _logSubscription = mesh.statusStream.listen((log) {
+        if (mounted) {
+          setState(() {
+            _terminalLogs.add(log);
+            if (_terminalLogs.length > kMaxDisplayLogs) {
+              _terminalLogs.removeAt(0);
+            }
+          });
+          _scrollToBottom();
+        }
+      });
+
+      final sonar = _sonarService;
+      if (sonar != null) {
+        _sonarSubscription = sonar.sonarMessages.listen((msg) {
+          mesh.addLog("🎯 [SONAR]盟友信号 Captured: $msg");
+          HapticFeedback.vibrate();
+        });
+        sonar.startListening();
       }
-    });
-
-    _sonarSubscription = _sonarService.sonarMessages.listen((msg) {
-      _meshService.addLog("🎯 [SONAR]盟友信号 Captured: $msg");
-      HapticFeedback.vibrate();
-    });
-
-    _sonarService.startListening();
+    }
   }
 
   @override
@@ -67,25 +94,30 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
   void _scrollToBottom() {
     Future.delayed(const Duration(milliseconds: 100), () {
       if (_logScrollController.hasClients) {
-        _logScrollController.animateTo(_logScrollController.position.maxScrollExtent, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
+        _logScrollController.animateTo(
+            _logScrollController.position.maxScrollExtent,
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeOut);
       }
     });
   }
 
   // 🔥 ОДНА КНОПКА ДЛЯ ВСЕГО (UX Mastery)
   void _startGlobalDiscovery() async {
+    final mesh = _meshService;
+    if (mesh == null) return;
     setState(() => _isScanning = true);
     HapticFeedback.mediumImpact();
 
-    _meshService.addLog("📡 Re-initializing all sensors...");
+    mesh.addLog("📡 Re-initializing all sensors...");
 
     // 1. Сброс и старт Wi-Fi Mesh
     await NativeMeshService.forceReset();
     await Future.delayed(const Duration(seconds: 1));
-    await _meshService.startDiscovery(SignalType.mesh);
+    await mesh.startDiscovery(SignalType.mesh);
 
     // 2. Старт Bluetooth
-    await _meshService.startDiscovery(SignalType.bluetooth);
+    await mesh.startDiscovery(SignalType.bluetooth);
 
     // Таймер авто-выключения сканера через 30 сек
     Future.delayed(const Duration(seconds: 30), () {
@@ -97,12 +129,39 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
 
   @override
   Widget build(BuildContext context) {
+    if (_meshService == null) {
+      if (isCoreReady) {
+        setupSessionLocator(AppMode.REAL);
+        _meshService =
+            locator.isRegistered<MeshService>() ? locator<MeshService>() : null;
+      }
+      if (_meshService == null) {
+        return Scaffold(
+          backgroundColor: Colors.black,
+          body: SafeArea(
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const CircularProgressIndicator(
+                      color: AppColors.stealthOrange),
+                  const SizedBox(height: 16),
+                  Text('Initializing mesh...',
+                      style: TextStyle(color: Colors.white70)),
+                ],
+              ),
+            ),
+          ),
+        );
+      }
+    }
     final mesh = context.watch<MeshService>();
     final isLinked = mesh.isP2pConnected;
 
     return Scaffold(
       backgroundColor: Colors.black,
-      body: SafeArea( // 🛡️ Защита от вырезов камеры
+      body: SafeArea(
+        // 🛡️ Защита от вырезов камеры
         child: Column(
           children: [
             _buildTopHUD(isLinked),
@@ -121,13 +180,21 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
   Widget _buildTopHUD(bool isLinked) {
     final role = NetworkMonitor().currentRole;
     bool isOnline = role == MeshRole.BRIDGE;
+    int? hops;
+    if (locator.isRegistered<TacticalMeshOrchestrator>()) {
+      hops = locator<TacticalMeshOrchestrator>().myHops;
+    }
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
       decoration: BoxDecoration(
           color: const Color(0xFF0D0D0D),
-          border: Border(bottom: BorderSide(color: isOnline ? Colors.greenAccent : (isLinked ? Colors.cyanAccent : Colors.redAccent), width: 0.5))
-      ),
+          border: Border(
+              bottom: BorderSide(
+                  color: isOnline
+                      ? Colors.greenAccent
+                      : (isLinked ? Colors.cyanAccent : Colors.redAccent),
+                  width: 0.5))),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
@@ -135,9 +202,13 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                isOnline ? "SECURED UPLINK" : (isLinked ? "MESH ACTIVE" : "SILENT MODE"),
+                isOnline
+                    ? "SECURED UPLINK"
+                    : (isLinked ? "MESH ACTIVE" : "SILENT MODE"),
                 style: TextStyle(
-                  color: isOnline ? Colors.greenAccent : (isLinked ? Colors.cyanAccent : Colors.redAccent),
+                  color: isOnline
+                      ? Colors.greenAccent
+                      : (isLinked ? Colors.cyanAccent : Colors.redAccent),
                   fontSize: 14,
                   fontWeight: FontWeight.bold,
                   letterSpacing: 1.2,
@@ -147,6 +218,11 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
                 "Local grid synchronization active",
                 style: TextStyle(color: Colors.white24, fontSize: 8),
               ),
+              if (hops != null)
+                Text(
+                  "Hops: $hops${role == MeshRole.BRIDGE ? " (BRIDGE)" : ""}",
+                  style: const TextStyle(color: Colors.white38, fontSize: 10),
+                ),
             ],
           ),
           IconButton(
@@ -167,10 +243,10 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
           width: size,
           height: size,
           child: CustomPaint(
-          painter: _RadarPainter(
-            animationValue: _radarController.value,
-            scanAngle: _radarController.value * 2 * 3.14159, // Полный оборот
-          ),
+            painter: _RadarPainter(
+              animationValue: _radarController.value,
+              scanAngle: _radarController.value * 2 * 3.14159, // Полный оборот
+            ),
           ),
         );
       },
@@ -185,13 +261,20 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
         SizedBox(
           height: 100,
           child: mesh.nearbyNodes.isEmpty
-              ? Center(child: Text("NO ALLIES IN RANGE", style: TextStyle(fontFamily: 'Orbitron', fontWeight: FontWeight.bold, color: Colors.white10, fontSize: 12)))
+              ? Center(
+                  child: Text("NO ALLIES IN RANGE",
+                      style: TextStyle(
+                          fontFamily: 'Orbitron',
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white10,
+                          fontSize: 12)))
               : ListView.builder(
-            padding: const EdgeInsets.symmetric(horizontal: 20),
-            scrollDirection: Axis.horizontal,
-            itemCount: mesh.nearbyNodes.length,
-            itemBuilder: (context, i) => _AllyCard(node: mesh.nearbyNodes[i]),
-          ),
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  scrollDirection: Axis.horizontal,
+                  itemCount: mesh.nearbyNodes.length,
+                  itemBuilder: (context, i) =>
+                      _AllyCard(node: mesh.nearbyNodes[i]),
+                ),
         ),
         const SizedBox(height: 10),
         // Центральная тактическая кнопка
@@ -211,7 +294,13 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
       mainAxisSize: MainAxisSize.min,
       children: [
         if (_isAcousticTransmitting)
-          FadeIn(child: Text("⚡ EMITTING SONAR FLARE", style: TextStyle(fontFamily: 'Orbitron', fontWeight: FontWeight.bold, color: AppColors.sonarPurple, fontSize: 10))),
+          FadeIn(
+              child: Text("⚡ EMITTING SONAR FLARE",
+                  style: TextStyle(
+                      fontFamily: 'Orbitron',
+                      fontWeight: FontWeight.bold,
+                      color: AppColors.sonarPurple,
+                      fontSize: 10))),
         const SizedBox(height: 10),
         SizedBox(
           width: 160,
@@ -219,7 +308,8 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
           child: Stack(
             alignment: Alignment.center,
             children: [
-              if (_isScanning) _buildRadarAnimation(), // Радар прямо вокруг кнопки
+              if (_isScanning)
+                _buildRadarAnimation(), // Радар прямо вокруг кнопки
               GestureDetector(
                 onTap: _isScanning ? null : _startGlobalDiscovery,
                 child: Container(
@@ -227,8 +317,14 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
                   height: 90,
                   decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      color: _isScanning ? AppColors.gridCyan.withOpacity(0.05) : AppColors.surface,
-                      border: Border.all(color: _isScanning ? AppColors.gridCyan : AppColors.textDim, width: 2),
+                      color: _isScanning
+                          ? AppColors.gridCyan.withOpacity(0.05)
+                          : AppColors.surface,
+                      border: Border.all(
+                          color: _isScanning
+                              ? AppColors.gridCyan
+                              : AppColors.textDim,
+                          width: 2),
                       boxShadow: [
                         if (_isScanning)
                           BoxShadow(
@@ -249,7 +345,12 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
         ),
         const SizedBox(height: 15),
         Text(_isScanning ? "LISTENING FOR SIGNALS..." : "INITIALIZE SCAN",
-            style: TextStyle(fontFamily: 'Orbitron', fontWeight: FontWeight.bold, color: _isScanning ? AppColors.gridCyan : AppColors.textDim, fontSize: 10, letterSpacing: 2)),
+            style: TextStyle(
+                fontFamily: 'Orbitron',
+                fontWeight: FontWeight.bold,
+                color: _isScanning ? AppColors.gridCyan : AppColors.textDim,
+                fontSize: 10,
+                letterSpacing: 2)),
       ],
     );
   }
@@ -269,21 +370,51 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                "LOG TERMINAL",
-                style: TextStyle(
-                  fontFamily: 'Orbitron',
-                  color: Colors.white.withOpacity(0.5),
-                  fontSize: 10,
-                  letterSpacing: 1,
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      "LOG TERMINAL",
+                      style: TextStyle(
+                        fontFamily: 'Orbitron',
+                        color: Colors.white.withOpacity(0.5),
+                        fontSize: 10,
+                        letterSpacing: 1,
+                      ),
+                    ),
+                    Text(
+                      "Long-press to copy. Amber = MESH_DIAG (BLE/Wi‑Fi). Copy up to 1300 lines.",
+                      style: TextStyle(
+                        fontFamily: 'RobotoMono',
+                        color: Colors.white.withOpacity(0.35),
+                        fontSize: 9,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
                 ),
               ),
-              IconButton(
-                icon: const Icon(Icons.copy, color: Colors.greenAccent, size: 18),
-                tooltip: "Copy all logs",
-                onPressed: _copyAllLogs,
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
+              const SizedBox(width: 8),
+              Material(
+                color: Colors.amber.withOpacity(0.25),
+                borderRadius: BorderRadius.circular(8),
+                child: InkWell(
+                  onTap: _copyAllLogs,
+                  borderRadius: BorderRadius.circular(8),
+                  splashColor: Colors.amber.withOpacity(0.4),
+                  highlightColor: Colors.amber.withOpacity(0.2),
+                  child: Padding(
+                    padding: const EdgeInsets.all(8),
+                    child: Icon(
+                      Icons.copy,
+                      color: Colors.amber,
+                      size: 20,
+                    ),
+                  ),
+                ),
               ),
             ],
           ),
@@ -304,18 +435,29 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
                 : ListView.builder(
                     controller: _logScrollController,
                     itemCount: _terminalLogs.length,
-                    itemBuilder: (context, i) => Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 2),
-                      child: Text(
-                        "> ${_terminalLogs[i]}",
-                        style: TextStyle(
-                          fontFamily: 'RobotoMono',
-                          color: Colors.greenAccent.withOpacity(0.7),
-                          fontSize: 12, // Увеличили с 10 до 12
-                          height: 1.4, // Увеличили межстрочный интервал для читаемости
+                    itemBuilder: (context, i) {
+                      final line = _terminalLogs[i];
+                      final lineText = "> $line";
+                      final isDiag = line.contains('MESH_DIAG');
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2),
+                        child: InkWell(
+                          onLongPress: () => _copyLogLine(lineText),
+                          child: SelectableText(
+                            lineText,
+                            style: TextStyle(
+                              fontFamily: 'RobotoMono',
+                              color: isDiag
+                                  ? Colors.amber.withOpacity(0.95)
+                                  : Colors.greenAccent.withOpacity(0.7),
+                              fontSize: isDiag ? 11.5 : 12,
+                              height: 1.4,
+                              fontWeight: isDiag ? FontWeight.w500 : null,
+                            ),
+                          ),
                         ),
-                      ),
-                    ),
+                      );
+                    },
                   ),
           ),
         ],
@@ -323,16 +465,55 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
     );
   }
 
+  /// Копирование одной строки (удобно для GATT 133 и др.)
+  Future<void> _copyLogLine(String lineText) async {
+    try {
+      if (lineText.isEmpty) return;
+      await Clipboard.setData(ClipboardData(text: lineText));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+              "Line copied to clipboard",
+              style: TextStyle(color: Colors.white),
+            ),
+            duration: const Duration(seconds: 1),
+            backgroundColor: Colors.green,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+      HapticFeedback.mediumImpact();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Copy failed: $e", style: const TextStyle(color: Colors.white)),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> _copyAllLogs() async {
+    final mesh = _meshService;
+    if (mesh == null) return;
     try {
       // Получаем все логи из MeshService (не только видимые)
-      final allLogs = _meshService.getAllLogsAsString();
-      
+      final allLogs = mesh.getAllLogsAsString();
+
       if (allLogs.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text("No logs to copy"),
-            duration: Duration(seconds: 2),
+          SnackBar(
+            content: const Text(
+              "No logs to copy",
+              style: TextStyle(color: Colors.white),
+            ),
+            duration: const Duration(seconds: 2),
+            backgroundColor: Colors.orange,
+            behavior: SnackBarBehavior.floating,
           ),
         );
         return;
@@ -340,25 +521,30 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
 
       // Копируем в буфер обмена
       await Clipboard.setData(ClipboardData(text: allLogs));
-      
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text("Copied ${_meshService.getAllLogs().length} log entries to clipboard"),
+            content: Text(
+              "Copied ${mesh.getLogsCopyCount()} log entries to clipboard",
+              style: const TextStyle(color: Colors.white),
+            ),
             duration: const Duration(seconds: 2),
             backgroundColor: Colors.green,
+            behavior: SnackBarBehavior.floating,
           ),
         );
       }
-      
+
       HapticFeedback.mediumImpact();
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text("Failed to copy logs: $e"),
+            content: Text("Failed to copy logs: $e", style: const TextStyle(color: Colors.white)),
             duration: const Duration(seconds: 3),
             backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
           ),
         );
       }
@@ -375,14 +561,21 @@ class _MeshHybridScreenState extends State<MeshHybridScreen> with SingleTickerPr
         mainAxisSize: MainAxisSize.min,
         children: [
           ListTile(
-            leading: const Icon(Icons.power_settings_new, color: Colors.redAccent),
+            leading:
+                const Icon(Icons.power_settings_new, color: Colors.redAccent),
             title: const Text("HALT ALL TRANSMISSIONS"),
-            onTap: () { _meshService.stopAll(); Navigator.pop(context); },
+            onTap: () {
+              _meshService?.stopAll();
+              Navigator.pop(context);
+            },
           ),
           ListTile(
             leading: const Icon(Icons.wifi_off, color: Colors.orangeAccent),
             title: const Text("RESET P2P STACK"),
-            onTap: () { NativeMeshService.forceReset(); Navigator.pop(context); },
+            onTap: () {
+              NativeMeshService.forceReset();
+              Navigator.pop(context);
+            },
           ),
         ],
       ),
@@ -405,8 +598,7 @@ class _AllyCard extends StatelessWidget {
         decoration: BoxDecoration(
             color: AppColors.cardBackground,
             borderRadius: BorderRadius.circular(15),
-            border: Border.all(color: AppColors.white05)
-        ),
+            border: Border.all(color: AppColors.white05)),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           mainAxisSize: MainAxisSize.min,
@@ -417,7 +609,10 @@ class _AllyCard extends StatelessWidget {
             Flexible(
               child: Text(
                 node.name,
-                style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold),
                 overflow: TextOverflow.ellipsis,
                 maxLines: 1,
               ),
@@ -428,25 +623,29 @@ class _AllyCard extends StatelessWidget {
               child: ElevatedButton(
                 style: ElevatedButton.styleFrom(
                     backgroundColor: AppColors.gridCyan.withOpacity(0.1),
-                    side: BorderSide(color: AppColors.gridCyan.withOpacity(0.5), width: 0.5),
-                    padding: EdgeInsets.zero
-                ),
+                    side: BorderSide(
+                        color: AppColors.gridCyan.withOpacity(0.5), width: 0.5),
+                    padding: EdgeInsets.zero),
                 onPressed: () async {
                   // 🔥 ПРЯМАЯ ПРОВЕРКА НАЖАТИЯ
                   print("👆 [UI] LINK button tapped for node: ${node.id}");
 
                   HapticFeedback.mediumImpact();
 
-                  // Передаем управление сервису
-                  await locator<MeshService>().connectToNode(node.id);
+                  // Передаем управление сервису (если зарегистрирован)
+                  if (locator.isRegistered<MeshService>()) {
+                    await locator<MeshService>().connectToNode(node.id);
+                  }
                 }, // Вот здесь была пропущена запятая
                 child: context.watch<MeshService>().isTransferring
                     ? const SizedBox(
-                    width: 12,
-                    height: 12,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.gridCyan)
-                )
-                    : const Text("LINK", style: TextStyle(fontSize: 8, fontWeight: FontWeight.bold)),
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2, color: AppColors.gridCyan))
+                    : const Text("LINK",
+                        style: TextStyle(
+                            fontSize: 8, fontWeight: FontWeight.bold)),
               ),
             )
           ],
@@ -487,8 +686,10 @@ class _RadarPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1;
 
-    canvas.drawLine(Offset(center.dx, 0), Offset(center.dx, size.height), linePaint);
-    canvas.drawLine(Offset(0, center.dy), Offset(size.width, center.dy), linePaint);
+    canvas.drawLine(
+        Offset(center.dx, 0), Offset(center.dx, size.height), linePaint);
+    canvas.drawLine(
+        Offset(0, center.dy), Offset(size.width, center.dy), linePaint);
 
     // 3. Расходящиеся волны (пульсация)
     final wavePaint = Paint()
@@ -499,7 +700,7 @@ class _RadarPainter extends CustomPainter {
       final waveProgress = (animationValue + i * 0.33) % 1.0;
       final waveRadius = maxRadius * waveProgress;
       final opacity = (1 - waveProgress) * 0.6;
-      
+
       wavePaint.color = Colors.cyanAccent.withOpacity(opacity);
       canvas.drawCircle(center, waveRadius, wavePaint);
     }
@@ -550,6 +751,7 @@ class _RadarPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_RadarPainter oldDelegate) {
-    return oldDelegate.animationValue != animationValue || oldDelegate.scanAngle != scanAngle;
+    return oldDelegate.animationValue != animationValue ||
+        oldDelegate.scanAngle != scanAngle;
   }
 }

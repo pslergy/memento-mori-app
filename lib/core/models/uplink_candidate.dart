@@ -9,8 +9,11 @@ class UplinkCandidate {
   /// Уникальный идентификатор кандидата (MAC адрес или ID)
   final String id;
   
-  /// MAC адрес устройства
+  /// MAC адрес устройства (меняется при BLE rotation; для подключения брать из свежего scan)
   final String mac;
+  
+  /// Стабильный UUID устройства (8-byte hash в hex из manufacturerData); для подключения по UUID, не по MAC
+  final String? deviceUuid;
   
   /// Роль устройства (BRIDGE или GHOST)
   final String role; // "BRIDGE" или "GHOST"
@@ -29,6 +32,12 @@ class UplinkCandidate {
   
   /// Зашифрованный токен BRIDGE (если известен)
   final String? bridgeToken;
+
+  /// Wi-Fi Direct passphrase (из manufacturerData BRIDGE, для connect)
+  final String? wifiDirectPassphrase;
+
+  /// Wi-Fi Direct network name / SSID (из manufacturerData BRIDGE)
+  final String? wifiDirectNetworkName;
   
   /// Время последнего подтверждения (когда кандидат был обнаружен)
   final DateTime lastSeen;
@@ -73,14 +82,15 @@ class UplinkCandidate {
   }
   
   /// Приоритет (выше = важнее)
-  /// BRIDGE всегда имеет приоритет выше GHOST
-  /// Внутри роли: выше confidence = выше приоритет
+  /// BRIDGE > RELAY > GHOST. Внутри роли: выше confidence = выше приоритет.
   int get priority {
     if (role == "BRIDGE") {
       return (1000 + (confidence * 100)).toInt(); // BRIDGE: 1000-1100
-    } else {
-      return (confidence * 100).toInt(); // GHOST: 0-100
     }
+    if (role == "RELAY") {
+      return (500 + (confidence * 100)).toInt(); // RELAY: 500-600
+    }
+    return (confidence * 100).toInt(); // GHOST: 0-100
   }
   
   /// Проверка, валиден ли кандидат (не истёк ли TTL)
@@ -93,8 +103,11 @@ class UplinkCandidate {
   /// Проверка, является ли кандидат BRIDGE
   bool get isBridge => role == "BRIDGE" || hops == 0;
   
-  /// Проверка, является ли кандидат GHOST
-  bool get isGhost => role == "GHOST" || hops > 0;
+  /// Проверка, является ли кандидат RELAY (призрак-релеятор с GATT)
+  bool get isRelay => role == "RELAY";
+  
+  /// Проверка, является ли кандидат GHOST (не BRIDGE и не RELAY)
+  bool get isGhost => role == "GHOST" || (hops > 0 && role != "RELAY");
   
   /// Возраст кандидата в секундах
   int get ageSeconds => DateTime.now().difference(lastSeen).inSeconds;
@@ -109,12 +122,15 @@ class UplinkCandidate {
   UplinkCandidate({
     required this.id,
     required this.mac,
+    this.deviceUuid,
     required this.role,
     required this.hops,
     this.hasData = false,
     this.ip,
     this.port,
     this.bridgeToken,
+    this.wifiDirectPassphrase,
+    this.wifiDirectNetworkName,
     DateTime? lastSeen,
     DateTime? createdAt,
     this.confidence = 0.5,
@@ -128,12 +144,15 @@ class UplinkCandidate {
   
   /// Обновить кандидата новыми данными обнаружения
   UplinkCandidate copyWith({
+    String? mac,
     String? role,
     int? hops,
     bool? hasData,
     String? ip,
     int? port,
     String? bridgeToken,
+    String? wifiDirectPassphrase,
+    String? wifiDirectNetworkName,
     DateTime? lastSeen,
     double? confidence,
     String? discoverySource,
@@ -157,13 +176,16 @@ class UplinkCandidate {
     
     return UplinkCandidate(
       id: id,
-      mac: mac,
+      mac: mac ?? this.mac,
+      deviceUuid: deviceUuid,
       role: role ?? this.role,
       hops: hops ?? this.hops,
       hasData: hasData ?? this.hasData,
       ip: ip ?? this.ip,
       port: port ?? this.port,
       bridgeToken: bridgeToken ?? this.bridgeToken,
+      wifiDirectPassphrase: wifiDirectPassphrase ?? this.wifiDirectPassphrase,
+      wifiDirectNetworkName: wifiDirectNetworkName ?? this.wifiDirectNetworkName,
       lastSeen: lastSeen ?? DateTime.now(),
       createdAt: createdAt,
       confidence: newConfidence,
@@ -184,6 +206,8 @@ class UplinkCandidate {
     String? ip,
     int? port,
     String? bridgeToken,
+    String? wifiDirectPassphrase,
+    String? wifiDirectNetworkName,
   }) {
     String role = "GHOST";
     int hops = 99;
@@ -211,6 +235,10 @@ class UplinkCandidate {
         if (hops == 0) {
           role = "BRIDGE";
           confidence = extractedToken != null ? 0.9 : 0.6; // Высокая уверенность если есть token
+        } else if (parts.length >= 4 && parts[3] == "RELAY") {
+          role = "RELAY";
+          peerId = parts.length >= 5 ? parts[4] : "RL";
+          confidence = 0.6; // Призрак-релеятор (принимает GATT)
         } else {
           role = "GHOST";
           confidence = 0.5;
@@ -221,6 +249,8 @@ class UplinkCandidate {
     // 🔥 КРИТИЧНО: Проверка manufacturerData (fallback если имя пустое)
     // Для рандомизированных MAC на Huawei используем manufacturerData для определения BRIDGE
     String? logicalId;
+    String? parsedWifiPassphrase;
+    String? parsedWifiNetworkName;
     if (effectiveName.isEmpty && manufacturerData != null) {
       final mfData = manufacturerData[0xFFFF];
       if (mfData != null && mfData.length >= 2) {
@@ -229,11 +259,17 @@ class UplinkCandidate {
           role = "BRIDGE";
           hops = 0;
           
-          // 🔥 КРИТИЧНО: Извлекаем token из manufacturerData (для Huawei где localName пустое)
-          // Формат: [0x42, 0x52, ...token_bytes] = "BR" + token (первые 18 байт токена)
-          // Токен может быть обрезан из-за ограничения manufacturerData (до 18 байт)
+          // 🔥 КРИТИЧНО: Извлекаем token и passphrase из manufacturerData
+          // Формат: [0x42, 0x52, ...token, 0x7C, ...passphrase(8)] или [0x42, 0x52, ...token]
           if (mfData.length > 2) {
-            final tokenBytes = mfData.sublist(2); // Пропускаем первые 2 байта ("BR")
+            int tokenEnd = mfData.indexOf(0x7C, 2); // 0x7C = разделитель token|passphrase
+            final tokenBytes = tokenEnd > 2 ? mfData.sublist(2, tokenEnd) : mfData.sublist(2);
+            if (tokenEnd > 2 && mfData.length >= tokenEnd + 1 + 8) {
+              try {
+                final passphraseFromMf = utf8.decode(mfData.sublist(tokenEnd + 1, tokenEnd + 9)).trim();
+                if (passphraseFromMf.isNotEmpty) parsedWifiPassphrase = passphraseFromMf;
+              } catch (_) {}
+            }
             try {
               // Декодируем token как UTF-8
               final extractedTokenFromMf = utf8.decode(tokenBytes);
@@ -264,6 +300,11 @@ class UplinkCandidate {
             confidence = 0.6; // Средняя уверенность для manufacturerData без token
             print("⚠️ [UplinkCandidate] manufacturerData too short (${mfData.length} bytes), no token");
           }
+        } else if (mfData[0] == 0x52 && mfData[1] == 0x4C) {
+          // "RL" = RELAY (призрак-релеятор с GATT)
+          role = "RELAY";
+          hops = 255;
+          confidence = 0.5;
         } else if (mfData[0] == 0x47 && mfData[1] == 0x48) {
           // "GH" = GHOST
           role = "GHOST";
@@ -273,27 +314,53 @@ class UplinkCandidate {
       }
     }
     
-    // 🔥 КРИТИЧНО: Используем logical ID вместо MAC для идентификации BRIDGE
-    // Это решает проблему рандомизированных MAC на Huawei
-    final candidateId = logicalId ?? peerId;
-    
+    // 🔥 WI-FI DIRECT: Парсим passphrase из manufacturerData для BRIDGE (когда effectiveName не пустое)
+    if (role == "BRIDGE" && parsedWifiPassphrase == null && manufacturerData != null) {
+      final mfData = manufacturerData[0xFFFF];
+      if (mfData != null && mfData.length >= 12) {
+        final sepIdx = mfData.indexOf(0x7C, 2);
+        if (sepIdx > 2 && mfData.length >= sepIdx + 9) {
+          try {
+            final p = utf8.decode(mfData.sublist(sepIdx + 1, sepIdx + 9)).trim();
+            if (p.isNotEmpty) parsedWifiPassphrase = p;
+          } catch (_) {}
+        }
+      }
+    }
+
+    // 🔥 Device UUID: из manufacturerData GH/RL (bytes 2..10 = 8 bytes hash) — стабильный ID при ротации MAC
+    String? deviceUuidHex;
+    if (manufacturerData != null) {
+      final mf = manufacturerData[0xFFFF];
+      if (mf != null && mf.length >= 10 &&
+          ((mf[0] == 0x47 && mf[1] == 0x48) || (mf[0] == 0x52 && mf[1] == 0x4C))) {
+        deviceUuidHex = mf.sublist(2, 10).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+      }
+    }
+
+    // 🔥 КРИТИЧНО: Используем logical ID вместо MAC для идентификации BRIDGE; для GHOST — deviceUuid если есть
+    final candidateId = deviceUuidHex ?? logicalId ?? peerId;
+
     // Если есть service UUID - повышаем уверенность
     if (serviceUuids != null && serviceUuids.isNotEmpty) {
       confidence += 0.1;
     }
-    
+
     return UplinkCandidate(
-      id: candidateId, // Используем logical ID вместо MAC для BRIDGE
+      id: candidateId,
       mac: mac,
+      deviceUuid: deviceUuidHex,
       role: role,
       hops: hops,
       hasData: hasData,
       ip: ip,
       port: port,
-      bridgeToken: bridgeToken ?? extractedToken, // Используем извлеченный token
+      bridgeToken: bridgeToken ?? extractedToken,
+      wifiDirectPassphrase: wifiDirectPassphrase ?? parsedWifiPassphrase,
+      wifiDirectNetworkName: wifiDirectNetworkName ?? parsedWifiNetworkName,
       confidence: confidence.clamp(0.0, 1.0),
       discoverySources: {"BLE"},
-      ttlSeconds: role == "BRIDGE" ? 120 : 60, // BRIDGE живёт дольше
+      ttlSeconds: role == "BRIDGE" ? 120 : 60,
     );
   }
   

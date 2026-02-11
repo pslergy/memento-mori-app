@@ -5,6 +5,9 @@ import 'package:provider/provider.dart';
 import 'package:animate_do/animate_do.dart';
 import 'dart:math' as math;
 
+import '../../core/connection_status_panel.dart';
+import '../../core/decoy/app_bootstrap.dart';
+import '../../core/decoy/app_mode.dart';
 import '../../core/mesh_service.dart';
 import '../../core/locator.dart';
 import '../../core/models/signal_node.dart';
@@ -12,7 +15,9 @@ import '../../core/native_mesh_service.dart';
 import '../../core/ultrasonic_service.dart';
 import '../../core/network_monitor.dart';
 import '../../core/router/router_connection_service.dart';
+import 'router_management_screen.dart';
 import '../../core/api_service.dart';
+import '../../core/storage_service.dart';
 import '../theme/app_colors.dart';
 
 class MeshControlScreen extends StatefulWidget {
@@ -22,7 +27,8 @@ class MeshControlScreen extends StatefulWidget {
   State<MeshControlScreen> createState() => _MeshControlScreenState();
 }
 
-class _MeshControlScreenState extends State<MeshControlScreen> with TickerProviderStateMixin {
+class _MeshControlScreenState extends State<MeshControlScreen>
+    with TickerProviderStateMixin {
   late AnimationController _radarController;
   late AnimationController _pulseController;
   late AnimationController _glowController;
@@ -32,10 +38,16 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
   @override
   void initState() {
     super.initState();
-    _radarController = AnimationController(vsync: this, duration: const Duration(seconds: 3))..repeat();
-    _pulseController = AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat();
-    _glowController = AnimationController(vsync: this, duration: const Duration(milliseconds: 1500))..repeat(reverse: true);
-    
+    _radarController =
+        AnimationController(vsync: this, duration: const Duration(seconds: 3))
+          ..repeat();
+    _pulseController =
+        AnimationController(vsync: this, duration: const Duration(seconds: 2))
+          ..repeat();
+    _glowController = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 1500))
+      ..repeat(reverse: true);
+
     // Обновление статуса каждые 2 секунды
     _statusUpdateTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       if (mounted) setState(() {});
@@ -52,9 +64,10 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
   }
 
   void _logAction(String msg) {
+    if (!locator.isRegistered<MeshService>()) return;
     Future.microtask(() {
-      final mesh = locator<MeshService>();
-      mesh.addLog("[CHAIN] $msg");
+      if (!locator.isRegistered<MeshService>()) return;
+      locator<MeshService>().addLog("[CHAIN] $msg");
     });
   }
 
@@ -62,62 +75,114 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
     _logAction("🚨 SOS EXECUTION STARTED");
     HapticFeedback.vibrate();
 
-    final mesh = locator<MeshService>();
-    final api = locator<ApiService>();
+    final mesh =
+        locator.isRegistered<MeshService>() ? locator<MeshService>() : null;
+    final api =
+        locator.isRegistered<ApiService>() ? locator<ApiService>() : null;
+    String userId = 'GHOST';
+    if (api != null) userId = api.currentUserId;
+    if (userId.isEmpty) userId = (await _vaultUserId()) ?? 'GHOST';
 
-    // 🔥 МУЛЬТИКАНАЛЬНАЯ ОТПРАВКА: Cloud -> Mesh -> Sonar
     bool success = false;
-    
-    // 1. Пытаемся через Cloud API (с retry для Tecno)
-    try {
-      await api.sendAonymizedSOS();
-      success = true;
-      _logAction("✅ SOS sent via Cloud API");
-    } catch (e) {
-      _logAction("⚠️ Cloud SOS failed: $e");
+
+    // 1. Cloud API (если зарегистрирован)
+    if (api != null) {
+      try {
+        await api.sendAonymizedSOS();
+        success = true;
+        _logAction("✅ SOS sent via Cloud API");
+      } catch (e) {
+        _logAction("⚠️ Cloud SOS failed: $e");
+      }
     }
 
-    // 2. Fallback: Отправляем через Mesh (всегда работает, даже оффлайн)
-    try {
-      final userId = api.currentUserId;
-      final shortId = userId.length >= 4 ? userId.substring(0, 4) : userId;
-      await mesh.sendAuto(
-        content: "🚨 CRITICAL SOS: Nomad $shortId position compromised.",
-        chatId: "THE_BEACON_GLOBAL",
-        receiverName: "GLOBAL",
-      );
-      success = true;
-      _logAction("✅ SOS sent via Mesh");
-    } catch (e) {
-      _logAction("⚠️ Mesh SOS failed: $e");
+    // 2. Mesh (если зарегистрирован)
+    if (mesh != null) {
+      try {
+        final shortId = userId.length >= 4 ? userId.substring(0, 4) : userId;
+        await mesh.sendAuto(
+          content: "🚨 CRITICAL SOS: Nomad $shortId position compromised.",
+          chatId: "THE_BEACON_GLOBAL",
+          receiverName: "GLOBAL",
+        );
+        success = true;
+        _logAction("✅ SOS sent via Mesh");
+      } catch (e) {
+        _logAction("⚠️ Mesh SOS failed: $e");
+      }
     }
 
-    // 3. Fallback: Отправляем через Sonar (для максимального покрытия)
-    try {
-      final userId = api.currentUserId;
-      await locator<UltrasonicService>().transmitFrame("SOS:$userId");
-      success = true;
-      _logAction("✅ SOS sent via Sonar");
-    } catch (e) {
-      _logAction("⚠️ Sonar SOS failed: $e");
+    // 3. Sonar (если зарегистрирован)
+    if (locator.isRegistered<UltrasonicService>()) {
+      try {
+        await locator<UltrasonicService>().transmitFrame("SOS:$userId");
+        success = true;
+        _logAction("✅ SOS sent via Sonar");
+      } catch (e) {
+        _logAction("⚠️ Sonar SOS failed: $e");
+      }
     }
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(success ? "✅ EMERGENCY BROADCAST ACTIVE" : "⚠️ SOS SENT (some channels may have failed)"),
+          content: Text(success
+              ? "✅ EMERGENCY BROADCAST ACTIVE"
+              : (mesh == null && api == null
+                  ? "⚠️ Mesh/Cloud not available (Stealth mode)"
+                  : "⚠️ SOS SENT (some channels may have failed)")),
           backgroundColor: success ? AppColors.warningRed : Colors.orange,
         ),
       );
     }
 
-    if (!success) {
-      _logAction("❌ SOS FAILED on all channels");
+    if (!success) _logAction("❌ SOS FAILED on all channels");
+  }
+
+  Future<String?> _vaultUserId() async {
+    try {
+      return await Vault.read('user_id');
+    } catch (_) {
+      return null;
     }
+  }
+
+  /// Поднимает SESSION с текущим режимом (REAL/DECOY) и перестраивает экран — для призрака и бриджа одинаково.
+  void _ensureSessionThenRebuild() {
+    Future<void> run() async {
+      final mode = await resolveAppMode();
+      if (mode == AppMode.INVALID) return;
+      setupSessionLocator(mode);
+      if (mounted) setState(() {});
+    }
+    run();
   }
 
   @override
   Widget build(BuildContext context) {
+    if (!locator.isRegistered<MeshService>()) {
+      if (isCoreReady) {
+        // На призраке и бридже одинаково: поднимаем SESSION с текущим режимом
+        _ensureSessionThenRebuild();
+      }
+      if (!locator.isRegistered<MeshService>()) {
+        return Scaffold(
+          appBar: AppBar(title: const Text('THE CHAIN')),
+          backgroundColor: AppColors.background,
+          body: const Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(color: AppColors.stealthOrange),
+                SizedBox(height: 16),
+                Text('Initializing mesh...',
+                    style: TextStyle(color: Colors.white70)),
+              ],
+            ),
+          ),
+        );
+      }
+    }
     final mesh = context.watch<MeshService>();
     final nodes = mesh.nearbyNodes;
     final role = NetworkMonitor().currentRole;
@@ -130,6 +195,7 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
         child: Column(
           children: [
             _buildTopHeader(mesh, role, connectedRouter),
+            const ConnectionStatusPanel(),
             Expanded(
               child: SingleChildScrollView(
                 physics: const BouncingScrollPhysics(),
@@ -160,8 +226,10 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
 
   Widget _buildTopHeader(MeshService mesh, MeshRole role, connectedRouter) {
     final isOnline = role == MeshRole.BRIDGE;
-    final themeColor = isOnline ? AppColors.cloudGreen : (mesh.isP2pConnected ? AppColors.gridCyan : AppColors.stealthOrange);
-    
+    final themeColor = isOnline
+        ? AppColors.cloudGreen
+        : (mesh.isP2pConnected ? AppColors.gridCyan : AppColors.stealthOrange);
+
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
@@ -173,20 +241,25 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
-        border: Border(bottom: BorderSide(color: themeColor.withOpacity(0.3), width: 1)),
+        border: Border(
+            bottom: BorderSide(color: themeColor.withOpacity(0.3), width: 1)),
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          _buildStatCard("ROLE", isOnline ? "BRIDGE" : "GHOST", themeColor, Icons.cloud),
-          _buildStatCard("NODES", "${mesh.nearbyNodes.length}", AppColors.gridCyan, Icons.hub),
-          _buildStatCard("STEALTH", mesh.isPowerSaving ? "ON" : "OFF", AppColors.stealthOrange, Icons.visibility_off),
+          _buildStatCard(
+              "ROLE", isOnline ? "BRIDGE" : "GHOST", themeColor, Icons.cloud),
+          _buildStatCard("NODES", "${mesh.nearbyNodes.length}",
+              AppColors.gridCyan, Icons.hub),
+          _buildStatCard("STEALTH", mesh.isPowerSaving ? "ON" : "OFF",
+              AppColors.stealthOrange, Icons.visibility_off),
         ],
       ),
     );
   }
 
-  Widget _buildStatCard(String label, String value, Color color, IconData icon) {
+  Widget _buildStatCard(
+      String label, String value, Color color, IconData icon) {
     return FadeInUp(
       duration: const Duration(milliseconds: 300),
       child: Container(
@@ -367,12 +440,14 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
                 ),
                 borderRadius: BorderRadius.circular(20),
                 border: Border.all(
-                  color: AppColors.warningRed.withOpacity(0.5 + _pulseController.value * 0.3),
+                  color: AppColors.warningRed
+                      .withOpacity(0.5 + _pulseController.value * 0.3),
                   width: 2,
                 ),
                 boxShadow: [
                   BoxShadow(
-                    color: AppColors.warningRed.withOpacity(0.3 * _pulseController.value),
+                    color: AppColors.warningRed
+                        .withOpacity(0.3 * _pulseController.value),
                     blurRadius: 20,
                     spreadRadius: 5,
                   ),
@@ -453,9 +528,15 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
               child: _buildChannelCard(
                 icon: Icons.bluetooth,
                 label: "BLE GATT",
-                status: mesh.nearbyNodes.where((n) => n.type == SignalType.bluetooth).isNotEmpty ? "ACTIVE" : "IDLE",
+                status: mesh.nearbyNodes
+                        .where((n) => n.type == SignalType.bluetooth)
+                        .isNotEmpty
+                    ? "ACTIVE"
+                    : "IDLE",
                 color: AppColors.sonarPurple,
-                isActive: mesh.nearbyNodes.where((n) => n.type == SignalType.bluetooth).isNotEmpty,
+                isActive: mesh.nearbyNodes
+                    .where((n) => n.type == SignalType.bluetooth)
+                    .isNotEmpty,
                 onTap: () {
                   mesh.startDiscovery(SignalType.bluetooth);
                 },
@@ -475,9 +556,16 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
                 isActive: _isAcousticTransmitting,
                 onTap: () async {
                   setState(() => _isAcousticTransmitting = true);
-                  await locator<UltrasonicService>().transmitFrame("LNK:${mesh.apiService.currentUserId}");
+                  final userId = locator.isRegistered<ApiService>()
+                      ? locator<ApiService>().currentUserId
+                      : (await _vaultUserId()) ?? 'GHOST';
+                  if (locator.isRegistered<UltrasonicService>()) {
+                    await locator<UltrasonicService>()
+                        .transmitFrame("LNK:$userId");
+                  }
                   Future.delayed(const Duration(seconds: 2), () {
-                    if (mounted) setState(() => _isAcousticTransmitting = false);
+                    if (mounted)
+                      setState(() => _isAcousticTransmitting = false);
                   });
                 },
               ),
@@ -491,7 +579,9 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
                 color: AppColors.cloudGreen,
                 isActive: connectedRouter != null,
                 onTap: () {
-                  // TODO: Открыть экран управления роутерами
+                  Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const RouterManagementScreen()),
+                  );
                 },
               ),
             ),
@@ -546,7 +636,8 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
                 animation: _pulseController,
                 builder: (context, child) {
                   return Transform.scale(
-                    scale: isActive ? 1.0 + (_pulseController.value * 0.1) : 1.0,
+                    scale:
+                        isActive ? 1.0 + (_pulseController.value * 0.1) : 1.0,
                     child: Icon(
                       icon,
                       color: isActive ? color : AppColors.textDim,
@@ -613,13 +704,31 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
               ),
             ),
             const SizedBox(height: 15),
-            _buildStatRow("Role", role == MeshRole.BRIDGE ? "BRIDGE (Online)" : "GHOST (Offline)", role == MeshRole.BRIDGE ? AppColors.cloudGreen : AppColors.stealthOrange),
+            _buildStatRow(
+                "Role",
+                role == MeshRole.BRIDGE ? "BRIDGE (Online)" : "GHOST (Offline)",
+                role == MeshRole.BRIDGE
+                    ? AppColors.cloudGreen
+                    : AppColors.stealthOrange),
             const SizedBox(height: 10),
-            _buildStatRow("Wi-Fi Direct", mesh.isP2pConnected ? "Connected" : "Disconnected", mesh.isP2pConnected ? AppColors.gridCyan : AppColors.textDim),
+            _buildStatRow(
+                "Wi-Fi Direct",
+                mesh.isP2pConnected ? "Connected" : "Disconnected",
+                mesh.isP2pConnected ? AppColors.gridCyan : AppColors.textDim),
             const SizedBox(height: 10),
-            _buildStatRow("Router", connectedRouter != null ? connectedRouter.ssid : "None", connectedRouter != null ? AppColors.cloudGreen : AppColors.textDim),
+            _buildStatRow(
+                "Router",
+                connectedRouter != null ? connectedRouter.ssid : "None",
+                connectedRouter != null
+                    ? AppColors.cloudGreen
+                    : AppColors.textDim),
             const SizedBox(height: 10),
-            _buildStatRow("Power Saving", mesh.isPowerSaving ? "Enabled" : "Disabled", mesh.isPowerSaving ? AppColors.stealthOrange : AppColors.gridCyan),
+            _buildStatRow(
+                "Power Saving",
+                mesh.isPowerSaving ? "Enabled" : "Disabled",
+                mesh.isPowerSaving
+                    ? AppColors.stealthOrange
+                    : AppColors.gridCyan),
           ],
         ),
       ),
@@ -788,11 +897,14 @@ class _MeshControlScreenState extends State<MeshControlScreen> with TickerProvid
       ),
       child: OutlinedButton.icon(
         style: OutlinedButton.styleFrom(
-          side: BorderSide(color: AppColors.warningRed.withOpacity(0.5), width: 1.5),
+          side: BorderSide(
+              color: AppColors.warningRed.withOpacity(0.5), width: 1.5),
           minimumSize: const Size(double.infinity, 50),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         ),
-        icon: const Icon(Icons.power_settings_new, color: AppColors.warningRed, size: 18),
+        icon: const Icon(Icons.power_settings_new,
+            color: AppColors.warningRed, size: 18),
         label: Text(
           "HALT ALL SIGNALS",
           style: TextStyle(

@@ -2,7 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../ui/terminal_style.dart';
 import '../theme/app_colors.dart';
+import '../../core/decoy/gate_storage.dart';
+import '../../core/decoy/mode_resolver.dart';
+import '../../core/decoy/app_mode.dart';
 import '../../warning_screen.dart';
+import '../../features/camouflage/calculator_gate.dart';
 
 /// 📚 Onboarding Tutorial Screen
 /// Brief tutorial after registration explaining BRIDGE/GHOST and mesh network
@@ -77,6 +81,8 @@ Messages are automatically routed through the mesh network. If internet is avail
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('tutorial_completed', true);
     if (!mounted) return;
+    await _ensureGateCodesSet();
+    if (!mounted) return;
     _navigateToMain();
   }
 
@@ -84,7 +90,19 @@ Messages are automatically routed through the mesh network. If internet is avail
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('tutorial_completed', true);
     if (!mounted) return;
+    await _ensureGateCodesSet();
+    if (!mounted) return;
     _navigateToMain();
+  }
+
+  /// Задаёт коды доступа калькулятора, если ещё не заданы (чтобы 3301 открывал приложение, а не Grid Access).
+  Future<void> _ensureGateCodesSet() async {
+    final hasHashes = await hasGateHashes();
+    if (hasHashes) return;
+    final primary = hashAccessCode('3301');
+    final alternative = hashAccessCode('0000');
+    await saveGateHashes(primary, alternative);
+    await saveGateMode(AppMode.REAL);
   }
 
   void _navigateToMain() {
@@ -104,8 +122,12 @@ Messages are automatically routed through the mesh network. If internet is avail
         return;
       }
     }
-    // Fallback navigation
-    Navigator.of(context).pushNamedAndRemoveUntil('/', (_) => false);
+    // После онбординга — сразу камуфляж (калькулятор). Не переходим на Splash:
+    // Splash вызывает setupCoreLocator() → locator.reset() → новый Vault, и чтение auth_token даёт null.
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const CalculatorGate()),
+      (_) => false,
+    );
   }
 
   @override

@@ -9,6 +9,7 @@ Independent research project exploring resilient mobile mesh networking under OS
 [![Open Source](https://img.shields.io/badge/Open%20Source-Yes-success.svg)]()
 [![Platform](https://img.shields.io/badge/Platform-Android-green.svg)](https://flutter.dev)
 [![Status](https://img.shields.io/badge/Status-Research%20Alpha-orange.svg)]()
+[![Website](https://img.shields.io/badge/Website-GitHub%20Pages-blue.svg)](https://pslergy.github.io/memento-mori-app/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)
 [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-pink.svg)](https://github.com/sponsors/pslergy)
 
@@ -122,6 +123,16 @@ The app dynamically switches transport layers based on tactical conditions:
 * **Architecture:** Clean Architecture + BLoC
 * **Database:** SQLite (FFI, WAL mode)
 * **Crypto:** pointycastle / cryptography (Ed25519, AES-GCM)
+
+---
+
+## 🌐 Project website
+
+The project has a static site (mission, status, use cases, roadmap) hosted on **GitHub Pages**:
+
+**https://pslergy.github.io/memento-mori-app/**
+
+Source: `docs/` (and `website/` as the editing source; run `scripts/sync-website-to-docs.ps1` to update `docs/`). To enable or change the URL: repo **Settings → Pages → Source**: Deploy from branch, branch `main`, folder `/docs`.
 
 ---
 

@@ -308,6 +308,18 @@ class _FriendsListScreenState extends State<FriendsListScreen> {
 
   Future<void> _handleFriendResponse(String friendId, String status) async {
     try {
+      // Облако: принять/отклонить на бэкенде (requestId = id отправителя заявки)
+      final api = locator<ApiService>();
+      try {
+        if (status == 'accepted') {
+          await api.acceptFriendRequest(friendId);
+        } else {
+          await api.rejectFriendRequest(friendId);
+        }
+      } catch (_) {
+        // Нет сети или не авторизован — продолжаем только локально и по mesh
+      }
+
       await _db.updateFriendStatus(
         friendId,
         status,
@@ -318,7 +330,7 @@ class _FriendsListScreenState extends State<FriendsListScreen> {
       final mesh = locator<MeshService>();
       final response = {
         'type': 'FRIEND_RESPONSE',
-        'senderId': locator<ApiService>().currentUserId,
+        'senderId': api.currentUserId,
         'receiverId': friendId,
         'status': status,
         'timestamp': DateTime.now().millisecondsSinceEpoch,

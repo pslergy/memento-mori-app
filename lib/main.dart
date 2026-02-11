@@ -1,31 +1,23 @@
-import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:memento_mori_app/core/local_db_service.dart';
-import 'package:memento_mori_app/l10n/app_localizations.dart';
-import 'package:memento_mori_app/core/http_override.dart';
-import 'package:memento_mori_app/core/api_service.dart';
-import 'package:memento_mori_app/splash_screen.dart';
-import 'package:provider/provider.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:provider/provider.dart';
 
-import 'core/MeshOrchestrator.dart';
-import 'core/background_service.dart';
-import 'core/gossip_manager.dart';
+import 'core/app_navigator_key.dart';
+import 'core/decoy/app_bootstrap.dart';
+import 'l10n/app_localizations.dart';
+import 'core/decoy/app_mode.dart';
+import 'core/decoy/timed_panic_lifecycle_bridge.dart';
 import 'core/locator.dart';
-import 'core/mesh_permission_screen.dart';
 import 'core/mesh_service.dart';
-import 'core/native_mesh_service.dart';
-import 'core/websocket_service.dart';
-
+import 'core/permission_gate.dart';
 
 Future<String> _writeCrash(Object error, StackTrace stack) async {
   try {
     final dir = await getApplicationSupportDirectory();
-    final file = File('${dir.path}/crash_${DateTime.now().millisecondsSinceEpoch}.log');
+    final file =
+        File('${dir.path}/crash_${DateTime.now().millisecondsSinceEpoch}.log');
     await file.writeAsString('ERROR: $error\n\n$stack');
     return file.path;
   } catch (_) {
@@ -36,37 +28,62 @@ Future<String> _writeCrash(Object error, StackTrace stack) async {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Глобальный перехват Flutter-ошибок с записью в файл
   FlutterError.onError = (FlutterErrorDetails details) async {
     await _writeCrash(details.exception, details.stack ?? StackTrace.current);
     FlutterError.dumpErrorToConsole(details);
   };
 
-  setupLocator();
-
-  final bool isFirstLaunch = await LocalDatabaseService().isFirstLaunch();
+  // Staged DI: CORE + SESSION registered before runApp so Provider<MeshService> and all screens can resolve without crash.
+  final AppMode mode = await resolveAppMode();
+  if (mode == AppMode.INVALID) {
+    runApp(const _GatePlaceholder());
+    return;
+  }
+  setupLocatorSafe();
+  setupCoreLocator(mode);
+  setupSessionLocator(mode);
 
   runApp(
     MultiProvider(
       providers: [
-        ChangeNotifierProvider.value(value: locator<MeshService>()),
+        ChangeNotifierProvider<MeshService>(
+          create: (_) => locator<MeshService>(),
+        ),
       ],
-      child: MyApp(isFirstLaunch: isFirstLaunch),
+      child: TimedPanicLifecycleBridge(
+        child: MyApp(mode: mode),
+      ),
     ),
   );
 }
 
-class MyApp extends StatelessWidget {
-  final bool isFirstLaunch;
-  const MyApp({super.key, required this.isFirstLaunch});
+/// Placeholder when authentication fails. No mode-specific wording.
+class _GatePlaceholder extends StatelessWidget {
+  const _GatePlaceholder();
 
   @override
   Widget build(BuildContext context) {
-    // 🔥 FIX: Глобально скрываем системную навигацию для всех экранов
+    return MaterialApp(
+      theme: ThemeData.dark(),
+      home: Scaffold(
+        body: Center(
+            child: Text('Access required',
+                style: TextStyle(color: Colors.grey[400]))),
+      ),
+    );
+  }
+}
+
+class MyApp extends StatelessWidget {
+  final AppMode mode;
+  const MyApp({super.key, required this.mode});
+
+  @override
+  Widget build(BuildContext context) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       SystemChrome.setEnabledSystemUIMode(
         SystemUiMode.manual,
-        overlays: [SystemUiOverlay.top], // Показываем только статус-бар
+        overlays: [SystemUiOverlay.top],
       );
       SystemChrome.setSystemUIOverlayStyle(
         const SystemUiOverlayStyle(
@@ -77,12 +94,16 @@ class MyApp extends StatelessWidget {
         ),
       );
     });
-    
+
     return MaterialApp(
+      navigatorKey: appNavigatorKey,
       title: 'Memento Mori',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark().copyWith(scaffoldBackgroundColor: const Color(0xFF121212)),
-      home: isFirstLaunch ? const MeshPermissionScreen() : const SplashScreen(),
+      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      theme: ThemeData.dark()
+          .copyWith(scaffoldBackgroundColor: const Color(0xFF121212)),
+      home: PermissionGate(mode: mode),
     );
   }
 }
@@ -104,12 +125,20 @@ class ErrorView extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text("🚨 CRITICAL CORE FAULT",
-                    style: TextStyle(color: Colors.red, fontSize: 22, fontWeight: FontWeight.bold)),
+                    style: TextStyle(
+                        color: Colors.red,
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold)),
                 const SizedBox(height: 20),
-                Text(error, style: const TextStyle(color: Colors.orange, fontWeight: FontWeight.bold)),
+                Text(error,
+                    style: const TextStyle(
+                        color: Colors.orange, fontWeight: FontWeight.bold)),
                 const Divider(color: Colors.white24),
                 Text(stack,
-                    style: const TextStyle(color: Colors.greenAccent, fontSize: 10, fontFamily: 'monospace')),
+                    style: const TextStyle(
+                        color: Colors.greenAccent,
+                        fontSize: 10,
+                        fontFamily: 'monospace')),
               ],
             ),
           ),

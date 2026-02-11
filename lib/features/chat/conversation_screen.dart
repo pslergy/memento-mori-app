@@ -11,14 +11,19 @@ import 'package:memento_mori_app/core/websocket_service.dart';
 import 'package:memento_mori_app/core/network_monitor.dart';
 import 'package:memento_mori_app/core/security_service.dart';
 
+import '../../core/decoy/app_mode.dart';
+import '../../core/decoy/timed_panic_controller.dart';
+import '../../core/decoy/vault_interface.dart';
 import '../../core/encryption_service.dart';
 import '../../core/local_db_service.dart';
 import '../../core/locator.dart';
 import '../../core/mesh_service.dart';
+import '../../core/room_id_normalizer.dart';
 import '../../core/native_mesh_service.dart';
 import '../../core/message_status.dart';
 import '../../core/room_state.dart';
 import '../../core/room_state.dart' show RoomStateHelper;
+import '../../core/module_status_panel.dart';
 import '../../ghost_input/ghost_controller.dart';
 import '../../ghost_input/ghost_keyboard.dart';
 import '../../dev_tools/room_timeline_debugger.dart';
@@ -136,7 +141,6 @@ class _ConversationScreenState extends State<ConversationScreen> {
   final ApiService _apiService = ApiService();
   final Set<String> _processedIds = {};
 
-
   StreamSubscription? _socketSubscription;
   StreamSubscription? _meshSubscription;
   String? _chatId;
@@ -149,9 +153,26 @@ class _ConversationScreenState extends State<ConversationScreen> {
   bool _isSending = false;
   RoomState _roomState = RoomState.active;
 
+  PanicPhase _panicPhase = PanicPhase.normal;
+  TimedPanicController? _panicController;
+
+  void _onPanicPhaseChanged() {
+    if (mounted && _panicController != null) {
+      setState(() {
+        _panicPhase = _panicController!.phase;
+        if (_panicPhase != PanicPhase.normal) _isKeyboardVisible = false;
+      });
+    }
+  }
+
   @override
   void initState() {
     super.initState();
+    if (locator.isRegistered<TimedPanicController>()) {
+      _panicController = locator<TimedPanicController>();
+      _panicPhase = _panicController!.phase;
+      _panicController!.addListener(_onPanicPhaseChanged);
+    }
     // 🔥 FIX: Скрываем системную навигацию при инициализации экрана чата
     SystemChrome.setEnabledSystemUIMode(
       SystemUiMode.manual,
@@ -166,6 +187,13 @@ class _ConversationScreenState extends State<ConversationScreen> {
       ),
     );
     SecurityService.enableSecureMode(); // Защита от скриншотов
+    // Ensure SESSION (ApiService, MeshService) so locator<> never throws on this screen.
+    if (!locator.isRegistered<MeshService>()) {
+      if (!locator.isRegistered<VaultInterface>()) {
+        setupCoreLocator(AppMode.REAL);
+      }
+      setupSessionLocator(AppMode.REAL);
+    }
     _initializeChat();
     _updateRoomState();
     // Слушаем изменения сетевого статуса
@@ -173,11 +201,19 @@ class _ConversationScreenState extends State<ConversationScreen> {
   }
 
   void _updateRoomState() {
+    if (!locator.isRegistered<MeshService>()) {
+      if (mounted)
+        setState(() {
+          _roomState = RoomStateHelper.fromNetworkStatus(
+              hasInternet: false, isSyncing: false);
+        });
+      return;
+    }
     final networkMonitor = NetworkMonitor();
     final hasInternet = networkMonitor.currentRole == MeshRole.BRIDGE;
     final mesh = locator<MeshService>();
     final isSyncing = mesh.isP2pConnected;
-    
+
     if (mounted) {
       setState(() {
         _roomState = RoomStateHelper.fromNetworkStatus(
@@ -190,19 +226,20 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   Future<void> _initializeChat() async {
     final db = LocalDatabaseService();
-    final api = locator<ApiService>();
-
-    // 1. ЛИЧНОСТЬ: Кто я сегодня?
-    _currentUserId = api.currentUserId;
+    // OFFLINE SAFE: единый источник user_id (Cloud или Ghost). BEACON FIX: после выхода/входа Ghost должен видеть свои сообщения.
+    _currentUserId = await getCurrentUserIdSafe();
+    if (_currentUserId == null || _currentUserId!.isEmpty) {
+      if (mounted) setState(() => _isLoadingHistory = false);
+      return;
+    }
 
     // 2. УНИФИКАЦИЯ КАНАЛА (The ID Unifier)
-    if (widget.friendId == "GLOBAL" || widget.chatRoomId == "THE_BEACON_GLOBAL") {
+    if (widget.friendId == "GLOBAL" ||
+        widget.chatRoomId == "THE_BEACON_GLOBAL") {
       _chatId = "THE_BEACON_GLOBAL"; // Единый ID для всей планеты
     } else {
-      // Для лички сортируем ID, чтобы у обоих участников ID комнаты СОВПАЛ
-      List<String> ids = [_currentUserId!, widget.friendId];
-      ids.sort();
-      _chatId = "GHOST_${ids[0]}_${ids[1]}";
+      _chatId =
+          RoomIdNormalizer.canonicalDmRoomId(_currentUserId!, widget.friendId);
     }
 
     // 3. МГНОВЕННЫЙ ЦИКЛ SQLITE
@@ -221,34 +258,44 @@ class _ConversationScreenState extends State<ConversationScreen> {
       if (payload['type'] == 'newMessage') {
         final msg = payload['message'];
         // Принимаем, если ID комнаты совпадает или это Глобал
-        if (msg['chatRoomId'] == _chatId || (msg['chatRoomId'] == "THE_BEACON_GLOBAL" && _chatId == "THE_BEACON_GLOBAL")) {
+        if (msg['chatRoomId'] == _chatId ||
+            (msg['chatRoomId'] == "THE_BEACON_GLOBAL" &&
+                _chatId == "THE_BEACON_GLOBAL")) {
           _processMessagePacket(msg, fromCloud: true);
         }
       }
     });
 
     // --- 👻 КАНАЛ 2: MESH (Gossip/P2P) ---
-    _meshSubscription = locator<MeshService>().messageStream.listen((packet) {
-      final String incomingChatId = packet['chatId'] ?? "";
-      final String senderId = packet['senderId'] ?? "";
+    if (locator.isRegistered<MeshService>()) {
+      _meshSubscription = locator<MeshService>().messageStream.listen((packet) {
+        final String incomingChatId = (packet['chatId'] ?? "").toString();
+        final String senderId = (packet['senderId'] ?? "").toString();
 
-      // Логика фильтрации: Пакет наш, если это Глобал или прямая личка
-      bool isMatch = incomingChatId == _chatId ||
-          (incomingChatId == "THE_BEACON_GLOBAL" && _chatId == "THE_BEACON_GLOBAL") ||
-          senderId == widget.friendId;
+        // Нормализация ID в ядре: сравнение по каноническому roomId (GHOST_MAC_MAC)
+        bool isMatch = RoomIdNormalizer.roomIdsMatch(incomingChatId, _chatId) ||
+            (incomingChatId.toUpperCase() == "THE_BEACON_GLOBAL" &&
+                _chatId == "THE_BEACON_GLOBAL") ||
+            RoomIdNormalizer.normalizePeerId(senderId) ==
+                RoomIdNormalizer.normalizePeerId(widget.friendId);
 
-      if (isMatch) {
-        _processMessagePacket(packet, fromCloud: false);
-      }
-    });
+        if (isMatch) {
+          _processMessagePacket(packet, fromCloud: false);
+        }
+      });
+    }
   }
 
-  void _processMessagePacket(Map<String, dynamic> data, {required bool fromCloud}) async {
+  void _processMessagePacket(Map<String, dynamic> data,
+      {required bool fromCloud}) async {
     final encryption = locator<EncryptionService>();
     final db = LocalDatabaseService();
 
     // 1. ДЕДУПЛИКАЦИЯ: канонический ID = h
-    final String msgId = data['h']?.toString() ?? data['clientTempId']?.toString() ?? data['id']?.toString() ?? '';
+    final String msgId = data['h']?.toString() ??
+        data['clientTempId']?.toString() ??
+        data['id']?.toString() ??
+        '';
     if (msgId.isEmpty || _processedIds.contains(msgId)) return;
     _processedIds.add(msgId);
 
@@ -267,7 +314,9 @@ class _ConversationScreenState extends State<ConversationScreen> {
       }
     }
 
-    final int tsMs = data['ts'] ?? data['timestamp'] ?? DateTime.now().millisecondsSinceEpoch;
+    final int tsMs = data['ts'] ??
+        data['timestamp'] ??
+        DateTime.now().millisecondsSinceEpoch;
     final createdAt = DateTime.fromMillisecondsSinceEpoch(tsMs);
 
     final newMessage = ChatMessage(
@@ -296,9 +345,11 @@ class _ConversationScreenState extends State<ConversationScreen> {
       });
       HapticFeedback.lightImpact(); // Вибрация при получении
       WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+      if (locator.isRegistered<TimedPanicController>()) {
+        locator<TimedPanicController>().recordActivity();
+      }
     }
   }
-
 
   void _listenToComms() {
     final db = LocalDatabaseService();
@@ -306,43 +357,59 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
     // --- 📡 КАНАЛ CLOUD (WebSocket) ---
     _socketSubscription = WebSocketService().stream.listen((data) async {
-      if (data['type'] == 'newMessage' && data['message']['chatRoomId'] == _chatId) {
+      if (data['type'] == 'newMessage' &&
+          data['message']['chatRoomId'] == _chatId) {
         _handleIncomingData(data['message'], isFromCloud: true);
       }
     });
 
     // --- 👻 КАНАЛ MESH (P2P) ---
-    _meshSubscription = locator<MeshService>().messageStream.listen((offlineData) async {
-      if (!mounted) return;
+    if (locator.isRegistered<MeshService>()) {
+      _meshSubscription =
+          locator<MeshService>().messageStream.listen((offlineData) async {
+        if (!mounted) return;
 
-      final String incomingChatId = (offlineData['chatId'] ?? "").toString().toUpperCase();
-      final String incomingSenderId = (offlineData['senderId'] ?? "").toString();
+        final String incomingChatId = (offlineData['chatId'] ?? "").toString();
+        final String incomingSenderId =
+            (offlineData['senderId'] ?? "").toString();
 
-      // Фильтр: Пакет для этой комнаты?
-      bool isMatch = incomingChatId == _chatId?.toUpperCase() ||
-          (incomingChatId == "THE_BEACON_GLOBAL" && widget.friendId == "GLOBAL") ||
-          incomingSenderId == widget.friendId;
+        // Нормализация ID в ядре: сравнение по каноническому roomId
+        bool isMatch = RoomIdNormalizer.roomIdsMatch(incomingChatId, _chatId) ||
+            (incomingChatId.toUpperCase() == "THE_BEACON_GLOBAL" &&
+                widget.friendId == "GLOBAL") ||
+            RoomIdNormalizer.normalizePeerId(incomingSenderId) ==
+                RoomIdNormalizer.normalizePeerId(widget.friendId);
 
-      if (isMatch) {
-        _handleIncomingData(offlineData, isFromCloud: false);
-      }
-    });
+        if (isMatch) {
+          _handleIncomingData(offlineData, isFromCloud: false);
+        } else if (incomingChatId.isNotEmpty &&
+            _chatId != null &&
+            incomingChatId.toUpperCase() != "THE_BEACON_GLOBAL") {
+          debugPrint(
+              "🚫 [UI] Filtered: Packet(${incomingChatId.length > 20 ? '${incomingChatId.substring(0, 20)}...' : incomingChatId}) doesn't match Screen($_chatId)");
+        }
+      });
+    }
   }
 
   // Единый обработчик входящих данных
-  void _handleIncomingData(Map<String, dynamic> data, {required bool isFromCloud}) async {
+  void _handleIncomingData(Map<String, dynamic> data,
+      {required bool isFromCloud}) async {
     final db = LocalDatabaseService();
     final encryption = locator<EncryptionService>();
 
     // Канонический ID: h, alias clientTempId/id (не генерировать из timestamp)
-    final String msgId = data['h']?.toString() ?? data['clientTempId']?.toString() ?? data['id']?.toString() ?? '';
+    final String msgId = data['h']?.toString() ??
+        data['clientTempId']?.toString() ??
+        data['id']?.toString() ??
+        '';
     if (msgId.isEmpty) return;
     final String senderId = data['senderId'] ?? "Unknown";
 
     // Если это наше собственное сообщение, полученное обратно - обновляем статус
     if (senderId == _currentUserId && msgId.startsWith("temp_")) {
-      final newStatus = isFromCloud 
-          ? MessageStatus.deliveredServer 
+      final newStatus = isFromCloud
+          ? MessageStatus.deliveredServer
           : MessageStatus.deliveredMesh;
       await db.updateMessageStatus(msgId, newStatus);
       // Обновляем статус в UI
@@ -350,11 +417,12 @@ class _ConversationScreenState extends State<ConversationScreen> {
         setState(() {
           final existingMsg = _messages.firstWhere(
             (m) => m.id == msgId,
-            orElse: () => ChatMessage(id: '', content: '', senderId: '', createdAt: DateTime.now()),
+            orElse: () => ChatMessage(
+                id: '', content: '', senderId: '', createdAt: DateTime.now()),
           );
           if (existingMsg.id == msgId) {
-            existingMsg.status = isFromCloud 
-                ? MessageStatus.deliveredServer 
+            existingMsg.status = isFromCloud
+                ? MessageStatus.deliveredServer
                 : MessageStatus.deliveredMesh;
           }
         });
@@ -380,9 +448,10 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
     final now = DateTime.now();
     // Сортировка по ts (время создания), не по времени приёма
-    final int tsMs = data['ts'] ?? data['timestamp'] ?? now.millisecondsSinceEpoch;
+    final int tsMs =
+        data['ts'] ?? data['timestamp'] ?? now.millisecondsSinceEpoch;
     final createdAt = DateTime.fromMillisecondsSinceEpoch(tsMs);
-    
+
     // Парсим vector clock если есть
     Map<String, int>? vectorClock;
     if (data['vectorClock'] != null) {
@@ -424,37 +493,68 @@ class _ConversationScreenState extends State<ConversationScreen> {
         });
       });
       WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+      if (locator.isRegistered<TimedPanicController>()) {
+        locator<TimedPanicController>().recordActivity();
+      }
     }
   }
 
   void _sendMessage() async {
+    if (locator.isRegistered<TimedPanicController>()) {
+      locator<TimedPanicController>().recordActivity();
+      if (_panicPhase != PanicPhase.normal) return;
+    }
     final text = _ghostController.value.trim();
     if (text.isEmpty || _isSending) return;
+    if (_currentUserId == null || _chatId == null) return;
 
     setState(() => _isSending = true);
-    final mesh = locator<MeshService>();
     final db = LocalDatabaseService();
+    if (!locator.isRegistered<MeshService>()) {
+      final now = DateTime.now();
+      final String tempId = "temp_${now.millisecondsSinceEpoch}";
+      final myMsg = ChatMessage(
+        id: tempId,
+        content: text,
+        senderId: _currentUserId!,
+        senderUsername: "Me",
+        createdAt: now,
+        status: MessageStatus.sentLocal,
+      );
+      setState(() => _messages.add(myMsg));
+      _ghostController.clear();
+      _scrollToBottom();
+      await db.saveMessage(myMsg, _chatId!);
+      await db.addToOutbox(myMsg, _chatId!);
+      if (mounted)
+        setState(() {
+          myMsg.status = "OFFLINE_QUEUED";
+          _isSending = false;
+        });
+      return;
+    }
+    final mesh = locator<MeshService>();
 
     final now = DateTime.now();
     final String tempId = "temp_${now.millisecondsSinceEpoch}";
-    
+
     // 🔄 vectorClock: используется ТОЛЬКО для синхронизации
     // "Какие сообщения мне не хватает", "до какого момента я в курсе"
     // НЕ используется для UI-логики или сортировки
     final vectorClock = <String, int>{
       _currentUserId!: now.millisecondsSinceEpoch,
     };
-    
+
     final myMsg = ChatMessage(
         id: tempId,
         content: text,
         senderId: _currentUserId!,
         senderUsername: "Me",
-      createdAt: now,
-      receivedAt: null, // 📊 receivedAt: только для статистики/отладки, НЕ для сортировки
-      vectorClock: vectorClock, // 🔄 Только для синхронизации
-        status: MessageStatus.sentLocal
-    );
+        createdAt: now,
+        receivedAt:
+            null, // 📊 receivedAt: только для статистики/отладки, НЕ для сортировки
+        vectorClock: vectorClock, // 🔄 Только для синхронизации
+        status: MessageStatus.sentLocal);
 
     // Сначала показываем у себя (Optimistic UI)
     setState(() => _messages.add(myMsg));
@@ -475,20 +575,21 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
       // Статус обновляется внутри sendAuto на DELIVERED_TO_NETWORK
       // Обновляем статус в зависимости от канала доставки
-      final newStatus = mesh.isP2pConnected 
-          ? MessageStatus.deliveredMesh 
-          : (NetworkMonitor().currentRole == MeshRole.BRIDGE 
-              ? MessageStatus.deliveredServer 
+      final newStatus = mesh.isP2pConnected
+          ? MessageStatus.deliveredMesh
+          : (NetworkMonitor().currentRole == MeshRole.BRIDGE
+              ? MessageStatus.deliveredServer
               : MessageStatus.deliveredMesh);
-      
-      setState(() {
-        myMsg.status = newStatus;
-      });
-      await db.updateMessageStatus(tempId, newStatus);
 
+      if (mounted) setState(() => myMsg.status = newStatus);
+      await db.updateMessageStatus(tempId, newStatus);
     } catch (e) {
-      setState(() => myMsg.status = "OFFLINE_QUEUED");
+      if (mounted) setState(() => myMsg.status = "OFFLINE_QUEUED");
       await db.addToOutbox(myMsg, _chatId!); // В инкубатор!
+      print(
+          "📤 [SEND] sendAuto failed → message in outbox, requesting auto-scan");
+      if (locator.isRegistered<MeshService>())
+        locator<MeshService>().requestAutoScanForOutbox();
     } finally {
       if (mounted) setState(() => _isSending = false);
     }
@@ -527,7 +628,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
                   Expanded(
                     child: Text(
                       widget.friendName,
-                      style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+                      style: const TextStyle(
+                          fontSize: 14, fontWeight: FontWeight.bold),
                     ),
                   ),
                   Text(
@@ -552,22 +654,44 @@ class _ConversationScreenState extends State<ConversationScreen> {
           ),
         ),
       ),
-      body: Column(
-        children: [
-          Expanded(
-            child: _isLoadingHistory
-                ? const Center(child: CircularProgressIndicator(color: Colors.cyanAccent))
-                : ListView.builder(
-              controller: _scrollController,
-              padding: const EdgeInsets.symmetric(vertical: 10),
-              itemCount: _messages.length,
-              itemBuilder: (context, index) => _buildMessageBubble(_messages[index]),
+      body: Listener(
+        onPointerDown: (_) {
+          if (locator.isRegistered<TimedPanicController>()) {
+            locator<TimedPanicController>().recordActivity();
+          }
+        },
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+              child: ModuleStatusPanel(compact: true),
             ),
-          ),
-          _buildInputZone(),
-          if (_isKeyboardVisible)
-            GhostKeyboard(controller: _ghostController, onSend: _sendMessage),
-        ],
+            Expanded(
+              child: _isLoadingHistory
+                  ? const Center(
+                      child:
+                          CircularProgressIndicator(color: Colors.cyanAccent))
+                  : NotificationListener<ScrollNotification>(
+                      onNotification: (_) {
+                        if (locator.isRegistered<TimedPanicController>()) {
+                          locator<TimedPanicController>().recordActivity();
+                        }
+                        return false;
+                      },
+                      child: ListView.builder(
+                        controller: _scrollController,
+                        padding: const EdgeInsets.symmetric(vertical: 10),
+                        itemCount: _messages.length,
+                        itemBuilder: (context, index) =>
+                            _buildMessageBubble(_messages[index]),
+                      ),
+                    ),
+            ),
+            _buildInputZone(),
+            if (_isKeyboardVisible && _panicPhase == PanicPhase.normal)
+              GhostKeyboard(controller: _ghostController, onSend: _sendMessage),
+          ],
+        ),
       ),
     );
   }
@@ -579,23 +703,33 @@ class _ConversationScreenState extends State<ConversationScreen> {
       child: Align(
         alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
         child: Column(
-          crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+          crossAxisAlignment:
+              isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
-            if (!isMe) Text("${message.senderUsername} >", style: const TextStyle(color: Colors.redAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+            if (!isMe)
+              Text("${message.senderUsername} >",
+                  style: const TextStyle(
+                      color: Colors.redAccent,
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold)),
             Container(
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
-                color: isMe ? Colors.redAccent.withOpacity(0.8) : const Color(0xFF1A1A1A),
+                color: isMe
+                    ? Colors.redAccent.withOpacity(0.8)
+                    : const Color(0xFF1A1A1A),
                 borderRadius: BorderRadius.circular(15),
                 border: Border.all(color: Colors.white.withOpacity(0.05)),
               ),
-              child: Text(message.content, style: const TextStyle(color: Colors.white, fontSize: 14)),
+              child: Text(message.content,
+                  style: const TextStyle(color: Colors.white, fontSize: 14)),
             ),
             const SizedBox(height: 2),
-            if (isMe) Text(
-              MessageStatus.getDisplayText(message.status),
-              style: const TextStyle(color: Colors.white24, fontSize: 8),
-            ),
+            if (isMe)
+              Text(
+                MessageStatus.getDisplayText(message.status),
+                style: const TextStyle(color: Colors.white24, fontSize: 8),
+              ),
           ],
         ),
       ),
@@ -603,6 +737,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
   }
 
   Widget _buildInputZone() {
+    final inputDisabled = _panicPhase != PanicPhase.normal;
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: const BoxDecoration(color: Color(0xFF0D0D0D)),
@@ -610,15 +745,26 @@ class _ConversationScreenState extends State<ConversationScreen> {
         children: [
           Expanded(
             child: GestureDetector(
-              onTap: () => setState(() => _isKeyboardVisible = !_isKeyboardVisible),
+              onTap: inputDisabled
+                  ? null
+                  : () =>
+                      setState(() => _isKeyboardVisible = !_isKeyboardVisible),
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                decoration: BoxDecoration(color: const Color(0xFF1A1A1A), borderRadius: BorderRadius.circular(25)),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                decoration: BoxDecoration(
+                    color: const Color(0xFF1A1A1A),
+                    borderRadius: BorderRadius.circular(25)),
                 child: AnimatedBuilder(
                   animation: _ghostController,
                   builder: (context, _) => Text(
-                    _ghostController.value.isEmpty ? "Emit signal..." : _ghostController.value,
-                    style: TextStyle(color: _ghostController.value.isEmpty ? Colors.white10 : Colors.white),
+                    _ghostController.value.isEmpty
+                        ? "Emit signal..."
+                        : _ghostController.value,
+                    style: TextStyle(
+                        color: _ghostController.value.isEmpty
+                            ? Colors.white10
+                            : Colors.white),
                   ),
                 ),
               ),
@@ -626,8 +772,10 @@ class _ConversationScreenState extends State<ConversationScreen> {
           ),
           const SizedBox(width: 10),
           CircleAvatar(
-            backgroundColor: Colors.redAccent,
-            child: IconButton(icon: const Icon(Icons.send, color: Colors.white), onPressed: _sendMessage),
+            backgroundColor: inputDisabled ? Colors.white24 : Colors.redAccent,
+            child: IconButton(
+                icon: const Icon(Icons.send, color: Colors.white),
+                onPressed: inputDisabled ? null : _sendMessage),
           ),
         ],
       ),
@@ -636,7 +784,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   void _scrollToBottom() {
     if (_scrollController.hasClients) {
-      _scrollController.animateTo(_scrollController.position.maxScrollExtent, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
+      _scrollController.animateTo(_scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
     }
   }
 
@@ -648,6 +797,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   @override
   void dispose() {
+    _panicController?.removeListener(_onPanicPhaseChanged);
     // Восстанавливаем системную навигацию при выходе
     SystemChrome.setEnabledSystemUIMode(
       SystemUiMode.edgeToEdge,

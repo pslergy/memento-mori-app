@@ -61,4 +61,23 @@ class RouterInfo {
       useAsRelay: (json['useAsRelay'] as int? ?? 0) == 1,
     );
   }
+
+  /// Чтение из строки БД (snake_case ключи).
+  factory RouterInfo.fromDbRow(Map<String, dynamic> row) {
+    return RouterInfo(
+      id: row['id'] as String,
+      ssid: row['ssid'] as String,
+      macAddress: row['mac_address'] as String?,
+      ipAddress: row['ip_address'] as String?,
+      priority: row['priority'] as int? ?? 50,
+      isTrusted: (row['is_trusted'] as int? ?? 0) == 1,
+      lastSeen: row['last_seen'] != null
+          ? DateTime.fromMillisecondsSinceEpoch(row['last_seen'] as int)
+          : null,
+      rssi: row['rssi'] != null ? (row['rssi'] as num).toDouble() : null,
+      hasInternet: (row['has_internet'] as int? ?? 0) == 1,
+      isOpen: (row['is_open'] as int? ?? 0) == 1,
+      useAsRelay: (row['use_as_relay'] as int? ?? 0) == 1,
+    );
+  }
 }

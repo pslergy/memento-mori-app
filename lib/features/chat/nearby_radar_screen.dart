@@ -3,6 +3,8 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:nearby_connections/nearby_connections.dart';
+import 'package:memento_mori_app/ghost_input/ghost_controller.dart';
+import 'package:memento_mori_app/ghost_input/ghost_keyboard.dart';
 
 class NearbyRadarScreen extends StatefulWidget {
   final String myUsername; // Мы передадим имя из профиля
@@ -14,10 +16,10 @@ class NearbyRadarScreen extends StatefulWidget {
 
 class _NearbyRadarScreenState extends State<NearbyRadarScreen> {
   final Strategy strategy = Strategy.P2P_CLUSTER; // Режим "многие ко многим"
-  Map<String, String> endpointMap = {}; // ID устройства -> Имя пользователя
-  String? connectedEndpointId; // С кем мы сейчас говорим
-  List<String> logs = []; // Лог событий (или чат)
-  final TextEditingController _msgController = TextEditingController();
+  Map<String, String> endpointMap = {};
+  String? connectedEndpointId;
+  List<String> logs = [];
+  final GhostController _msgGhost = GhostController();
 
   // 2. Начинаем вещать о себе и искать других
   void _startRadar() async {
@@ -129,14 +131,13 @@ class _NearbyRadarScreenState extends State<NearbyRadarScreen> {
   }
 
   void _sendMessage() {
-    if (connectedEndpointId == null || _msgController.text.isEmpty) return;
-    String msg = _msgController.text;
+    if (connectedEndpointId == null) return;
+    final msg = _msgGhost.value;
+    if (msg.isEmpty) return;
 
-    // Отправляем байты напрямую на устройство
     Nearby().sendBytesPayload(connectedEndpointId!, Uint8List.fromList(msg.codeUnits));
-
     _log("Me: $msg");
-    _msgController.clear();
+    _msgGhost.clear();
   }
 
   void _log(String text) {
@@ -196,28 +197,56 @@ class _NearbyRadarScreenState extends State<NearbyRadarScreen> {
             ),
           ),
 
-          // Поле ввода
+          // Поле ввода (Ghost-клавиатура для Tecno и др.)
           if (connectedEndpointId != null)
             Padding(
               padding: const EdgeInsets.all(8.0),
               child: Row(
                 children: [
                   Expanded(
-                    child: TextField(
-                      controller: _msgController,
-                      style: const TextStyle(color: Colors.white),
-                      decoration: const InputDecoration(
-                        hintText: "Enter encoded message...",
-                        hintStyle: TextStyle(color: Colors.white54),
-                        filled: true,
-                        fillColor: Colors.grey,
+                    child: GestureDetector(
+                      onTap: () {
+                        showModalBottomSheet(
+                          context: context,
+                          isScrollControlled: true,
+                          backgroundColor: Colors.transparent,
+                          builder: (context) => GhostKeyboard(
+                            controller: _msgGhost,
+                            onSend: () {
+                              _sendMessage();
+                              setState(() {});
+                              Navigator.pop(context);
+                            },
+                          ),
+                        );
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[850],
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.white24),
+                        ),
+                        child: AnimatedBuilder(
+                          animation: _msgGhost,
+                          builder: (_, __) => Text(
+                            _msgGhost.value.isEmpty
+                                ? 'Enter encoded message...'
+                                : _msgGhost.value,
+                            style: TextStyle(
+                              color: _msgGhost.value.isEmpty
+                                  ? Colors.white54
+                                  : Colors.white,
+                            ),
+                          ),
+                        ),
                       ),
                     ),
                   ),
                   IconButton(
                     icon: const Icon(Icons.send, color: Colors.greenAccent),
                     onPressed: _sendMessage,
-                  )
+                  ),
                 ],
               ),
             ),

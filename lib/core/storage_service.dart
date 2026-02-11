@@ -1,5 +1,8 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:get_it/get_it.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'decoy/vault_interface.dart';
 
 class StorageService {
   // ТАКТИЧЕСКИЙ ХОД: На Tecno/Huawei отключаем encryptedSharedPreferences,
@@ -12,52 +15,106 @@ class StorageService {
   static const storage = FlutterSecureStorage(aOptions: _options);
 }
 
-/// 🔒 SECURE VAULT: Хранит чувствительные данные в зашифрованном хранилище
-/// 
-/// КРИТИЧНО: Использует FlutterSecureStorage вместо SharedPreferences!
-/// - Android: AES-256 шифрование через KeyStore
-/// - iOS: Keychain Services
-/// 
-/// МИГРАЦИЯ: При первом запуске переносит данные из старого SharedPreferences
+/// 👻 Бэкап Ghost-идентичности в SharedPreferences.
+/// На Huawei FlutterSecureStorage может не сохранять данные между перезапусками — SharedPreferences надёжнее.
+const _ghostPrefix = '_ghost_bak_';
+
+class GhostBackup {
+  static const ghostKeys = ['auth_token', 'user_id', 'user_deathDate', 'user_birthDate'];
+
+  static Future<void> save(String userId, String deathDate, String birthDate) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('${_ghostPrefix}auth_token', 'GHOST_MODE_ACTIVE');
+      await prefs.setString('${_ghostPrefix}user_id', userId);
+      await prefs.setString('${_ghostPrefix}user_deathDate', deathDate);
+      await prefs.setString('${_ghostPrefix}user_birthDate', birthDate);
+      print("👻 [GhostBackup] Saved to SharedPreferences (Huawei fallback)");
+    } catch (e) {
+      print("⚠️ [GhostBackup] Save failed: $e");
+    }
+  }
+
+  static Future<String?> read(String key) async {
+    if (!ghostKeys.contains(key)) return null;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString('$_ghostPrefix$key');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<Map<String, String>?> readAll() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final userId = prefs.getString('${_ghostPrefix}user_id');
+      if (userId == null || userId.isEmpty) return null;
+      return {
+        'auth_token': prefs.getString('${_ghostPrefix}auth_token') ?? 'GHOST_MODE_ACTIVE',
+        'user_id': userId,
+        'user_deathDate': prefs.getString('${_ghostPrefix}user_deathDate') ?? '',
+        'user_birthDate': prefs.getString('${_ghostPrefix}user_birthDate') ?? '',
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// 🔒 SECURE VAULT: Хранит чувствительные данные в зашифрованном хранилище.
+///
+/// SECURITY INVARIANT: When [VaultInterface] is registered (mode-aware bootstrap),
+/// all read/write delegates to the mode-scoped vault. No shared storage across modes.
 class Vault {
-  // 🔒 Secure Storage с оптимальными настройками для проблемных устройств
+  static VaultInterface? get _scopedVault {
+    try {
+      if (GetIt.instance.isRegistered<VaultInterface>()) {
+        return GetIt.instance<VaultInterface>();
+      }
+    } catch (_) {}
+    return null;
+  }
+
   static const _storage = FlutterSecureStorage(
     aOptions: AndroidOptions(
-      encryptedSharedPreferences: false, // Отключаем для Tecno/Huawei совместимости
+      encryptedSharedPreferences:
+          false, // Отключаем для Tecno/Huawei совместимости
       resetOnError: true, // Сбросить при ошибке декриптации (лучше чем краш)
     ),
     iOptions: IOSOptions(
       accessibility: KeychainAccessibility.first_unlock_this_device,
     ),
   );
-  
+
   // Ключи, которые содержат чувствительные данные
   static const _sensitiveKeys = [
     'auth_token',
-    'user_id', 
+    'user_id',
     'landing_pass',
     'refresh_token',
     'session_id',
   ];
-  
+
   static bool _migrationCompleted = false;
 
   /// 🔄 Мигрирует данные из SharedPreferences в SecureStorage (однократно)
   static Future<void> _migrateIfNeeded() async {
     if (_migrationCompleted) return;
-    
+
     try {
       final prefs = await SharedPreferences.getInstance();
       final migrationKey = '_vault_migrated_v2';
-      
+
       // Проверяем, была ли миграция
       if (prefs.getBool(migrationKey) == true) {
         _migrationCompleted = true;
         return;
       }
-      
-      print("🔄 [VAULT] Starting migration from SharedPreferences to SecureStorage...");
-      
+
+      print(
+          "🔄 [VAULT] Starting migration from SharedPreferences to SecureStorage...");
+
       // Мигрируем все чувствительные ключи
       for (final key in _sensitiveKeys) {
         final oldValue = prefs.getString(key);
@@ -67,27 +124,34 @@ class Vault {
           print("  ✅ [VAULT] Migrated: $key");
         }
       }
-      
+
       // Отмечаем миграцию завершенной
       await prefs.setBool(migrationKey, true);
       _migrationCompleted = true;
       print("✅ [VAULT] Migration completed successfully");
-      
     } catch (e) {
       print("⚠️ [VAULT] Migration error (non-fatal): $e");
       _migrationCompleted = true; // Не блокируем работу при ошибке
     }
   }
 
-  /// 🔒 Записывает значение в ЗАШИФРОВАННОЕ хранилище
+  /// 🔒 Записывает значение в ЗАШИФРОВАННОЕ хранилище.
+  /// Для чувствительных ключей дублируем в fallback (_storage), чтобы на Huawei при рассинхроне scoped чтение с fallback находило данные.
   static Future<void> write(dynamic key, dynamic value) async {
     if (key == null || value == null) return;
-    
-    await _migrateIfNeeded();
-    
     final keyStr = key.toString();
     final valueStr = value.toString();
-    
+    final scoped = _scopedVault;
+    if (scoped != null) {
+      await scoped.write(keyStr, valueStr);
+      if (_sensitiveKeys.contains(keyStr)) {
+        try {
+          await _storage.write(key: keyStr, value: valueStr);
+        } catch (_) {}
+      }
+      return;
+    }
+    await _migrateIfNeeded();
     try {
       await _storage.write(key: keyStr, value: valueStr);
       // 🔒 НЕ логируем значения чувствительных ключей
@@ -109,17 +173,42 @@ class Vault {
     }
   }
 
-  /// 🔒 Читает значение из ЗАШИФРОВАННОГО хранилища
+  /// 🔒 Читает значение из ЗАШИФРОВАННОГО хранилища.
+  /// Если scoped возвращает null и ключ чувствительный — пробуем fallback (_storage), затем SharedPreferences (Huawei).
   static Future<String?> read(dynamic key) async {
     if (key == null) return null;
-    
-    await _migrateIfNeeded();
-    
     final keyStr = key.toString();
-    
+    final scoped = _scopedVault;
+    if (scoped != null) {
+      final res = await scoped.read(keyStr);
+      if (res != null) return res;
+      if (_sensitiveKeys.contains(keyStr)) {
+        try {
+          final fallback = await _storage.read(key: keyStr);
+          if (fallback != null && fallback.isNotEmpty) {
+            await scoped.write(keyStr, fallback);
+            print("📖 [VAULT-READ] $keyStr: ***SECURED*** (from fallback, synced)");
+            return fallback;
+          }
+        } catch (_) {}
+      }
+      if (GhostBackup.ghostKeys.contains(keyStr)) {
+        final ghostVal = await GhostBackup.read(keyStr);
+        if (ghostVal != null && ghostVal.isNotEmpty) {
+          await scoped.write(keyStr, ghostVal);
+          print("📖 [VAULT-READ] $keyStr: *** (from GhostBackup)");
+          return ghostVal;
+        }
+      }
+      return null;
+    }
+    await _migrateIfNeeded();
     try {
-      final res = await _storage.read(key: keyStr);
-      // 🔒 НЕ логируем значения чувствительных ключей
+      var res = await _storage.read(key: keyStr);
+      if (res == null && GhostBackup.ghostKeys.contains(keyStr)) {
+        res = await GhostBackup.read(keyStr);
+        if (res != null) await _storage.write(key: keyStr, value: res);
+      }
       if (_sensitiveKeys.contains(keyStr)) {
         print("📖 [VAULT-READ] $keyStr: ${res != null ? '***SECURED***' : 'null'}");
       } else {
@@ -135,8 +224,12 @@ class Vault {
   /// 🔒 Удаляет конкретный ключ
   static Future<void> delete(dynamic key) async {
     if (key == null) return;
-    
     final keyStr = key.toString();
+    final scoped = _scopedVault;
+    if (scoped != null) {
+      await scoped.delete(keyStr);
+      return;
+    }
     try {
       await _storage.delete(key: keyStr);
       print("🗑️ [VAULT-DELETE] $keyStr");
@@ -145,12 +238,17 @@ class Vault {
     }
   }
 
-  /// ☢️ Полная очистка ВСЕХ данных
+  /// ☢️ Полная очистка ВСЕХ данных (текущего режима)
   static Future<void> deleteAll() async {
+    final scoped = _scopedVault;
+    if (scoped != null) {
+      await scoped.deleteAll();
+      return;
+    }
     try {
       await _storage.deleteAll();
       print("☢️ [VAULT] ALL SECURE DATA WIPED.");
-      
+
       // Также очищаем SharedPreferences (для полной очистки)
       final prefs = await SharedPreferences.getInstance();
       await prefs.clear();
@@ -160,13 +258,13 @@ class Vault {
       print("❌ [VAULT] Error during deleteAll: $e");
     }
   }
-  
+
   /// 🔍 Проверяет наличие ключа
   static Future<bool> containsKey(dynamic key) async {
     if (key == null) return false;
-    
+    final scoped = _scopedVault;
+    if (scoped != null) return scoped.containsKey(key.toString());
     await _migrateIfNeeded();
-    
     try {
       return await _storage.containsKey(key: key.toString());
     } catch (e) {

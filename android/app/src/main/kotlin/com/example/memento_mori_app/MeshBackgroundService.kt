@@ -31,8 +31,9 @@ class MeshBackgroundService : Service() {
     private var serviceJob: Job? = null // Переменная для управления циклом сервера
     private var temporaryServerJob: Job? = null // Для временного сервера
     private var temporaryServerSocket: ServerSocket? = null // Сокет временного сервера
-    private val MESH_PORT = 55555 // Основной порт для mesh сети
-    private val BRIDGE_PULL_PORT = 55556 // Порт для временного BRIDGE сервера
+    // 🔥 Единый порт 55556: и постоянный, и временный сервер (на Huawei часто поднимается только временный — клиент подключается к 55556)
+    private val MESH_PORT = 55556
+    private val BRIDGE_PULL_PORT = 55556 // Тот же порт для временного BRIDGE сервера
     private var dbHelper: BridgeQueueDbHelper? = null
 
     companion object {
@@ -78,56 +79,38 @@ class MeshBackgroundService : Service() {
         // Запуск сервиса в режиме "бессмертия"
         startForeground(1, notification)
 
-        // 🔥 КРИТИЧЕСКИЙ ФИКС #1: Проверяем, является ли устройство Group Owner
-        // TCP сервер должен запускаться ТОЛЬКО на GO, иначе оба устройства пытаются быть серверами
-        val isGroupOwner = checkIfGroupOwner()
-        
-        if (!isGroupOwner) {
-            Log.w("P2P_BG", "⚠️ Not Group Owner - TCP server not started (only GO can be server)")
-            Log.w("P2P_BG", "   💡 This device is a client - will connect to GO's TCP server")
-            // Не поднимаем сервер, но сервис остается активным для других операций
-            return START_STICKY
-        }
-        
-        Log.d("P2P_BG", "✅ Device is Group Owner - TCP server can be started")
-
-        // 🔥 КРИТИЧЕСКИЙ ФИКС #3: Привязываем процесс к Wi-Fi Direct сети (Android 10+)
-        // Без этого сокеты могут идти через мобильную сеть вместо Wi-Fi Direct
-        bindToWifiDirectNetwork()
-
-        // 🔥 ПРОВЕРКА: Можно ли поднимать TCP сервер?
-        val canStartServer = DeviceDetector.canStartTcpServer(this)
-        
-        if (!canStartServer) {
-            Log.w("P2P_BG", "🚫 TCP server disabled - using BLE GATT instead")
-            // Не поднимаем сервер, но сервис остается активным для других операций
-            return START_STICKY
-        }
-
-        // Проверяем, это временный сервер или постоянный
+        // 🔥 КРИТИЧЕСКИЙ ФИКС #1: Проверка GO и запуск TCP сервера — асинхронно
+        // requestGroupInfo callback вызывается на Main Looper; runBlocking на Main приводил к дедлоку.
         val isTemporary = intent?.getBooleanExtra("temporary", false) ?: false
         val duration = intent?.getIntExtra("duration", 20) ?: 20
 
-        if (isTemporary) {
-            startTemporaryTcpServer(duration)
-        } else {
-            // Запуск постоянного TCP сервера
-            startTcpServer()
+        serviceScope.launch(Dispatchers.Default) {
+            val isGroupOwner = checkIfGroupOwnerAsync()
+            if (!isGroupOwner) {
+                Log.w("P2P_BG", "⚠️ Not Group Owner - TCP server not started (only GO can be server)")
+                Log.w("P2P_BG", "   💡 This device is a client - will connect to GO's TCP server")
+                return@launch
+            }
+            Log.d("P2P_BG", "✅ Device is Group Owner - TCP server can be started")
+            bindToWifiDirectNetwork()
+            if (!DeviceDetector.canStartTcpServer(this@MeshBackgroundService)) {
+                Log.w("P2P_BG", "🚫 TCP server disabled - using BLE GATT instead")
+                return@launch
+            }
+            withContext(Dispatchers.Main) {
+                if (isTemporary) {
+                    startTemporaryTcpServer(duration)
+                } else {
+                    startTcpServer()
+                }
+            }
         }
 
         return START_STICKY
     }
 
     private fun startTcpServer() {
-        // 🔥 КРИТИЧЕСКИЙ ФИКС #1: Дополнительная проверка перед запуском
-        // (основная проверка уже была в onStartCommand, но на всякий случай)
-        val isGroupOwner = checkIfGroupOwner()
-        if (!isGroupOwner) {
-            Log.w("P2P_BG", "⚠️ Not Group Owner - TCP server not started in startTcpServer()")
-            return
-        }
-        
-        // 🔥 КРИТИЧЕСКИЙ ФИКС #3: Привязываем процесс к Wi-Fi Direct сети
+        // GO уже проверен в onStartCommand (checkIfGroupOwnerAsync) перед вызовом с Main
         bindToWifiDirectNetwork()
         
         // 1. Убиваем старую задачу, если она жива
@@ -148,6 +131,7 @@ class MeshBackgroundService : Service() {
                     serverSocket = ss
 
                     Log.d("P2P_BG", "🛡️ SERVER REBORN on port $MESH_PORT (Group Owner confirmed)")
+                    WifiP2pHelper.sendLogToFlutter("TCP", "🛡️ Server ACTIVE on port $MESH_PORT")
 
                     while (isActive) {
                         val client = try {
@@ -181,6 +165,7 @@ class MeshBackgroundService : Service() {
     private suspend fun handleClientSecurely(socket: Socket, remoteIp: String?) {
         try {
             Log.d("P2P_BG", "🔌 [BRIDGE] New client connected from $remoteIp")
+            WifiP2pHelper.sendLogToFlutter("TCP", "🔌 Client connected: $remoteIp")
             socket.soTimeout = 10000 // Таймаут на чтение — 10 секунд (для batch)
             val reader = socket.getInputStream().bufferedReader(StandardCharsets.UTF_8)
             val input = reader.readLine()
@@ -199,6 +184,7 @@ class MeshBackgroundService : Service() {
                         else -> {
                             // Стандартная обработка (для обратной совместимости)
                             Log.d("P2P_BG", "📦 Packet captured from $remoteIp")
+                            WifiP2pHelper.sendLogToFlutter("TCP", "📦 Packet from $remoteIp type=$type")
                             val broadcastIntent = Intent(ACTION_MESSAGE_RECEIVED).apply {
                                 setPackage(packageName)
                                 putExtra("message", input)
@@ -242,6 +228,7 @@ class MeshBackgroundService : Service() {
             val count = json.optInt("count", 0)
 
             Log.d("P2P_BG", "📦 GHOST_UPLOAD from $senderId: $count messages (batch: $batchId)")
+            WifiP2pHelper.sendLogToFlutter("TCP", "📦 UPLOAD: $count msg from GHOST")
 
             // Сохраняем в SQLite очередь
             dbHelper?.let { db ->
@@ -293,18 +280,8 @@ class MeshBackgroundService : Service() {
     }
 
     private fun startTemporaryTcpServer(durationSeconds: Int) {
-        // 🔥 КРИТИЧЕСКИЙ ФИКС #1: Проверяем, является ли устройство Group Owner
-        // Временный сервер тоже должен запускаться ТОЛЬКО на GO
-        val isGroupOwner = checkIfGroupOwner()
-        
-        if (!isGroupOwner) {
-            Log.w("P2P_BG", "⚠️ Not Group Owner - temporary TCP server not started")
-            return
-        }
-        
-        // 🔥 КРИТИЧЕСКИЙ ФИКС #3: Привязываем процесс к Wi-Fi Direct сети
+        // GO уже проверен в onStartCommand (checkIfGroupOwnerAsync) перед вызовом с Main
         bindToWifiDirectNetwork()
-        
         // Закрываем предыдущий временный сервер, если он есть
         temporaryServerJob?.cancel()
         temporaryServerSocket?.close()
@@ -421,73 +398,56 @@ class MeshBackgroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     /**
-     * 🔥 КРИТИЧЕСКИЙ ФИКС #1: Проверяет, является ли устройство Group Owner
-     * TCP сервер должен запускаться ТОЛЬКО на GO
-     * 
-     * 🔥 FIX: Добавлена retry логика для случая, когда группа ещё формируется
+     * Асинхронная проверка GO для использования из корутины (Default dispatcher).
+     * Не блокирует Main — callback requestGroupInfo может выполниться на Main Looper.
      */
-    private fun checkIfGroupOwner(): Boolean {
+    private suspend fun checkIfGroupOwnerAsync(): Boolean {
         return try {
             val wifiP2pManager = getSystemService(Context.WIFI_P2P_SERVICE) as? android.net.wifi.p2p.WifiP2pManager
-            if (wifiP2pManager == null) {
+                ?: run {
                 Log.w("P2P_BG", "⚠️ WifiP2pManager not available")
                 return false
             }
-            
             val channel = wifiP2pManager.initialize(applicationContext, Looper.getMainLooper(), null)
-            if (channel == null) {
+                ?: run {
                 Log.w("P2P_BG", "⚠️ Failed to initialize WifiP2pManager channel")
                 return false
             }
-            
-            var isOwner = false
+
             val deferred = CompletableDeferred<Boolean>()
-            
-            // 🔥 FIX: Добавляем retry логику для случая, когда группа ещё формируется
             var retryCount = 0
-            val maxRetries = 3
-            
+            val maxRetries = 8
+
             fun checkGroupInfo() {
-                wifiP2pManager.requestConnectionInfo(channel) { info ->
-                    if (info != null && info.groupFormed && info.groupOwnerAddress != null) {
-                        isOwner = info.isGroupOwner
-                        Log.d("P2P_BG", "📋 Group info: isGroupOwner=$isOwner, groupFormed=${info.groupFormed}")
-                        deferred.complete(isOwner)
+                wifiP2pManager.requestGroupInfo(channel) { group ->
+                    if (group != null && group.isGroupOwner) {
+                        Log.d("P2P_BG", "📋 Group info (requestGroupInfo): isGroupOwner=true, networkName=${group.networkName}")
+                        deferred.complete(true)
                     } else {
-                        // Группа ещё не сформирована - retry
-                        if (retryCount < maxRetries) {
+                        if (group != null) {
+                            Log.d("P2P_BG", "📋 Group info (requestGroupInfo): group exists but we are not owner")
+                            deferred.complete(false)
+                        } else if (retryCount < maxRetries) {
                             retryCount++
-                            Log.d("P2P_BG", "📋 Group not formed yet, retry $retryCount/$maxRetries...")
-                            Handler(Looper.getMainLooper()).postDelayed({
-                                checkGroupInfo()
-                            }, 1000) // Retry через 1 секунду
+                            Log.d("P2P_BG", "📋 No group yet, retry $retryCount/$maxRetries in 1.2s...")
+                            Handler(Looper.getMainLooper()).postDelayed({ checkGroupInfo() }, 1200)
                         } else {
                             Log.d("P2P_BG", "📋 No active group found after $maxRetries retries")
-                            isOwner = false
                             deferred.complete(false)
                         }
                     }
                 }
             }
-            
-            checkGroupInfo()
-            
-            // Ждем результат с таймаутом
-            runBlocking {
-                try {
-                    isOwner = deferred.awaitWithTimeout(5000) ?: false  // Увеличен таймаут до 5 секунд
-                } catch (e: Exception) {
-                    Log.w("P2P_BG", "⚠️ Timeout checking group owner status: ${e.message}")
-                    isOwner = false
-                }
-            }
-            
-            isOwner
+
+            // Запускаем запрос на Main Looper; await на текущем (Default) — Main свободен для callback
+            withContext(Dispatchers.Main.immediate) { checkGroupInfo() }
+            deferred.awaitWithTimeout(15000) ?: false
         } catch (e: Exception) {
             Log.e("P2P_BG", "❌ Error checking Group Owner status: ${e.message}")
             false
         }
     }
+
     
     /**
      * 🔥 КРИТИЧЕСКИЙ ФИКС #3: Привязывает процесс к Wi-Fi Direct сети (Android 10+)

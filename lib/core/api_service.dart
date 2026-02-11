@@ -12,19 +12,43 @@ import 'package:memento_mori_app/core/ultrasonic_service.dart';
 import 'package:memento_mori_app/core/security_config.dart'; // 🔒 SECURITY FIX
 import 'package:synchronized/synchronized.dart';
 
-
 import 'encryption_service.dart';
 import 'exceptions.dart';
 import 'local_db_service.dart';
 import 'location_name_service.dart';
 import 'locator.dart';
 import 'mesh_service.dart';
+import 'room_id_normalizer.dart';
 import 'models/ad_packet.dart';
 import 'network_monitor.dart';
 import 'native_mesh_service.dart';
 
+// OFFLINE FIRST: Ghost identity creation using only Vault + EncryptionService. No ApiService required.
+Future<void> createGhostIdentityLocal(String username, String email) async {
+  if (!locator.isRegistered<EncryptionService>()) {
+    throw StateError(
+        'Ghost creation requires CORE locator (EncryptionService). Run setupCoreLocator before registration.');
+  }
+  final encryption = locator<EncryptionService>();
+  final identity = await encryption.generateGhostIdentity(username);
+  final String ghostId = identity['userId']!;
+  final String landingPass =
+      await encryption.generateLandingPass(email, ghostId);
+  await Vault.write('user_id', ghostId);
+  await Vault.write('user_name', username);
+  await Vault.write('user_email', email);
+  await Vault.write('landing_pass', landingPass);
+  await Vault.write('auth_token', 'GHOST_MODE_ACTIVE');
+  final deathDate =
+      DateTime.now().add(const Duration(days: 365 * 75)).toIso8601String();
+  final birthDate = DateTime(2000, 1, 1).toIso8601String();
+  await Vault.write('user_deathDate', deathDate);
+  await Vault.write('user_birthDate', birthDate);
+  await GhostBackup.save(ghostId, deathDate, birthDate);
+}
+
 class ApiService {
-  final String _baseUrl = 'https://89.125.131.63:3000/api';
+  String get _baseUrl => SecurityConfig.backendBaseUrl;
   final _storage = const FlutterSecureStorage(
     aOptions: AndroidOptions(
       encryptedSharedPreferences: true, // Более надежный режим для Tecno/Xiaomi
@@ -36,20 +60,50 @@ class ApiService {
   static String? _memoizedToken;
   static String? _cachedUserId;
   String get currentUserId => _cachedUserId ?? "";
-  
+
+  // 🛡️ ANTICENSORSHIP: ephemeral token for mesh senderId (anonymous over-the-air)
+  String? _ephemeralToken;
+  DateTime? _ephemeralTokenExpiry;
+  static const Duration _ephemeralTokenTtl = Duration(minutes: 50);
+  String get meshSenderId => _ephemeralToken != null &&
+          _ephemeralTokenExpiry != null &&
+          DateTime.now().isBefore(_ephemeralTokenExpiry!)
+      ? _ephemeralToken!
+      : (_cachedUserId ?? 'GHOST_NODE');
+
+  /// Fetches ephemeral token when connectivity exists. Call on login/BRIDGE.
+  Future<void> fetchEphemeralTokenIfNeeded() async {
+    if (isGhostMode) return;
+    final now = DateTime.now();
+    if (_ephemeralToken != null &&
+        _ephemeralTokenExpiry != null &&
+        now.add(const Duration(minutes: 10)).isBefore(_ephemeralTokenExpiry!)) {
+      return;
+    }
+    try {
+      final res = await _sendDirectHttp('POST', '/auth/ephemeral-token', null);
+      if (res is Map && res['ephemeralToken'] != null) {
+        _ephemeralToken = res['ephemeralToken'] as String;
+        _ephemeralTokenExpiry = DateTime.fromMillisecondsSinceEpoch(
+            (res['expiresAt'] as num).toInt());
+      }
+    } catch (_) {}
+  }
+
   // 🔒 Fix race conditions: Use Lock for atomic operations
   final _syncLock = Lock();
 
   // ✅ БЕЗОПАСНЫЙ МЕТОД ЧТЕНИЯ (Защита от красного экрана)
   Future<String?> _safeRead(String key) async {
-  try {
-  return await Vault.read( key);
-  } catch (e) {
-  print("☢️ [Storage] Decryption failed for key: $key. Wiping corrupted data...");
-  // Если случился BAD_DECRYPT — стираем всё, чтобы приложение не "умерло" навсегда
+    try {
+      return await Vault.read(key);
+    } catch (e) {
+      print(
+          "☢️ [Storage] Decryption failed for key: $key. Wiping corrupted data...");
+      // Если случился BAD_DECRYPT — стираем всё, чтобы приложение не "умерло" навсегда
 
-  return null;
-  }
+      return null;
+    }
   }
 
   bool get isGhostMode => _memoizedToken == 'GHOST_MODE_ACTIVE';
@@ -61,7 +115,8 @@ class ApiService {
       'Content-Type': 'application/json',
       'Host': 'update.microsoft.com',
       // Если мы призраки - не шлем левый токен серверу
-      if (_memoizedToken != null && !isGhostMode) 'Authorization': 'Bearer $_memoizedToken',
+      if (_memoizedToken != null && !isGhostMode)
+        'Authorization': 'Bearer $_memoizedToken',
     };
   }
 
@@ -79,19 +134,15 @@ class ApiService {
     }
   }
 
-
-
   // Добавь проверку: авторизован ли пользователь (для Auth Gate)
   bool get isAuthenticated => _cachedUserId != null;
 
-
-
   static Future<void> init() async {
     print("🚀 [ApiService] Initializing Network Systems...");
-    
+
     // 🔒 SECURITY FIX: Load cached TOFU fingerprint on startup
     await SecurityConfig.loadCachedFingerprint();
-    
+
     NetworkMonitor().start();
     NativeMeshService.init();
   }
@@ -111,9 +162,6 @@ class ApiService {
   // 🧠 УМНАЯ МАРШРУТИЗАЦИЯ (DIRECT -> CACHE -> MESH)
   // ===========================================================================
 
-
-
-
   Future<dynamic> _makeRequest({
     required String method,
     required String endpoint,
@@ -124,25 +172,27 @@ class ApiService {
       return _handleOfflineFlow(method, endpoint, body);
     }
 
-    // Если мы не призрак, проверяем роль и шлем запрос
     final currentRole = NetworkMonitor().currentRole;
-    if (currentRole == MeshRole.BRIDGE) {
+    final hasValidBridgeLease = NetworkMonitor().hasValidBridgeLease;
+    if (currentRole == MeshRole.BRIDGE && hasValidBridgeLease) {
       try {
         return await _sendDirectHttp(method, endpoint, body);
       } catch (e) {
         return _handleOfflineFlow(method, endpoint, body);
       }
-    } else {
-      return _handleOfflineFlow(method, endpoint, body);
     }
+    return _handleOfflineFlow(method, endpoint, body);
   }
 
   // 🔥 ЛОГИКА ВЫЖИВАНИЯ: Если нет сети, пробуем Mesh, если нет Mesh — отдаем из SQLite
   /// Логика выживания: Фолбек для оффлайна
   /// Логика выживания: Фолбек для оффлайна (Консолидация БД и Mesh-эфира)
-  Future<dynamic> _handleOfflineFlow(String method, String endpoint, dynamic body) async {
+  Future<dynamic> _handleOfflineFlow(
+      String method, String endpoint, dynamic body) async {
     final db = LocalDatabaseService();
-    final mesh = locator<MeshService>();
+    final MeshService? mesh = locator.isRegistered<MeshService>()
+        ? locator<MeshService>()
+        : null;
 
     // 1. ИСТОРИЯ СООБЩЕНИЙ (С учетом владельца)
     if (endpoint.contains('/messages') && method == 'GET') {
@@ -162,7 +212,10 @@ class ApiService {
           'id': 'THE_BEACON_GLOBAL',
           'name': 'THE BEACON (Global SOS)',
           'type': 'GLOBAL',
-          'lastMessage': {'content': 'Mesh Active. Frequency secured.', 'createdAt': DateTime.now().toIso8601String()},
+          'lastMessage': {
+            'content': 'Mesh Active. Frequency secured.',
+            'createdAt': DateTime.now().toIso8601String()
+          },
           'otherUser': null
         }
       ];
@@ -172,8 +225,7 @@ class ApiService {
       final List<Map<String, dynamic>> localRooms = await database.query(
           'chat_rooms',
           where: 'ownerId = ?',
-          whereArgs: [currentUserId]
-      );
+          whereArgs: [currentUserId]);
 
       // Добавляем их в общий список, избегая дублирования с Маяком
       for (var room in localRooms) {
@@ -182,25 +234,29 @@ class ApiService {
         }
       }
 
-      // В. Добавляем живых соседей из Mesh (которых нет в базе)
-      for (var node in mesh.nearbyNodes) {
-        if (currentUserId.isEmpty) continue;
+      // В. Добавляем живых соседей из Mesh (которых нет в базе), если MeshService доступен
+      if (mesh != null) {
+        for (var node in mesh.nearbyNodes) {
+          if (currentUserId.isEmpty) continue;
 
-        // Генерируем детерминированный ID для оффлайн-чата
-        List<String> ids = [currentUserId, node.id];
-        ids.sort();
-        final String meshChatId = "GHOST_${ids[0]}_${ids[1]}";
+          // Нормализация ID в ядре: канонический roomId для DM
+          final String meshChatId =
+              RoomIdNormalizer.canonicalDmRoomId(currentUserId, node.id);
 
-        // Проверяем, нет ли уже такого чата в списке (чтобы не дублировать)
-        bool exists = consolidatedList.any((c) => c['id'] == meshChatId);
-        if (!exists) {
-          consolidatedList.add({
-            'id': meshChatId,
-            'name': node.name,
-            'type': 'DIRECT',
-            'lastMessage': {'content': 'Signal detected via Mesh.', 'createdAt': DateTime.now().toIso8601String()},
-            'otherUser': {'id': node.id, 'username': node.name}
-          });
+          // Проверяем, нет ли уже такого чата в списке (чтобы не дублировать)
+          bool exists = consolidatedList.any((c) => c['id'] == meshChatId);
+          if (!exists) {
+            consolidatedList.add({
+              'id': meshChatId,
+              'name': node.name,
+              'type': 'DIRECT',
+              'lastMessage': {
+                'content': 'Signal detected via Mesh.',
+                'createdAt': DateTime.now().toIso8601String()
+              },
+              'otherUser': {'id': node.id, 'username': node.name}
+            });
+          }
         }
       }
       return consolidatedList;
@@ -221,11 +277,11 @@ class ApiService {
     return [];
   }
 
-
-  Future<dynamic> _sendDirectHttp(String method, String endpoint, dynamic body) async {
+  Future<dynamic> _sendDirectHttp(
+      String method, String endpoint, dynamic body) async {
     final client = _createHttpClient();
     final url = Uri.parse('$_baseUrl$endpoint');
-    final token = await Vault.read( 'auth_token');
+    final token = await Vault.read('auth_token');
 
     final headers = {
       'Content-Type': 'application/json',
@@ -233,14 +289,19 @@ class ApiService {
       if (token != null) 'Authorization': 'Bearer $token',
     };
 
-    dynamic encodedBody = (body != null && body is! String) ? jsonEncode(body) : body;
+    dynamic encodedBody =
+        (body != null && body is! String) ? jsonEncode(body) : body;
 
     try {
       http.Response response;
       if (method == 'POST') {
-        response = await client.post(url, headers: headers, body: encodedBody).timeout(const Duration(seconds: 10));
+        response = await client
+            .post(url, headers: headers, body: encodedBody)
+            .timeout(const Duration(seconds: 10));
       } else if (method == 'GET') {
-        response = await client.get(url, headers: headers).timeout(const Duration(seconds: 10));
+        response = await client
+            .get(url, headers: headers)
+            .timeout(const Duration(seconds: 10));
       } else {
         throw Exception("Method not implemented");
       }
@@ -253,21 +314,30 @@ class ApiService {
         String? errorCode;
         try {
           final errorBody = jsonDecode(response.body);
-          errorMessage = errorBody['message'] ?? errorBody['error'] ?? errorMessage;
+          errorMessage =
+              errorBody['message'] ?? errorBody['error'] ?? errorMessage;
           errorCode = errorBody['code'] ?? errorBody['error'];
         } catch (_) {
           // Если не удалось распарсить JSON, используем стандартное сообщение
         }
-        
+
         // Специальная обработка: если пользователь удален - очищаем токен
-        if (response.statusCode == 401 && (errorCode == 'USER_DELETED' || errorCode == 'AUTH_USER_NOT_FOUND')) {
+        if (response.statusCode == 401 &&
+            (errorCode == 'USER_DELETED' ||
+                errorCode == 'AUTH_USER_NOT_FOUND')) {
           _log("🚫 [API] User deleted from database, clearing local token");
           await logout(); // Очищаем локальные данные
-          throw Exception('Your account no longer exists. Please register again.');
+          throw Exception(
+              'Your account no longer exists. Please register again.');
         }
-        
+
         throw Exception('$errorMessage (${response.statusCode})');
       }
+    } on Exception catch (e) {
+      if (e is SocketException || e is TimeoutException || e is HandshakeException || e is http.ClientException) {
+        SecurityConfig.recordBackendFailure();
+      }
+      rethrow;
     } finally {
       client.close();
     }
@@ -309,11 +379,17 @@ class ApiService {
   }
 
   // Хелпер для конвертации (если нужно)
-  Map<String, dynamic> rawToMap(dynamic data) => Map<String, dynamic>.from(data);
+  Map<String, dynamic> rawToMap(dynamic data) =>
+      Map<String, dynamic>.from(data);
 
-  Future<dynamic> _sendViaMesh(String method, String endpoint, dynamic body) async {
+  Future<dynamic> _sendViaMesh(
+      String method, String endpoint, dynamic body) async {
+    if (!locator.isRegistered<MeshService>()) {
+      if (endpoint.contains('trending') || endpoint.contains('chats')) return [];
+      return {'error': 'Offline: Mesh not available'};
+    }
     try {
-      final token = _memoizedToken ?? await Vault.read( 'auth_token');
+      final token = _memoizedToken ?? await Vault.read('auth_token');
       final headers = {
         'Authorization': 'Bearer $token',
         'Content-Type': 'application/json'
@@ -324,12 +400,10 @@ class ApiService {
           '/api$endpoint',
           method,
           headers,
-          body is String ? body : (body != null ? jsonEncode(body) : null)
-      );
+          body is String ? body : (body != null ? jsonEncode(body) : null));
 
       // Проверяем, что в ответе есть тело
       return response['body'] ?? {};
-
     } catch (e) {
       // 🔥 ГЛАВНОЕ: Вместо выброса исключения, возвращаем "пустой" результат
       print("⚠️ [MeshBridge] Target node did not respond: $e");
@@ -343,15 +417,14 @@ class ApiService {
     }
   }
 
-
-
   Map<String, String> _getObfuscatedHeaders(String? token) {
     return {
       'Content-Type': 'application/json',
       // Маскируемся под домен из "белого списка"
       'Host': 'update.microsoft.com',
       // Используем стандартный браузерный User-Agent
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept': 'application/json',
       'Connection': 'keep-alive',
       if (token != null) 'Authorization': 'Bearer $token',
@@ -360,14 +433,17 @@ class ApiService {
       'X-Static-Entropy': DateTime.now().millisecond.toString(),
     };
   }
+
   Future<void> syncOutbox() async {
-    // 🔒 Fix race conditions: Atomic check-and-set using Lock
     return await _syncLock.synchronized(() async {
       if (isGhostMode) {
         _log("👤 System in Stealth mode. Sync deferred until legalization.");
         return;
       }
-      // 1. Защита от дублей: если синхронизация уже идет — выходим
+      if (!NetworkMonitor().hasValidBridgeLease) {
+        _log("[ROUTER] syncOutbox skipped: no valid BRIDGE lease");
+        return;
+      }
       if (_isSyncing) {
         _log("⏳ Sync already in progress. Skipping cycle.");
         return;
@@ -381,7 +457,10 @@ class ApiService {
 
         if (pending.isEmpty) return;
 
-        _log("🔄 [BRIDGE-PROTOCOL] Syncing ${pending.length} encrypted signals...");
+        _log(
+            "🔄 [BRIDGE-PROTOCOL] Syncing ${pending.length} encrypted signals...");
+
+        await fetchEphemeralTokenIfNeeded();
 
         // Кэшируем токен один раз на весь цикл синхронизации
         final String? token = await Vault.read('auth_token');
@@ -391,21 +470,24 @@ class ApiService {
           try {
             final String chatId = msg['chatRoomId'];
 
-            // Отправка
+            // Отправка (senderId для relay и ephemeral)
+            final senderId = msg['senderId'];
             await _sendDirectHttp('POST', '/chats/$chatId/messages', {
               'content': msg['content'],
               'isEncrypted': msg['isEncrypted'] == 1,
               'clientTempId': msg['id'],
+              if (senderId != null && senderId.toString().isNotEmpty)
+                'senderId': senderId.toString(),
             });
 
             // СРАЗУ удаляем после успеха
             await db.removeFromOutbox(msg['id']);
             _log("✅ [RELAY-SUCCESS] Signal ${msg['id']} delivered.");
-
           } catch (e) {
             _log("❌ [RELAY-ERROR] Message ${msg['id']} failed: $e");
             // Если сервер вернул 409 (Conflict/Already exists), тоже удаляем из Outbox
-            if (e.toString().contains("409")) await db.removeFromOutbox(msg['id']);
+            if (e.toString().contains("409"))
+              await db.removeFromOutbox(msg['id']);
             break;
           }
         }
@@ -458,7 +540,7 @@ class ApiService {
       'password': password,
       'dateOfBirth': birthDate.toIso8601String(),
       'countryCode': 'RU', // Можно определять динамически
-      'gender': 'MALE',    // Можно добавить в UI позже
+      'gender': 'MALE', // Можно добавить в UI позже
     });
 
     if (response != null && response['token'] != null) {
@@ -482,19 +564,22 @@ class ApiService {
   // 🔥 СРАЗУ ДОБАВИМ И МЕТОД ПРОВЕРКИ НИКА, чтобы убрать вторую ошибку в UI
   Future<bool> checkUsernameAvailable(String username) async {
     try {
-      final res = await _sendDirectHttp('GET', '/users/check-username?username=$username', null);
+      final res = await _sendDirectHttp(
+          'GET', '/users/check-username?username=$username', null);
       return res['available'] ?? false;
     } catch (e) {
       return false;
     }
   }
+
   Future<void> sendAonymizedSOS() async {
     Position pos = await Geolocator.getCurrentPosition();
 
     // Огрубляем до 1.1 км (2 знака после запятой = ~1.1 км точность)
     double lat = double.parse(pos.latitude.toStringAsFixed(2));
     double lon = double.parse(pos.longitude.toStringAsFixed(2));
-    String sectorId = "S_${lat.toString().replaceAll('.', '')}_${lon.toString().replaceAll('.', '')}";
+    String sectorId =
+        "S_${lat.toString().replaceAll('.', '')}_${lon.toString().replaceAll('.', '')}";
 
     // Получаем название места (анонимно, только для зоны 1.1 км)
     final locationService = LocationNameService();
@@ -523,7 +608,9 @@ class ApiService {
     // Пытаемся отправить через Cloud + Mesh (если есть интернет)
     bool cloudSuccess = false;
     try {
-      await _makeRequest(method: 'POST', endpoint: '/emergency/signal', body: sosPayload).timeout(
+      await _makeRequest(
+              method: 'POST', endpoint: '/emergency/signal', body: sosPayload)
+          .timeout(
         const Duration(seconds: 10),
         onTimeout: () {
           throw TimeoutException('SOS request timeout');
@@ -535,20 +622,21 @@ class ApiService {
       print("⚠️ [SOS] Cloud send failed: $e");
     }
 
-    // 🔥 FALLBACK: Если Cloud не работает - отправляем через Mesh
-    if (!cloudSuccess) {
+    // 🔥 FALLBACK: Если Cloud не работает - отправляем через Mesh (если зарегистрирован)
+    if (!cloudSuccess && locator.isRegistered<MeshService>()) {
       try {
         final mesh = locator<MeshService>();
         final ultrasonic = locator<UltrasonicService>();
-        
+
         // Отправляем через Mesh
         await mesh.sendAuto(
-          content: "🚨 SOS: Sector $sectorId${locationName != null ? ' ($locationName)' : ''}",
+          content:
+              "🚨 SOS: Sector $sectorId${locationName != null ? ' ($locationName)' : ''}",
           chatId: "THE_BEACON_GLOBAL",
           receiverName: "GLOBAL",
         );
         print("✅ [SOS] Signal sent via Mesh");
-        
+
         // Также отправляем через Sonar для максимального покрытия
         try {
           await ultrasonic.transmitFrame("SOS:$sectorId");
@@ -571,7 +659,8 @@ class ApiService {
     final String ghostId = identity['userId']!;
 
     // 2. Создаем посадочный талон (хеш, который знает только юзер и сервер в будущем)
-    final String landingPass = await encryption.generateLandingPass(email, ghostId);
+    final String landingPass =
+        await encryption.generateLandingPass(email, ghostId);
 
     // 3. Бронируем данные в Vault
     await Vault.write('user_id', ghostId);
@@ -581,16 +670,14 @@ class ApiService {
     await Vault.write('auth_token', 'GHOST_MODE_ACTIVE');
 
     // 4. Считаем даты для Memento Mori (Memento Mori оффлайн-старт)
-    final deathDate = DateTime.now().add(const Duration(days: 365 * 75)).toIso8601String();
+    final deathDate =
+        DateTime.now().add(const Duration(days: 365 * 75)).toIso8601String();
     await Vault.write('user_deathDate', deathDate);
     await Vault.write('user_birthDate', DateTime(2000, 1, 1).toIso8601String());
 
     _memoizedToken = 'GHOST_MODE_ACTIVE';
     _cachedUserId = ghostId;
   }
-
-
-
 
   Future<void> syncGhostIdentity() async {
     final String? token = await Vault.read('auth_token');
@@ -621,11 +708,11 @@ class ApiService {
     if (value == null || value.length < 8) return '***';
     return '${value.substring(0, 4)}...${value.substring(value.length - 4)}';
   }
-  
+
   void _log(String msg) {
     print("📡 [API-Service] $msg");
   }
-  
+
   void _logSecure(String msg, {String? sensitiveValue}) {
     if (sensitiveValue != null) {
       print("📡 [API-Service] $msg: ${_maskSensitive(sensitiveValue)}");
@@ -643,7 +730,8 @@ class ApiService {
     final email = await Vault.read('user_email');
     final pass = await Vault.read('landing_pass');
 
-    _logSecure("🧬 Initiating Identity Legalization for Nomad", sensitiveValue: ghostId);
+    _logSecure("🧬 Initiating Identity Legalization for Nomad",
+        sensitiveValue: ghostId);
 
     try {
       // 2. Отправляем "Посадочный талон" на сервер
@@ -691,7 +779,6 @@ class ApiService {
     }
   }
 
-
   // Метод для переключения режима (например, из настроек)
   void setTorMode(bool enabled) {
     _useTor = enabled;
@@ -701,15 +788,11 @@ class ApiService {
     // проверить доступность сети через NetworkMonitor().checkNow();
   }
 
-
-
-
-
-  // Метод для полной очистки при логауте
+  // Метод для полной очистки при логауте. Uses Vault when mode-scoped so current mode only is wiped.
   Future<void> logout() async {
     _memoizedToken = null;
     _cachedUserId = null;
-    await _storage.deleteAll();
+    await Vault.deleteAll();
     _log("🚪 [API] Logout completed - all tokens cleared");
   }
 
@@ -717,10 +800,9 @@ class ApiService {
   // 🧠 УМНАЯ МАРШРУТИЗАЦИЯ (DIRECT -> TOR -> MESH)
   // ===========================================================================
 
-
-
   // Вынес попытку TOR/Mesh в отдельный метод для чистоты
-  Future<dynamic> _tryTorOrMesh(String method, String endpoint, dynamic body) async {
+  Future<dynamic> _tryTorOrMesh(
+      String method, String endpoint, dynamic body) async {
     if (!_useTor) {
       _useTor = true;
       try {
@@ -734,14 +816,9 @@ class ApiService {
     return _sendViaMesh(method, endpoint, body);
   }
 
-
-
-
-
-
-
   Future<List<dynamic>> getAvailableGroups() async {
-    return await _makeRequest(method: 'GET', endpoint: '/chats/available-groups');
+    return await _makeRequest(
+        method: 'GET', endpoint: '/chats/trending');
   }
 
   // Запрос на вступление
@@ -749,17 +826,8 @@ class ApiService {
     return await _makeRequest(
         method: 'POST',
         endpoint: '/chats/join-request',
-        body: {'chatId': groupId}
-    );
+        body: {'chatId': groupId});
   }
-
-
-
-
-
-
-
-
 
   // ===========================================================================
   // 🛰️ ПУБЛИЧНЫЕ МЕТОДЫ API (С поддежкой GHOST/MESH режимов)
@@ -770,12 +838,10 @@ class ApiService {
     // Для логина мы используем прямую отправку, так как это критический узел безопасности
     // Нормализуем email (убираем пробелы, приводим к нижнему регистру)
     final normalizedEmail = email.trim().toLowerCase();
-    
+
     try {
-      final response = await _sendDirectHttp('POST', '/auth/login', {
-        'email': normalizedEmail,
-        'password': password
-      });
+      final response = await _sendDirectHttp('POST', '/auth/login',
+          {'email': normalizedEmail, 'password': password});
 
       if (response != null && response['token'] != null) {
         _memoizedToken = response['token'];
@@ -783,15 +849,17 @@ class ApiService {
 
         // Сразу кэшируем личность
         _cachedUserId = user['id'].toString();
-        await Vault.write( 'auth_token',  _memoizedToken);
-        await Vault.write( 'user_id',  _cachedUserId);
-        await Vault.write( 'user_name',  user['username']);
+        await Vault.write('auth_token', _memoizedToken);
+        await Vault.write('user_id', _cachedUserId);
+        await Vault.write('user_name', user['username']);
+        unawaited(fetchEphemeralTokenIfNeeded());
       }
       return response;
     } catch (e) {
       // Улучшенная обработка ошибок
       final errorStr = e.toString();
-      if (errorStr.contains('401') || errorStr.contains('Invalid credentials')) {
+      if (errorStr.contains('401') ||
+          errorStr.contains('Invalid credentials')) {
         throw Exception('Invalid email or password');
       }
       if (errorStr.contains('400')) {
@@ -809,7 +877,7 @@ class ApiService {
 
       if (response != null && response['id'] != null) {
         _cachedUserId = response['id'].toString();
-        await Vault.write( 'user_id',  _cachedUserId);
+        await Vault.write('user_id', _cachedUserId);
         return response;
       }
       throw Exception("Invalid server response");
@@ -839,7 +907,8 @@ class ApiService {
     final String ghostId = identity['userId']!;
 
     // 2. Генерируем "Посадочный талон" для будущей легализации
-    final String landingPass = await encryption.generateLandingPass(email, ghostId);
+    final String landingPass =
+        await encryption.generateLandingPass(email, ghostId);
 
     // 3. Сохраняем всё в Vault (бронированное хранилище)
     await Vault.write('user_id', ghostId);
@@ -864,7 +933,10 @@ class ApiService {
       'name': 'THE BEACON (Global SOS)',
       'type': 'GLOBAL', // Убедись, что это совпадает с типом во вкладке
       'isEphemeral': false,
-      'lastMessage': {'content': 'Mesh Active. Frequency secured.', 'createdAt': DateTime.now().toIso8601String()},
+      'lastMessage': {
+        'content': 'Mesh Active. Frequency secured.',
+        'createdAt': DateTime.now().toIso8601String()
+      },
       'otherUser': null
     };
 
@@ -875,10 +947,11 @@ class ApiService {
       // Добавляем retry для Tecno/Xiaomi (более агрессивные оптимизации батареи)
       int retries = 0;
       const maxRetries = 2;
-      
+
       while (retries < maxRetries) {
         try {
-          final response = await _makeRequest(method: 'GET', endpoint: '/chats').timeout(
+          final response =
+              await _makeRequest(method: 'GET', endpoint: '/chats').timeout(
             const Duration(seconds: 15),
             onTimeout: () {
               throw TimeoutException('Request timeout');
@@ -892,7 +965,8 @@ class ApiService {
         } catch (e) {
           retries++;
           if (retries < maxRetries) {
-            _log("⚠️ [Tecno] Chat load failed, retrying in 2s... (attempt $retries/$maxRetries)");
+            _log(
+                "⚠️ [Tecno] Chat load failed, retrying in 2s... (attempt $retries/$maxRetries)");
             await Future.delayed(const Duration(seconds: 2));
           } else {
             _log("📡 Isolated: Using local Beacon only. Error: $e");
@@ -919,36 +993,50 @@ class ApiService {
 
   /// ИСТОРИЯ СООБЩЕНИЙ
   Future<List<dynamic>> getMessages(String chatId) async {
-    return await _makeRequest(method: 'GET', endpoint: '/chats/$chatId/messages');
+    return await _makeRequest(
+        method: 'GET', endpoint: '/chats/$chatId/messages');
   }
 
   /// СОЗДАТЬ ЛИНК (Личный чат)
   Future<Map<String, dynamic>> findOrCreateChat(String friendId) async {
     return await _makeRequest(
-        method: 'POST',
-        endpoint: '/chats/direct',
-        body: {'userId': friendId}
-    );
+        method: 'POST', endpoint: '/chats/direct', body: {'userId': friendId});
   }
 
   /// СОЗДАТЬ ОТРЯД (Группа)
-  Future<Map<String, dynamic>> createGroupChat(String name, List<String> userIds) async {
+  Future<Map<String, dynamic>> createGroupChat(
+      String name, List<String> userIds) async {
     return await _makeRequest(
         method: 'POST',
         endpoint: '/chats/group',
-        body: {'name': name, 'userIds': userIds}
-    );
+        body: {'name': name, 'userIds': userIds});
   }
 
   /// ПОИСК СИГНАЛОВ (Пользователей)
   Future<List<dynamic>> searchUsers(String query) async {
     // Поиск работает только в онлайне или через Bridge
-    return await _makeRequest(method: 'GET', endpoint: '/friends/search?query=$query');
+    return await _makeRequest(
+        method: 'GET', endpoint: '/friends/search?query=$query');
   }
 
   /// ЗАПРОС НА УСТАНОВКУ СВЯЗИ (Дружба)
   Future<void> sendFriendRequest(String friendId) async {
-    await _makeRequest(method: 'POST', endpoint: '/friends/add', body: {'friendId': friendId});
+    await _makeRequest(
+        method: 'POST', endpoint: '/friends/add', body: {'friendId': friendId});
+  }
+
+  /// Принять заявку в друзья (requestId = id отправителя заявки, userA_id)
+  Future<void> acceptFriendRequest(String requestId) async {
+    await _makeRequest(
+        method: 'PUT',
+        endpoint: '/friends/requests/$requestId/accept');
+  }
+
+  /// Отклонить заявку в друзья (requestId = id отправителя заявки, userA_id)
+  Future<void> rejectFriendRequest(String requestId) async {
+    await _makeRequest(
+        method: 'DELETE',
+        endpoint: '/friends/requests/$requestId/reject');
   }
 
   /// АКТИВНЫЕ ЧАСТОТЫ (Тренды)
@@ -962,22 +1050,17 @@ class ApiService {
   }
 
   /// ЖАЛОБА (Report)
-  Future<void> sendReport({
-    required String reason,
-    required String reportedUserId,
-    String? description,
-    String? messageId
-  }) async {
-    await _makeRequest(
-        method: 'POST',
-        endpoint: '/reports',
-        body: {
-          'reason': reason,
-          'reportedUserId': reportedUserId,
-          'description': description,
-          'messageId': messageId
-        }
-    );
+  Future<void> sendReport(
+      {required String reason,
+      required String reportedUserId,
+      String? description,
+      String? messageId}) async {
+    await _makeRequest(method: 'POST', endpoint: '/reports', body: {
+      'reason': reason,
+      'reportedUserId': reportedUserId,
+      'description': description,
+      'messageId': messageId
+    });
   }
 
   /// ПРОТОКОЛ NUKE (Удаление аккаунта)
@@ -997,7 +1080,9 @@ class ApiService {
       final client = _createHttpClient();
       try {
         // Имитируем обычный поиск в Google, чтобы скрыть активность мессенджера
-        await client.get(Uri.parse('https://www.google.com/search?q=weather+today+in+Amsterdam'))
+        await client
+            .get(Uri.parse(
+                'https://www.google.com/search?q=weather+today+in+Amsterdam'))
             .timeout(const Duration(seconds: 3));
       } catch (_) {
         // Ошибка шума не важна
@@ -1006,7 +1091,6 @@ class ApiService {
       }
     }
   }
-
 
   /// ПОЛУЧИТЬ СПИСОК ДРУЗЕЙ (Для создания групп)
   Future<List<dynamic>> getFriends() async {
@@ -1029,7 +1113,8 @@ class ApiService {
   // --- СИСТЕМНЫЕ МЕТОДЫ ---
 
   Future<Map<String, dynamic>> generateRecoveryPhrase() async {
-    return await _makeRequest(method: 'POST', endpoint: '/auth/generate-recovery');
+    return await _makeRequest(
+        method: 'POST', endpoint: '/auth/generate-recovery');
   }
 
   Future<Map<String, dynamic>> recoverAccount({
@@ -1042,4 +1127,5 @@ class ApiService {
       'recoveryPhrase': recoveryPhrase.trim().toLowerCase(),
       'newPassword': newPassword,
     });
-  }}
+  }
+}

@@ -88,7 +88,8 @@ class TerminalLoadingIndicator extends StatefulWidget {
   });
 
   @override
-  State<TerminalLoadingIndicator> createState() => _TerminalLoadingIndicatorState();
+  State<TerminalLoadingIndicator> createState() =>
+      _TerminalLoadingIndicatorState();
 }
 
 class _TerminalLoadingIndicatorState extends State<TerminalLoadingIndicator> {
@@ -144,10 +145,14 @@ class TerminalProgressBar extends StatelessWidget {
             child: Row(
               children: [
                 TerminalText(
-                  i < currentStep ? '[OK]' : (i == currentStep ? '[...]' : '[  ]'),
+                  i < currentStep
+                      ? '[OK]'
+                      : (i == currentStep ? '[...]' : '[  ]'),
                   color: i < currentStep
                       ? Colors.greenAccent
-                      : (i == currentStep ? Colors.yellowAccent : Colors.white38),
+                      : (i == currentStep
+                          ? Colors.yellowAccent
+                          : Colors.white38),
                   fontSize: 12,
                 ),
                 const SizedBox(width: 8),
@@ -190,7 +195,9 @@ class TerminalErrorDialog extends StatelessWidget {
         children: [
           const Icon(Icons.error_outline, color: Colors.redAccent, size: 20),
           const SizedBox(width: 8),
-          TerminalTitle(title, color: Colors.redAccent),
+          Expanded(
+            child: TerminalTitle(title, color: Colors.redAccent),
+          ),
         ],
       ),
       content: SingleChildScrollView(
@@ -201,7 +208,8 @@ class TerminalErrorDialog extends StatelessWidget {
             TerminalText(message, color: Colors.white70),
             if (solution != null) ...[
               const SizedBox(height: 16),
-              TerminalText('Solution:', color: Colors.greenAccent, fontWeight: FontWeight.bold),
+              TerminalText('Solution:',
+                  color: Colors.greenAccent, fontWeight: FontWeight.bold),
               const SizedBox(height: 4),
               TerminalText(solution!, color: Colors.white70),
             ],
@@ -221,7 +229,8 @@ class TerminalErrorDialog extends StatelessWidget {
               backgroundColor: Colors.greenAccent,
               foregroundColor: Colors.black,
             ),
-            child: const TerminalText('Retry', color: Colors.black, fontWeight: FontWeight.bold),
+            child: const TerminalText('Retry',
+                color: Colors.black, fontWeight: FontWeight.bold),
           ),
       ],
     );
@@ -258,7 +267,10 @@ class TerminalInfoBox extends StatelessWidget {
             children: [
               Icon(icon, color: color, size: 16),
               const SizedBox(width: 8),
-              TerminalText(title, color: color, fontWeight: FontWeight.bold),
+              Expanded(
+                child: TerminalText(title,
+                    color: color, fontWeight: FontWeight.bold),
+              ),
             ],
           ),
           const SizedBox(height: 8),

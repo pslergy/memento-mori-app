@@ -12,8 +12,16 @@ import 'network_monitor.dart';
 import '../splash_screen.dart';
 import '../features/ui/terminal_style.dart';
 
+/// When non-null, this screen runs in "gate mode": no GetIt (CORE/SESSION) until after grant.
+/// On success it calls [onPermissionsGranted] and does NOT touch LocalDatabaseService or mesh.
 class MeshPermissionScreen extends StatefulWidget {
-  const MeshPermissionScreen({Key? key}) : super(key: key);
+  const MeshPermissionScreen({
+    Key? key,
+    this.onPermissionsGranted,
+  }) : super(key: key);
+
+  /// If set, permission UI must not use locator. Parent (PermissionGate) will setup DI and navigate.
+  final VoidCallback? onPermissionsGranted;
 
   @override
   State<MeshPermissionScreen> createState() => _MeshPermissionScreenState();
@@ -63,7 +71,8 @@ class _MeshPermissionScreenState extends State<MeshPermissionScreen> {
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),
-            child: const Text("CANCEL", style: TextStyle(color: Colors.redAccent)),
+            child:
+                const Text("CANCEL", style: TextStyle(color: Colors.redAccent)),
           ),
           ElevatedButton(
             onPressed: () => openAppSettings(),
@@ -80,18 +89,18 @@ class _MeshPermissionScreenState extends State<MeshPermissionScreen> {
       _log("Permission request already in progress, ignoring");
       return;
     }
-    
+
     _log("Starting permission request...");
     setState(() => _loading = true);
-    
+
     // 🔥 FIX: Небольшая задержка для предотвращения двойного нажатия
     await Future.delayed(const Duration(milliseconds: 300));
-    
+
     if (!mounted) {
       setState(() => _loading = false);
       return;
     }
-    
+
     try {
       // Базовый список разрешений (без notification — на некоторых Tecno/HiOS это может крашить системный диалог)
       List<Permission> permissions = [
@@ -108,19 +117,20 @@ class _MeshPermissionScreenState extends State<MeshPermissionScreen> {
       }
 
       _log("Requesting ${permissions.length} permission(s)...");
-      
+
       // 1️⃣ Запрашиваем всё разом
       Map<Permission, PermissionStatus> statuses = await permissions.request();
-      
+
       _log("Permission request completed. Statuses: $statuses");
-      
+
       if (!mounted) {
         setState(() => _loading = false);
         return;
       }
 
       // 2️⃣ Проверяем на "Вечный отказ"
-      bool isPermanentlyDenied = statuses.values.any((s) => s.isPermanentlyDenied);
+      bool isPermanentlyDenied =
+          statuses.values.any((s) => s.isPermanentlyDenied);
       if (isPermanentlyDenied) {
         _log("Some permissions permanently denied");
         if (!mounted) return;
@@ -133,20 +143,23 @@ class _MeshPermissionScreenState extends State<MeshPermissionScreen> {
       bool allGranted = statuses.values.every((s) => s.isGranted);
 
       if (allGranted) {
-        _log("Mandate granted. Activating Infrastructure...");
-
-        // Инициализация систем (только один раз при первом запуске)
+        _log("Mandate granted.");
+        if (widget.onPermissionsGranted != null) {
+          // Staged DI: parent (PermissionGate) will setup CORE + SESSION and navigate. No GetIt here.
+          widget.onPermissionsGranted!();
+          setState(() => _loading = false);
+          return;
+        }
+        _log("Activating Infrastructure...");
+        if (!locator.isRegistered<LocalDatabaseService>()) {
+          setupLocator();
+        }
         await locator<LocalDatabaseService>().setFirstLaunchDone();
-
-        // Запуск базовых нативных сервисов и мониторинга сети
         NativeMeshService.init();
         NetworkMonitor().start();
-
-        // Полный старт Mesh-оркестратора (Wi-Fi Direct + BLE + Sonar + Gossip)
-        await locator<TacticalMeshOrchestrator>().startMeshNetwork(context: context);
-
+        await locator<TacticalMeshOrchestrator>()
+            .startMeshNetwork(context: context);
         if (!mounted) return;
-        // Летим в Сплеш, он направит дальше
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(builder: (_) => const SplashScreen()),
         );
@@ -189,7 +202,8 @@ class _MeshPermissionScreenState extends State<MeshPermissionScreen> {
         statusBarIconBrightness: Brightness.light,
       ),
     );
-    _checkFirstLaunch();
+    // Only use GetIt when not in gate mode (onPermissionsGranted == null).
+    if (widget.onPermissionsGranted == null) _checkFirstLaunch();
   }
 
   @override
@@ -202,16 +216,15 @@ class _MeshPermissionScreenState extends State<MeshPermissionScreen> {
   }
 
   Future<void> _checkFirstLaunch() async {
+    if (widget.onPermissionsGranted != null) return;
+    if (!locator.isRegistered<LocalDatabaseService>()) return;
     final isFirstLaunch = await locator<LocalDatabaseService>().isFirstLaunch();
     if (!isFirstLaunch) {
-      // Если не первый запуск — просто пролетаем дальше
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(builder: (_) => const SplashScreen()),
       );
     }
-    // 🔥 УПРОЩЕНИЕ: Не показываем экран объяснения, сразу запрашиваем разрешения
-    // Пользователь может нажать кнопку когда будет готов
   }
 
   @override
@@ -224,8 +237,8 @@ class _MeshPermissionScreenState extends State<MeshPermissionScreen> {
       body: Container(
         // 🔥 FIX: Добавляем отступ снизу для системной навигации (если она все еще видна)
         padding: EdgeInsets.only(
-          bottom: MediaQuery.of(context).padding.bottom > 0 
-              ? MediaQuery.of(context).padding.bottom 
+          bottom: MediaQuery.of(context).padding.bottom > 0
+              ? MediaQuery.of(context).padding.bottom
               : 0,
         ),
         child: SafeArea(
@@ -239,7 +252,8 @@ class _MeshPermissionScreenState extends State<MeshPermissionScreen> {
                         mainAxisSize: MainAxisSize.min,
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          const Icon(Icons.shield_outlined, size: 80, color: Colors.redAccent),
+                          const Icon(Icons.shield_outlined,
+                              size: 80, color: Colors.redAccent),
                           const SizedBox(height: 32),
                           const TerminalTitle(
                             "PERMISSIONS REQUIRED",
@@ -260,19 +274,22 @@ class _MeshPermissionScreenState extends State<MeshPermissionScreen> {
                               ),
                               elevation: 4,
                             ),
-                            onPressed: _loading ? null : () {
-                              // 🔥 FIX: Добавляем небольшую задержку для предотвращения двойного нажатия
-                              if (!_loading) {
-                                _requestPermissionsAndStart();
-                              }
-                            },
+                            onPressed: _loading
+                                ? null
+                                : () {
+                                    // 🔥 FIX: Добавляем небольшую задержку для предотвращения двойного нажатия
+                                    if (!_loading) {
+                                      _requestPermissionsAndStart();
+                                    }
+                                  },
                             child: _loading
                                 ? const SizedBox(
                                     width: 20,
                                     height: 20,
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
-                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.black),
+                                      valueColor: AlwaysStoppedAnimation<Color>(
+                                          Colors.black),
                                     ),
                                   )
                                 : const TerminalText(

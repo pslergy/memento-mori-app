@@ -8,6 +8,20 @@ import 'locator.dart';
 import 'mesh_service.dart';
 import 'native_mesh_service.dart';
 
+/// 🔒 КОНТРАКТ SONAR: орган чувств сети, не транспорт.
+///
+/// Sonar используется для:
+/// • обнаружения соседних узлов (beacon = «узел рядом»);
+/// • bootstrap / hint для BLE и Wi‑Fi (сигнал может подсказать «кто-то здесь», не более);
+/// • экстренных коротких сигналов (SOS, очень короткие сообщения в sendAuto / cascade).
+///
+/// Sonar не является надёжным транспортом:
+/// • может быть потерян или искажён;
+/// • не гарантирует доставку;
+/// • любой принятый Sonar-сигнал = намёк (hint), а не факт доставки.
+///
+/// Sonar не используется для gossip или bulk-доставки. Не подключать к PeerCache
+/// как success/failure доставки; допускаются только observation / presence.
 class UltrasonicService {
   static final UltrasonicService _instance = UltrasonicService._internal();
   factory UltrasonicService() => _instance;
@@ -139,7 +153,9 @@ class UltrasonicService {
     }
   }
 
-  /// Ультразвуковой маяк
+  /// Ультразвуковой маяк (presence: «узел рядом»).
+  /// Не передаёт данных. При приёме на другой стороне — только намёк на присутствие;
+  /// не должен вызывать sendAuto, cascade или relay (см. контракт Sonar).
   Future<void> transmitBeacon() async {
     if (_isTransmitting) return;
     _isTransmitting = true;

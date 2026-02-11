@@ -9,17 +9,71 @@ import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+/// Один канал облака (хост + порт). Порядок в списке = приоритет (первый — минимальная вероятность блокировки для целевого региона).
+class BackendChannel {
+  final String host;
+  final int port;
+  const BackendChannel({required this.host, required this.port});
+  String get baseUrl => 'https://$host:$port/api';
+  String get pingUrl => 'https://$host:$port/api/auth/ping';
+  String get wsOrigin => 'wss://$host:$port';
+}
+
 /// 🔒 Конфигурация безопасности приложения
 class SecurityConfig {
   // ⚠️ PRODUCTION MODE: Certificate Pinning активен
   // Для разработки временно установите true (НЕ КОММИТИТЬ!)
   static const bool debugMode = false; // 🔒 PRODUCTION: false
-  
-  // 🔒 Доверенные хосты (IP-адреса и домены API сервера)
-  static const List<String> trustedHosts = [
-    '89.125.131.63',
+
+  // 🌐 Каналы облака (DPI): первый — основной (минимальная вероятность блокировки, см. DPI_USAGE.md),
+  // остальные — резерв при недоступности. Все хосты должны быть в trustedHostsBase или здесь.
+  static const List<BackendChannel> backendChannels = [
+    BackendChannel(host: '89.125.131.63', port: 3000),
+    // Резервные каналы (раскомментировать и настроить под свои fronting-хосты):
+    // BackendChannel(host: 'backup1.example.com', port: 443),
+    // BackendChannel(host: 'backup2.example.com', port: 443),
+  ];
+
+  static int _currentChannelIndex = 0;
+
+  /// Текущий канал (после переключения при сбоях).
+  static BackendChannel get currentChannel {
+    final idx = _currentChannelIndex;
+    if (idx >= 0 && idx < backendChannels.length) return backendChannels[idx];
+    return backendChannels.first;
+  }
+
+  static String get backendHost => currentChannel.host;
+  static int get backendPort => currentChannel.port;
+  static String get backendBaseUrl => currentChannel.baseUrl;
+  static String get backendPingUrl => currentChannel.pingUrl;
+  static String get backendWsOrigin => currentChannel.wsOrigin;
+
+  /// Вызвать при неудачном ping/API: переключает на следующий канал (по кругу).
+  static void recordBackendFailure() {
+    if (backendChannels.length <= 1) return;
+    _currentChannelIndex = (_currentChannelIndex + 1) % backendChannels.length;
+    print("🌐 [BACKEND] Switched to channel ${_currentChannelIndex + 1}/${backendChannels.length}: ${currentChannel.host}:${currentChannel.port}");
+  }
+
+  /// Вернуться на первый канал (например при успешном ping).
+  static void resetToPrimaryChannel() {
+    if (_currentChannelIndex == 0) return;
+    _currentChannelIndex = 0;
+    print("🌐 [BACKEND] Reset to primary channel: ${currentChannel.host}:${currentChannel.port}");
+  }
+
+  /// Индекс текущего канала (0 = primary).
+  static int get currentChannelIndex => _currentChannelIndex;
+
+  // 🔒 Доверенные хосты: база + все хосты из каналов (для TLS/pinning).
+  static const List<String> trustedHostsBase = [
     'memento-mori.app',
     'api.memento-mori.app',
+  ];
+  static List<String> get trustedHosts => [
+    ...trustedHostsBase,
+    for (final c in backendChannels) c.host,
   ];
   
   // 🔒 SHA-256 отпечатки сертификатов (Certificate Pinning)
