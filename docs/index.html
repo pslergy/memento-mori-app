@@ -14,8 +14,8 @@
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Memento Mori — Tactical Mesh Messenger">
-  <meta name="twitter:description" content="Mesh messenger for when there’s no signal: metro, mines, construction, forest, bunkers. Offline-first. Open source.">
-  <base href="/memento-mori-app/">
+  <meta name="twitter:description" content="Mesh messenger for when there’s no signal: metro, mines, construction, forest, bunkers. Offline-first. Open source.">  <base href="/memento-mori-app/">
+
   <link rel="icon" type="image/png" href="favicon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -34,6 +34,7 @@
         <a href="#features">How it works</a>
         <a href="#tech">Tech</a>
         <a href="#get">Get Started</a>
+        <a href="#donate">Donate</a>
       </nav>
     </div>
   </header>
@@ -190,10 +191,31 @@ flutter run --release</code></pre>
       </div>
     </section>
 
-    <section class="section support">
+    <section id="donate" class="section support">
       <div class="wrap">
         <h2 class="section-title">Support the Project</h2>
-        <p>Memento Mori is an independent open-source research project. You can support long-term work on resilient offline communication via <a href="https://github.com/sponsors/pslergy" target="_blank" rel="noopener">GitHub Sponsors</a>.</p>
+        <p class="support-intro">Memento Mori is an independent open-source research project. Your support helps accelerate development and keep resilient offline communication alive.</p>
+        <div class="donate-cta">
+          <p class="donate-label">Donate (crypto — no middleman):</p>
+          <div class="crypto-grid">
+            <div class="crypto-item">
+              <span class="crypto-tag">BTC</span>
+              <code class="crypto-addr" title="Copy">bc1q7308mnt0yarq5s9ngvjvurp3juggn9jy9yh53p</code>
+            </div>
+            <div class="crypto-item">
+              <span class="crypto-tag">ETH</span>
+              <code class="crypto-addr" title="Copy">0xd642d38532FE3c2B5Fa0547556fff2d9388621E6</code>
+            </div>
+            <div class="crypto-item">
+              <span class="crypto-tag">BNB Chain (BEP-20)</span>
+              <code class="crypto-addr" title="Copy">0xd642d38532FE3c2B5Fa0547556fff2d9388621E6</code>
+            </div>
+          </div>
+          <p class="donate-hint">Click an address to copy. Also available in the app under Support / Donate.</p>
+        </div>
+        <div class="github-sponsors-block">
+          <p><strong>GitHub Sponsors</strong> — application submitted; link will be active once approved. <a href="https://github.com/sponsors/pslergy" target="_blank" rel="noopener">github.com/sponsors/pslergy</a></p>
+        </div>
       </div>
     </section>
   </main>
@@ -211,6 +233,18 @@ flutter run --release</code></pre>
         if (!id) return;
         const el = document.getElementById(id);
         if (el) { e.preventDefault(); el.scrollIntoView({ behavior: 'smooth' }); }
+      });
+    });
+    document.querySelectorAll('.crypto-addr').forEach(el => {
+      el.addEventListener('click', function() {
+        const text = this.textContent.trim();
+        navigator.clipboard.writeText(text).then(function() {
+          const t = document.createElement('span');
+          t.textContent = ' Copied!';
+          t.style.color = 'var(--accent)';
+          el.appendChild(t);
+          setTimeout(function() { t.remove(); }, 2000);
+        });
       });
     });
   </script>
