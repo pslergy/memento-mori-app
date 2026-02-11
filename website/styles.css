@@ -445,18 +445,90 @@ body {
   color: var(--fg-muted);
 }
 
-/* Support */
-.support p {
-  margin: 0;
+/* Support / Donate */
+.support-intro {
+  margin: 0 0 1.5rem;
   color: var(--fg-muted);
 }
 
-.support a {
+.donate-cta {
+  margin-bottom: 1.5rem;
+  padding: 1.5rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.donate-label {
+  margin: 0 0 0.75rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.crypto-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.crypto-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.crypto-tag {
+  flex-shrink: 0;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--bg);
+  background: var(--accent-dim);
+  border-radius: 4px;
+}
+
+.crypto-addr {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  cursor: pointer;
+  padding: 0.25rem 0;
+}
+
+.crypto-addr:hover {
+  color: var(--accent);
+}
+
+.donate-hint {
+  margin: 0.75rem 0 0;
+  font-size: 0.8rem;
+  color: var(--fg-muted);
+}
+
+.github-sponsors-block {
+  padding: 1rem;
+  background: rgba(125, 211, 160, 0.06);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.github-sponsors-block p {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+}
+
+.support a,
+.github-sponsors-block a {
   color: var(--accent);
   text-decoration: none;
 }
 
-.support a:hover {
+.support a:hover,
+.github-sponsors-block a:hover {
   text-decoration: underline;
 }
 

@@ -13,6 +13,7 @@ import 'package:memento_mori_app/features/chat/donate_screen.dart';
 import 'package:memento_mori_app/features/profile/profile_screen.dart';
 import 'package:memento_mori_app/features/chat/mesh_hybrid_screen.dart';
 import 'package:memento_mori_app/features/friends/friends_list_screen.dart';
+import 'package:memento_mori_app/features/chat/map_screen.dart';
 import '../../core/storage_service.dart';
 import '../../core/websocket_service.dart';
 
@@ -35,13 +36,18 @@ class _ChatListScreenState extends State<ChatListScreen>
   void initState() {
     super.initState();
     _tabController =
-        TabController(length: 4, vsync: this); // Добавили вкладку Friends
+        TabController(length: 5, vsync: this); // SIGNAL, SQUADS, NODES, FRIENDS, MAP
     _tabController.addListener(() {
       if (!_tabController.indexIsChanging) setState(() {});
     });
 
     _loadChats();
     _listenToSocket();
+    if (locator.isRegistered<MeshService>()) {
+      locator<MeshService>().loadMessengerMode().then((_) {
+        if (mounted) setState(() {});
+      });
+    }
 
     NetworkMonitor().onRoleChanged.listen((role) {
       if (mounted) _loadChats();
@@ -218,11 +224,13 @@ class _ChatListScreenState extends State<ChatListScreen>
             Tab(text: "SQUADS"),
             Tab(text: "NODES"),
             Tab(text: "FRIENDS"),
+            Tab(text: "MAP"),
           ],
         ),
       ),
       body: Column(
         children: [
+          _buildMessengerModeSwitch(),
           _buildTacticalHUD(),
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
@@ -236,12 +244,83 @@ class _ChatListScreenState extends State<ChatListScreen>
                 _buildChatList(
                     _groupChats, "No squads detected in this sector."),
                 _buildChatList(_directChats, "No private links established."),
-                const FriendsListScreen(), // Вкладка Friends
+                const FriendsListScreen(),
+                const MapScreen(),
               ],
             ),
           ),
         ],
       ),
+    );
+  }
+
+  // --- 🔥 ВИЗИТКА МЕССЕНДЖЕРА: ОНЛАЙН / ОФФЛАЙН ---
+  Widget _buildMessengerModeSwitch() {
+    if (!locator.isRegistered<MeshService>()) return const SizedBox.shrink();
+    final mesh = locator<MeshService>();
+    return ListenableBuilder(
+      listenable: mesh,
+      builder: (context, _) {
+        final offline = mesh.preferOfflineMode;
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+          decoration: BoxDecoration(
+            color: Colors.black,
+            border: Border(
+              bottom: BorderSide(
+                color: (offline ? Colors.cyanAccent : Colors.greenAccent)
+                    .withOpacity(0.4),
+                width: 1,
+              ),
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'MESSENGER MODE',
+                style: TextStyle(
+                  color: Colors.white38,
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.5,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: _ModeSegment(
+                      label: 'ONLINE',
+                      subtitle: 'Cloud + mesh',
+                      isSelected: !offline,
+                      accent: Colors.greenAccent,
+                      onTap: () {
+                        mesh.setPreferOfflineMode(false);
+                        setState(() {});
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _ModeSegment(
+                      label: 'OFFLINE',
+                      subtitle: 'Mesh only',
+                      isSelected: offline,
+                      accent: Colors.cyanAccent,
+                      onTap: () {
+                        mesh.setPreferOfflineMode(true);
+                        setState(() {});
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -526,6 +605,67 @@ class _ChatListScreenState extends State<ChatListScreen>
       builder: (_) => ConversationScreen(
           friendId: friendId, friendName: name, chatRoomId: roomId),
     ));
+  }
+}
+
+/// Сегмент переключателя режима ONLINE / OFFLINE.
+class _ModeSegment extends StatelessWidget {
+  final String label;
+  final String subtitle;
+  final bool isSelected;
+  final Color accent;
+  final VoidCallback onTap;
+
+  const _ModeSegment({
+    required this.label,
+    required this.subtitle,
+    required this.isSelected,
+    required this.accent,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: isSelected ? accent.withOpacity(0.15) : Colors.white.withOpacity(0.03),
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: isSelected ? accent.withOpacity(0.7) : Colors.white12,
+              width: isSelected ? 1.5 : 0.5,
+            ),
+          ),
+          child: Column(
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  color: isSelected ? accent : Colors.white54,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.2,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                subtitle,
+                style: TextStyle(
+                  color: isSelected ? accent.withOpacity(0.9) : Colors.white24,
+                  fontSize: 8,
+                  letterSpacing: 0.5,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
 

@@ -8,12 +8,11 @@ import 'package:memento_mori_app/features/theme/app_colors.dart';
 class DonateScreen extends StatelessWidget {
   const DonateScreen({super.key});
 
-  /// Замените на реальные адреса или подгружайте из конфига/remote config.
-  static const String _btcAddress = 'bc1q...PLACEHOLDER'; // TODO: подставить реальный BTC
-  static const String _ethAddress = '0x...PLACEHOLDER';   // TODO: подставить реальный ETH
-  static const String _usdtAddress = '0x...PLACEHOLDER';  // TODO: подставить реальный USDT (ERC-20)
-  /// Ссылка на страницу с донатами (GitHub Sponsors, Ko-fi, Patreon и т.д.)
-  static const String _moreOptionsUrl = 'https://github.com'; // TODO: подставить реальную ссылку
+  static const String _btcAddress = 'bc1q7308mnt0yarq5s9ngvjvurp3juggn9jy9yh53p';
+  static const String _ethAddress = '0xd642d38532FE3c2B5Fa0547556fff2d9388621E6';
+  static const String _bnbAddress = '0xd642d38532FE3c2B5Fa0547556fff2d9388621E6'; // BNB Chain (BEP-20)
+  /// GitHub Sponsors — заявка подана, пока не одобрена; задел на будущее.
+  static const String _githubSponsorsUrl = 'https://github.com/sponsors/pslergy';
 
   @override
   Widget build(BuildContext context) {
@@ -46,11 +45,11 @@ class DonateScreen extends StatelessWidget {
           const SizedBox(height: 8),
           _buildCryptoCard(context, 'ETH', _ethAddress, Colors.blueAccent),
           const SizedBox(height: 8),
-          _buildCryptoCard(context, 'USDT (ERC-20)', _usdtAddress, Colors.greenAccent),
+          _buildCryptoCard(context, 'BNB Chain (BEP-20)', _bnbAddress, Colors.amber),
           const SizedBox(height: 24),
-          _buildSectionTitle('MORE OPTIONS'),
+          _buildSectionTitle('GITHUB SPONSORS'),
           const SizedBox(height: 8),
-          _buildLinkCard(context),
+          _buildGitHubSponsorsCard(context),
         ],
       ),
     );
@@ -70,7 +69,7 @@ class DonateScreen extends StatelessWidget {
           const SizedBox(width: 12),
           Expanded(
             child: Text(
-              'Support development of the tactical mesh. Crypto or link below.',
+              'Help the project and speed up development. Crypto below — no middleman. GitHub Sponsors coming soon.',
               style: TextStyle(
                 color: Colors.white.withOpacity(0.9),
                 fontSize: 12,
@@ -164,7 +163,7 @@ class DonateScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildLinkCard(BuildContext context) {
+  Widget _buildGitHubSponsorsCard(BuildContext context) {
     return Container(
       decoration: BoxDecoration(
         color: AppColors.gridCyan.withOpacity(0.08),
@@ -172,9 +171,9 @@ class DonateScreen extends StatelessWidget {
         border: Border.all(color: AppColors.gridCyan.withOpacity(0.25)),
       ),
       child: ListTile(
-        leading: Icon(Icons.link, color: AppColors.gridCyan, size: 24),
+        leading: Icon(Icons.volunteer_activism, color: AppColors.gridCyan, size: 24),
         title: const Text(
-          'Donation page (GitHub / Ko-fi / etc.)',
+          'GitHub Sponsors',
           style: TextStyle(
             color: Colors.white,
             fontSize: 12,
@@ -182,22 +181,21 @@ class DonateScreen extends StatelessWidget {
           ),
         ),
         subtitle: Text(
-          _moreOptionsUrl,
+          'Application pending — link will work once approved.',
           style: TextStyle(
             color: Colors.white54,
             fontSize: 10,
-            fontFamily: 'monospace',
           ),
         ),
         trailing: IconButton(
-          icon: Icon(Icons.copy, color: AppColors.gridCyan, size: 20),
+          icon: Icon(Icons.open_in_new, color: AppColors.gridCyan, size: 20),
           onPressed: () {
-            Clipboard.setData(const ClipboardData(text: _moreOptionsUrl));
+            Clipboard.setData(const ClipboardData(text: _githubSponsorsUrl));
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Link copied — open in browser'),
-                backgroundColor: Colors.black87,
-                duration: Duration(seconds: 2),
+              SnackBar(
+                content: const Text('Link copied — open in browser when available'),
+                backgroundColor: Colors.grey[900],
+                duration: const Duration(seconds: 2),
               ),
             );
           },
