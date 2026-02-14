@@ -10,11 +10,14 @@ class MessageRoutingContext {
   final String targetId;
   final String? messageId;
   final bool isEmergency;
+  /// Когда true (MESSENGER MODE = OFFLINE), BRIDGE не шлёт в Cloud — только mesh.
+  final bool preferOfflineMode;
 
   MessageRoutingContext({
     required this.targetId,
     this.messageId,
     this.isEmergency = false,
+    this.preferOfflineMode = false,
   });
 }
 
@@ -32,6 +35,7 @@ class MessageRouter {
       return DeliveryPath.meshDtn;
     }
     if (role == MeshRole.BRIDGE && hasValidBridgeLease) {
+      if (ctx.preferOfflineMode) return DeliveryPath.meshDtn;
       return DeliveryPath.backendDirect;
     }
     return DeliveryPath.meshDtn;

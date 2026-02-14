@@ -242,7 +242,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
           RoomIdNormalizer.canonicalDmRoomId(_currentUserId!, widget.friendId);
     }
 
-    // 3. МГНОВЕННЫЙ ЦИКЛ SQLITE
+    // 🔒 CORE must be ready so getMessages decrypts with same salt (after cold start / reinstall: camouflage → code → chat).
+    for (int i = 0; i < 25; i++) {
+      if (locator.isRegistered<EncryptionService>() ||
+          locator.isRegistered<VaultInterface>()) break;
+      await Future.delayed(const Duration(milliseconds: 200));
+      if (!mounted) return;
+    }
+
+    // 3. МГНОВЕННЫЙ ЦИКЛ SQLITE (getMessages returns [] if CORE still not ready)
     final history = await db.getMessages(_chatId!);
     setState(() {
       _messages = history;
@@ -302,13 +310,16 @@ class _ConversationScreenState extends State<ConversationScreen> {
     // 2. ЗАЩИТА ОТ ЭХА
     if (data['senderId'] == _currentUserId) return;
 
-    String content = data['content'] ?? "";
+    String content = data['content']?.toString() ?? data['data']?.toString() ?? "";
 
-    // 3. РАСШИФРОВКА (E2EE)
-    if (data['isEncrypted'] == true) {
+    // 3. РАСШИФРОВКА (E2EE): mesh in THE_BEACON_GLOBAL is always encrypted with shared key — decrypt so we never show ciphertext
+    final bool shouldDecrypt = data['isEncrypted'] == true ||
+        (!fromCloud && (_chatId == 'THE_BEACON_GLOBAL' || _chatId == 'GLOBAL') && content.isNotEmpty && content.length >= 20 && !content.contains(' '));
+    if (shouldDecrypt) {
       try {
         final key = await encryption.getChatKey(_chatId!);
-        content = await encryption.decrypt(content, key);
+        final decrypted = await encryption.decrypt(content, key);
+        content = decrypted.isNotEmpty ? decrypted : "[Secure Signal: Captured but Locked]";
       } catch (e) {
         content = "[Secure Signal: Captured but Locked]";
       }
@@ -433,14 +444,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
     if (_processedIds.contains(msgId)) return;
     _processedIds.add(msgId);
 
-    String content = data['content'] ?? "";
+    // Use 'content' or fallback to 'data' (e.g. BLE-assembled payload)
+    String content = data['content']?.toString() ?? data['data']?.toString() ?? "";
 
-    // Расшифровка
+    // Расшифровка: always replace content with decrypted result so we never show ciphertext
     if (data['isEncrypted'] == true || !isFromCloud) {
       try {
         final key = await encryption.getChatKey(_chatId!);
         final decrypted = await encryption.decrypt(content, key);
-        if (decrypted.isNotEmpty) content = decrypted;
+        content = decrypted.isNotEmpty ? decrypted : "[Secure Message Captured]";
       } catch (e) {
         content = "[Secure Message Captured]";
       }

@@ -19,6 +19,8 @@ import 'ultrasonic_service.dart';
 import 'gossip_manager.dart';
 import 'bluetooth_service.dart';
 import 'discovery_context_service.dart';
+import 'connection_phase.dart';
+import 'node_mode.dart';
 import 'connection_stabilizer.dart';
 import 'repeater_service.dart';
 import 'ghost_transfer_manager.dart';
@@ -99,6 +101,8 @@ void ensureCoreLocator(AppMode mode) {
 // Mesh, GhostTransferManager, TimedPanicController. Do not register before CORE.
 
 void _registerMeshAndTransport() {
+  locator.registerLazySingleton(() => ConnectionPhaseController());
+  locator.registerLazySingleton(() => NodeModeController());
   locator.registerLazySingleton(() => ApiService());
   locator.registerLazySingleton(() => MeshService());
   locator.registerLazySingleton(() => GossipManager());

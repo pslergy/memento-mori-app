@@ -16,6 +16,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:device_info_plus/device_info_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
@@ -159,6 +160,29 @@ class MeshService with ChangeNotifier {
 
   FlutterLocalNotificationsPlugin? _meshNotifications;
   bool _meshNotificationsInitialized = false;
+  bool _preferOfflineMode = false;
+
+  /// MESSENGER MODE: when true, BRIDGE sends only via mesh (no Cloud).
+  bool get preferOfflineMode => _preferOfflineMode;
+
+  /// Load saved messenger mode preference.
+  Future<void> loadMessengerMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _preferOfflineMode = prefs.getBool('prefer_offline_mode') ?? false;
+      notifyListeners();
+    } catch (_) {}
+  }
+
+  /// Set messenger mode (OFFLINE = mesh only). Persists and notifies.
+  void setPreferOfflineMode(bool value) {
+    if (_preferOfflineMode == value) return;
+    _preferOfflineMode = value;
+    notifyListeners();
+    SharedPreferences.getInstance().then((prefs) {
+      prefs.setBool('prefer_offline_mode', value);
+    });
+  }
 
   MeshService._internal() {
     // Запускаем таймер очистки "мертвых" нод раз в 10 секунд
@@ -1178,6 +1202,7 @@ class MeshService with ChangeNotifier {
       targetId: targetId,
       messageId: messageId ?? tempId,
       isEmergency: isEmergency,
+      preferOfflineMode: _preferOfflineMode,
     );
     final deliveryPath = MessageRouter.resolvePath(routingCtx);
     _log("[ROUTER] Resolved path: $deliveryPath for $targetId");
@@ -2897,7 +2922,7 @@ class MeshService with ChangeNotifier {
           "📤 [GHOST↔GHOST] roleDecision=${decision.reason}, shouldConnect=${decision.shouldConnect}");
       if (!decision.shouldConnect) {
         transferTimeoutTimer?.cancel();
-        _isTransferring = false;
+        _exitCascade();
         notifyListeners();
         return;
       }
@@ -2932,7 +2957,7 @@ class MeshService with ChangeNotifier {
         _log(
             "📤 [GHOST↔GHOST] Strategy: not initiating GATT (restrictive vendor or passive), waiting for peer to connect");
         transferTimeoutTimer?.cancel();
-        _isTransferring = false;
+        _exitCascade();
         notifyListeners();
         return;
       }
@@ -2946,7 +2971,7 @@ class MeshService with ChangeNotifier {
         _log(
             "[BLE-STRATEGY] Adaptive: prefer wait (recent failures with peer), not initiating GATT this cycle");
         transferTimeoutTimer?.cancel();
-        _isTransferring = false;
+        _exitCascade();
         notifyListeners();
         return;
       }
@@ -5611,8 +5636,14 @@ class MeshService with ChangeNotifier {
 
       // --- 3. GOSSIP ДЕДУПЛИКАЦИЯ (Anti-Entropy Layer) ---
       // Генерируем или извлекаем уникальный хеш пакета.
-      final String packetHash =
-          data['h'] ?? "pulse_${data['timestamp']}_${data['senderId']}";
+      // 🔥 MSG_FRAG: каждый фрагмент должен иметь свой hash (mid+idx), иначе 2-й и 3-й отбрасываются как дубликат и сообщение не собирается.
+      final String packetHash;
+      if (data['mid'] != null && data['idx'] != null) {
+        packetHash = "frag_${data['mid']}_${data['idx']}";
+      } else {
+        packetHash =
+            data['h'] ?? "pulse_${data['timestamp']}_${data['senderId']}";
+      }
 
       // Проверка через БД: если мы уже видели этот сигнал, мы его не обрабатываем и не пересылаем.
       if (await db.isPacketSeen(packetHash)) {

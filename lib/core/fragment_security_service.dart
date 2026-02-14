@@ -51,6 +51,7 @@ class FragmentSecurityService {
         'h': "${messageId}_$i",
         'ttl': packet['ttl'] ?? 5,
         'timestamp': packet['timestamp'],
+        if (packet['isEncrypted'] == true) 'isEncrypted': true,
       });
     }
     

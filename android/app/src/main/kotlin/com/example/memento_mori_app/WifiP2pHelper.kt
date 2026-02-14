@@ -52,6 +52,17 @@ class WifiP2pHelper(
     private var receiver: BroadcastReceiver? = null
     private val intentFilter = IntentFilter()
 
+    /** [WIFI-DIAG] Structured diagnostic log — compact one-line for console (no logic change). */
+    private fun diag(tag: String, message: String) {
+        val full = "[WIFI-DIAG] $tag | $message"
+        Log.d("P2P", full)
+        runOnMain {
+            try {
+                methodChannel.invokeMethod("onNativeLog", mapOf("tag" to "P2P", "message" to full))
+            } catch (_: Exception) { }
+        }
+    }
+
     private val networkExecutor = Executors.newFixedThreadPool(4).asCoroutineDispatcher()
     private val scope = CoroutineScope(networkExecutor + SupervisorJob())
 
@@ -77,6 +88,8 @@ class WifiP2pHelper(
     private val MAX_GROUP_RETRIES = 3     // Максимум попыток
     /** Huawei/Honor: после сбоя createGroup не ретраить сразу (cooldown 60s). */
     private var lastGroupCreateFailureTimeMs: Long = 0
+    /** [WIFI-DIAG] Last successful createGroup timestamp. */
+    private var lastGroupCreateSuccessTimeMs: Long = 0
 
     init {
         intentFilter.addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
@@ -383,12 +396,14 @@ class WifiP2pHelper(
         receiver = object : BroadcastReceiver() {
             @SuppressLint("MissingPermission")
             override fun onReceive(context: Context, intent: Intent) {
-                when (intent.action) {
+                val action = intent.action ?: "null"
+                diag("P2P:action", "action=$action")
+                when (action) {
                     WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
-                        // 🔥 КРИТИЧНО: Обрабатываем изменение состояния Wi-Fi Direct
                         val state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
                         isP2pEnabled = state == WifiP2pManager.WIFI_P2P_STATE_ENABLED
-                        
+                        diag("P2P:STATE", "state=$state p2p=$isP2pEnabled")
+
                         if (isP2pEnabled) {
                             Log.d("P2P", "✅ Wi-Fi Direct ENABLED")
                             runOnMain { 
@@ -402,6 +417,7 @@ class WifiP2pHelper(
                         }
                     }
                     WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
+                        diag("P2P:PEERS", "received")
                         manager?.requestPeers(channel) { peers ->
                             val deviceList = peers?.deviceList?.map {
                                 val hashedMac = anonymize(it.deviceAddress)
@@ -427,6 +443,9 @@ class WifiP2pHelper(
                             @Suppress("DEPRECATION")
                             intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO)
                         }
+                        val isConnected = networkInfo?.isConnected ?: false
+                        val detailedState = networkInfo?.detailedState?.name ?: "null"
+                        diag("P2P:CONN", "connected=$isConnected state=$detailedState")
 
                         logP2P("🔗 [CONNECTION] State: ${networkInfo?.state}, Connected: ${networkInfo?.isConnected}")
 
@@ -442,7 +461,7 @@ class WifiP2pHelper(
                                     Log.w("P2P", "⚠️ [CONNECTION_CHANGED] Connection info is null")
                                     return@requestConnectionInfo
                                 }
-                                
+                                diag("P2P:CONN:info", "groupFormed=${info.groupFormed} go=${info.isGroupOwner}")
                                 logP2P("📋 [CONNECTION] Info received")
                                 logP2P("   - Group formed: ${info.groupFormed}")
                                 logP2P("   - Is group owner: ${info.isGroupOwner}")
@@ -514,6 +533,10 @@ class WifiP2pHelper(
                             runOnMain { methodChannel.invokeMethod("onDisconnected", null) }
                         }
                     }
+                    WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION -> {
+                        diag("P2P:THIS_DEVICE", "received")
+                    }
+                    else -> { }
                 }
             }
         }
@@ -668,7 +691,7 @@ class WifiP2pHelper(
     }
 
     @SuppressLint("MissingPermission")
-    fun connect(hashedAddress: String, networkName: String? = null, passphrase: String? = null) {
+    fun connect(hashedAddress: String, networkName: String? = null, passphrase: String? = null, groupOwnerIntent: Int = 15) {
         if (!ensureP2pInitialized()) {
             Log.e("P2P", "❌ [CONNECT] P2P not initialized")
             runOnMain {
@@ -708,17 +731,18 @@ class WifiP2pHelper(
             logP2P("   📋 Using passphrase for Wi-Fi Direct (GHOST will connect without dialog)")
         }
 
+        val intent = groupOwnerIntent.coerceIn(0, 15)
         val config = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && passphrase != null && passphrase.isNotEmpty()) {
-            // API 29+: Используем Builder с passphrase — GHOST подключается без диалога ввода пароля
+            // API 29+: Builder с passphrase; groupOwnerIntent задаём после build()
             val builder = android.net.wifi.p2p.WifiP2pConfig.Builder()
             builder.setDeviceAddress(android.net.MacAddress.fromString(realMac))
             networkName?.let { builder.setNetworkName(it) }
             builder.setPassphrase(passphrase)
-            builder.build()
+            builder.build().apply { this.groupOwnerIntent = intent }
         } else {
             WifiP2pConfig().apply {
                 deviceAddress = realMac
-                groupOwnerIntent = 15
+                this.groupOwnerIntent = intent
             }
         }
 
@@ -932,6 +956,7 @@ class WifiP2pHelper(
         Log.d("P2P", "🔍 [GROUP] Checking existing group...")
         
         manager?.requestGroupInfo(channel) { group ->
+            diag("requestGroupInfo", "null=${group == null} nn=${group?.networkName} pass=${group?.passphrase?.take(4)}... go=${group?.isGroupOwner} owner=${group?.owner?.deviceAddress?.let { anonymize(it) }} clients=${group?.clientList?.size ?: 0}")
             if (group != null) {
                 val info = GroupInfo(
                     networkName = group.networkName,
@@ -944,7 +969,7 @@ class WifiP2pHelper(
                 Log.d("P2P", "   📋 Owner: ${if (info.isGroupOwner) "Us" else anonymize(info.ownerAddress ?: "")}")
                 Log.d("P2P", "   📋 Clients: ${info.clientCount}")
                 Log.d("P2P", "   📋 Passphrase: ${info.passphrase?.take(4)}...")
-                
+
                 isGroupOwner = info.isGroupOwner
                 currentGroupName = info.networkName
                 callback(info)
@@ -1080,6 +1105,8 @@ class WifiP2pHelper(
         
         val listener = object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
+                lastGroupCreateSuccessTimeMs = System.currentTimeMillis()
+                diag("createGroup:OK", "ts=$lastGroupCreateSuccessTimeMs")
                 logP2P("✅ [GROUP] Create cmd OK, waiting...")
                 
                 // Группа создается асинхронно, ждем обновления через колбек
@@ -1088,9 +1115,10 @@ class WifiP2pHelper(
                     delay(1000) // Даем время на создание группы
                     
                     manager?.requestGroupInfo(channel) { group ->
+                        diag("requestGroupInfo", "null=${group == null} nn=${group?.networkName} pass=${group?.passphrase?.take(4)}... go=${group?.isGroupOwner} owner=${group?.owner?.deviceAddress?.let { anonymize(it) }} clients=${group?.clientList?.size ?: 0}")
                         isGroupCreating = false
                         groupCreationRetries = 0
-                        
+
                         if (group != null) {
                             val info = GroupInfo(
                                 networkName = group.networkName,
@@ -1141,7 +1169,7 @@ class WifiP2pHelper(
                     WifiP2pManager.ERROR -> "Внутренняя ошибка Wi-Fi P2P"
                     else -> "Неизвестная ошибка: $reason"
                 }
-                
+                diag("createGroup:FAIL", "code=$reason msg=$errorMsg ts=$lastGroupCreateFailureTimeMs")
                 Log.e("P2P", "❌ [GROUP] Ошибка создания группы: $errorMsg (code: $reason)")
                 
                 // 📡 Fallback: 5 GHz не поддерживается на части устройств — повтор с 2.4 GHz (API 29+)
@@ -1198,9 +1226,13 @@ class WifiP2pHelper(
                     .setGroupOperatingBand(band)
                     .build()
                 logP2P(if (try5GhzFirst) "   📡 Using 5 GHz band (API 29+)" else "   📡 Using 2.4 GHz band (fallback)")
+                diag("createGroup:PRE", "ts=${System.currentTimeMillis()} b=${Build.BRAND} m=${Build.MODEL} sdk=${Build.VERSION.SDK_INT} wifi=${wifiManager?.let { @Suppress("DEPRECATION") it.isWifiEnabled } ?: "n"} p2p=$isP2pEnabled discover=$_isDiscoveryActive go=$isGroupOwner group=$currentGroupName")
                 manager?.createGroup(ch, config, listener)
             }
-            ch != null -> manager?.createGroup(ch, listener)
+            ch != null -> {
+                diag("createGroup:PRE", "ts=${System.currentTimeMillis()} b=${Build.BRAND} m=${Build.MODEL} sdk=${Build.VERSION.SDK_INT} wifi=${wifiManager?.let { @Suppress("DEPRECATION") it.isWifiEnabled } ?: "n"} p2p=$isP2pEnabled discover=$_isDiscoveryActive go=$isGroupOwner group=$currentGroupName")
+                manager?.createGroup(ch, listener)
+            }
             else -> {
                 isGroupCreating = false
                 Log.e("P2P", "❌ [GROUP] Channel is null, cannot create group")
@@ -1221,37 +1253,38 @@ class WifiP2pHelper(
         }
         
         Log.d("P2P", "🗑️ [GROUP] Удаляем Wi-Fi Direct группу...")
-        
+        diag("removeGroup:PRE", "ts=${System.currentTimeMillis()} group=$currentGroupName go=$isGroupOwner")
+
         manager?.removeGroup(channel, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
+                diag("removeGroup:OK", "ts=${System.currentTimeMillis()}")
                 Log.d("P2P", "✅ [GROUP] Группа удалена")
                 isGroupOwner = false
                 currentGroupName = null
-                
+
                 runOnMain {
                     methodChannel.invokeMethod("onGroupRemoved", mapOf("success" to true))
                 }
                 callback(true)
             }
-            
+
             override fun onFailure(reason: Int) {
-                // Если ошибка = "нет группы для удаления" - это нормально
                 val errorMsg = when (reason) {
                     WifiP2pManager.P2P_UNSUPPORTED -> "Wi-Fi Direct не поддерживается"
                     WifiP2pManager.BUSY -> "Wi-Fi P2P занят"
                     WifiP2pManager.ERROR -> "Группа не найдена или уже удалена"
                     else -> "Неизвестная ошибка: $reason"
                 }
-                
+                diag("removeGroup:FAIL", "ts=${System.currentTimeMillis()} code=$reason msg=$errorMsg")
                 Log.w("P2P", "⚠️ [GROUP] Ошибка удаления группы: $errorMsg")
                 isGroupOwner = false
                 currentGroupName = null
-                
-                // Считаем успехом если группы нет (ERROR = 0 обычно означает "нечего удалять")
+
                 val success = reason == WifiP2pManager.ERROR || reason == 0
                 callback(success)
             }
         })
+        diag("removeGroup:POST", "waiting callback")
     }
     
     /**
@@ -1282,6 +1315,15 @@ class WifiP2pHelper(
      */
     fun getCurrentGroupName(): String? {
         return currentGroupName
+    }
+
+    /**
+     * [WIFI-DIAG] Dump current P2P state for telemetry. No logic change.
+     */
+    fun dumpP2pState() {
+        val lastSuccessTs = if (lastGroupCreateSuccessTimeMs == 0L) "never" else lastGroupCreateSuccessTimeMs.toString()
+        val lastFailureTs = if (lastGroupCreateFailureTimeMs == 0L) "never" else lastGroupCreateFailureTimeMs.toString()
+        diag("dump", "group=$currentGroupName go=$isGroupOwner lastFail=$lastFailureTs lastOk=$lastSuccessTs p2p=$isP2pEnabled creating=$isGroupCreating discover=$_isDiscoveryActive")
     }
     
     /**

@@ -190,9 +190,13 @@ class GossipManager {
 
   /// Главная точка входа для любого пакета из Mesh-эфира.
   Future<void> processEnvelope(Map<String, dynamic> packet) async {
+    packet = Map<String, dynamic>.from(packet);
     final String type = packet['type'] ?? 'UNKNOWN';
-    final String packetId =
-        packet['h'] ?? "pulse_${packet['timestamp']}_${packet['senderId']}";
+    // 🔥 FIX: MSG_FRAG must use per-fragment packetId so both fragments are processed
+    // (otherwise same pulse_ts_senderId would drop the 2nd fragment and message never assembles)
+    final String packetId = type == 'MSG_FRAG'
+        ? '${packet['mid']}_${packet['idx']}'
+        : (packet['h'] ?? "pulse_${packet['timestamp']}_${packet['senderId']}");
     final String senderId = packet['senderId'] ?? 'unknown';
 
     // 🔒 SECURITY FIX: Rate limiting check BEFORE processing
@@ -343,9 +347,15 @@ class GossipManager {
     _mesh.addLog(
         "📦 [FRAGMENT] fragment_received: mid=${messageId.substring(0, messageId.length > 8 ? 8 : messageId.length)}... idx=$index/$total sender=${senderId.substring(0, senderId.length > 8 ? 8 : senderId.length)}...");
 
-    // 💾 SAVE TO SQL (with flooding protection)
+    // 💾 SAVE TO SQL (with flooding protection). Pass chatId/senderId so first
+    // fragment can create placeholder in messages and satisfy message_fragments FK.
     final saved = await _db.saveFragment(
-        messageId: messageId, index: index, total: total, data: data);
+        messageId: messageId,
+        index: index,
+        total: total,
+        data: data,
+        chatId: chatId,
+        senderId: senderId);
 
     if (!saved) {
       // 📊 FORENSIC LOG: fragment_duplicate or fragment_rejected
@@ -379,8 +389,9 @@ class GossipManager {
       _mesh.addLog(
           "🎉 [FRAGMENT] message_assembled: $messageId (${allFrags.length} fragments)");
 
-      // 🔥 FIX: Правильная сортировка с проверкой типов
-      allFrags.sort((a, b) {
+      // 🔥 FIX: Копируем список перед sort — getFragments может вернуть read-only list на части устройств
+      final sortedFrags = List<Map<String, dynamic>>.from(allFrags);
+      sortedFrags.sort((a, b) {
         final aIdx = a['index_num'];
         final bIdx = b['index_num'];
         final aInt = aIdx is int
@@ -393,24 +404,24 @@ class GossipManager {
       });
 
       // 🔥 ДИАГНОСТИКА: Проверяем порядок после сортировки
-      final sortedIndices = allFrags.map((f) => f['index_num']).toList();
+      final sortedIndices = sortedFrags.map((f) => f['index_num']).toList();
       _mesh.addLog("🔍 [FRAGMENT-DEBUG] Sorted indices: $sortedIndices");
 
       String fullContent =
-          allFrags.map((f) => f['data']?.toString() ?? '').join("");
+          sortedFrags.map((f) => f['data']?.toString() ?? '').join("");
 
       _mesh.addLog(
           "📝 [FRAGMENT] Assembled content: ${fullContent.length} bytes");
 
-      final fullPacket = {
-        ...frag,
-        'type': 'OFFLINE_MSG',
-        'content': fullContent,
-        'h': messageId,
-        'chatId': chatId,
-        'senderId': senderId,
-        '_assembled': true, // 🔥 Маркер что сообщение собрано
-      };
+      // Build assembled packet from deep copy so mutations never hit read-only (BLE/DB).
+      final fullPacket = jsonDecode(jsonEncode(frag)) as Map<String, dynamic>;
+      fullPacket['type'] = 'OFFLINE_MSG';
+      fullPacket['content'] = fullContent;
+      fullPacket['h'] = messageId;
+      fullPacket['chatId'] = chatId;
+      fullPacket['senderId'] = senderId;
+      fullPacket['_assembled'] = true;
+      if (frag['isEncrypted'] == true) fullPacket['isEncrypted'] = true;
 
       // 📤 DELIVER TO UI (только полное сообщение!)
       _mesh.messageController.add(fullPacket);
@@ -426,8 +437,10 @@ class GossipManager {
       // 🧹 CLEANUP fragments
       await _db.clearFragments(messageId);
 
-      // 🔄 RELAY assembled message
-      await attemptRelay(fullPacket);
+      // 🔄 RELAY: deep copy so TTL/relay never hit read-only or nested immutability
+      final packetForRelay =
+          jsonDecode(jsonEncode(fullPacket)) as Map<String, dynamic>;
+      await attemptRelay(packetForRelay);
 
       // 📊 FORENSIC LOG: relay_forwarded
       _mesh.addLog(
@@ -478,6 +491,7 @@ class GossipManager {
   }
 
   Future<void> attemptRelay(Map<String, dynamic> packet) async {
+    packet = jsonDecode(jsonEncode(packet)) as Map<String, dynamic>;
     // 🔥 TTL: Проверяем TTL перед ретрансляцией (это relay, не конечная доставка)
     if (!_checkAndDecrementTtl(packet, isFinalRecipient: false)) {
       _statsDroppedTtl++;
@@ -617,7 +631,8 @@ class GossipManager {
       _mesh.addLog("   ⚠️ No connected GATT clients to relay to");
       return;
     }
-    // Не отправляем по GATT внутреннее поле _relayRecipientsSnapshot
+    // Не отправляем по GATT внутреннее поле _relayRecipientsSnapshot.
+    // Stage 2.1: packet['content'] is ciphertext (from sendAuto or from wire).
     final packetForSend = Map<String, dynamic>.from(packet)
       ..remove('_relayRecipientsSnapshot');
     final packetJson = jsonEncode(packetForSend);
@@ -670,6 +685,7 @@ class GossipManager {
   }
 
   /// 🔥 Ретрансляция через BLE GATT (BRIDGE → GHOST)
+  /// Stage 2.1: [packet] is relayed as-is; packet['content'] is ciphertext.
   Future<void> _relayViaBle(
       Map<String, dynamic> packet, List<dynamic> bluetoothNodes) async {
     final btService = _mesh.btService;

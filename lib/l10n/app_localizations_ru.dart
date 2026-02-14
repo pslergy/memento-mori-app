@@ -66,4 +66,52 @@ class AppLocalizationsRu extends AppLocalizations {
 
   @override
   String get odysseyComplete => 'of your Odyssey complete';
+
+  @override
+  String get donateAppBarTitle => 'ПОДДЕРЖАТЬ ПРОЕКТ';
+
+  @override
+  String get donateHeaderLine1 =>
+      'Поддержка проекта. Крипто ниже — без посредников, без регистрации.';
+
+  @override
+  String get donateHeaderLine2 =>
+      'Ваша анонимность и анонимность проекта сохраняются: перевод напрямую на кошелёк, никто не хранит ваши данные.';
+
+  @override
+  String get donateSectionCrypto => 'КРИПТО — БЕЗ ПОСРЕДНИКОВ';
+
+  @override
+  String get donateSectionOther => 'ДРУГОЕ (МЕНЕЕ АНОНИМНО)';
+
+  @override
+  String get donatePrivacyNote =>
+      'Криптопожертвования: анонимно, без привязки к личности. Предпочтительный способ для сохранения приватности с обеих сторон.';
+
+  @override
+  String donateAddressCopied(Object label) {
+    return '$label — адрес скопирован';
+  }
+
+  @override
+  String get donateGitHubTitle => 'GitHub Sponsors';
+
+  @override
+  String get donateGitHubSubtitle =>
+      'Опционально. Заявка на одобрение; для полной анонимности используйте крипто выше.';
+
+  @override
+  String get donateLabelBtc => 'BTC';
+
+  @override
+  String get donateLabelEth => 'ETH';
+
+  @override
+  String get donateLabelBnb => 'BNB Chain (BEP-20)';
+
+  @override
+  String get donateLabelUsdtTrx => 'USDT (TRC-20 / Tron)';
+
+  @override
+  String get donateLabelXmrSolana => 'XMR (Monero) в сети Solana';
 }

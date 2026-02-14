@@ -23,6 +23,7 @@ import 'repeater_service.dart';
 import 'ghost_transfer_manager.dart';
 import 'message_sync_service.dart';
 import 'network_phase_context.dart';
+import 'connection_phase.dart';
 import 'ios_edge_beacon_service.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -35,6 +36,9 @@ class RouteInfo {
   double batteryLevel;
   DateTime lastSeen;
   int queuePressure; // Загруженность соседа
+  /// TTL self-healing: optional bridge token and transport type.
+  final String? bridgeToken;
+  final String? connectionType; // 'ble' | 'wifi'
 
   RouteInfo({
     required this.nodeId,
@@ -42,6 +46,8 @@ class RouteInfo {
     this.batteryLevel = 1.0,
     required this.lastSeen,
     this.queuePressure = 0,
+    this.bridgeToken,
+    this.connectionType,
   });
 
   // Метрика "Качества" узла. Чем ниже, тем лучше узел как ретранслятор.
@@ -433,6 +439,12 @@ class TacticalMeshOrchestrator {
   final Map<String, RouteInfo> _routingTable = {};
   int _myHopsToInternet = 255;
 
+  /// TTL self-healing: remove peers not seen within this period (configurable).
+  static const int nodeTimeoutSeconds = 20;
+  static Duration get _nodeTimeout => Duration(seconds: nodeTimeoutSeconds);
+
+  Timer? _routingCleanupTimer;
+
   int get myHops => _myHopsToInternet;
 
   NodeRole _role = NodeRole.GHOST;
@@ -456,7 +468,7 @@ class TacticalMeshOrchestrator {
   RouteInfo? getBestUplink() {
     var candidates = _routingTable.values
         .where((r) => r.hopsToInternet < _myHopsToInternet)
-        .where((r) => DateTime.now().difference(r.lastSeen).inMinutes < 2)
+        .where((r) => DateTime.now().difference(r.lastSeen) < _nodeTimeout)
         .toList();
 
     if (candidates.isEmpty) return null;
@@ -505,9 +517,41 @@ class TacticalMeshOrchestrator {
     }
   }
 
+  /// TTL self-healing: remove expired peers and recalculate routes. Called every 5s.
+  void _runRoutingCleanup() {
+    final now = DateTime.now();
+    final toRemove = <String>[];
+    for (final e in _routingTable.entries) {
+      if (now.difference(e.value.lastSeen) > _nodeTimeout) {
+        toRemove.add(e.key);
+      }
+    }
+    for (final nodeId in toRemove) {
+      _routingTable.remove(nodeId);
+      _log("[ROUTING] Node expired: $nodeId");
+    }
+    if (toRemove.isNotEmpty) {
+      _routeRecalculation();
+    }
+  }
+
+  /// Recalculate shortest hop paths and optionally start discovery if upstream lost (only when phase == idle).
+  void _routeRecalculation() {
+    _updateMyGradient();
+    _log("[ROUTING] Recalculated topology");
+    final best = getBestUplink();
+    if (best != null) return;
+    if (!locator.isRegistered<ConnectionPhaseController>()) return;
+    if (locator<ConnectionPhaseController>().current != ConnectionPhase.idle) return;
+    _mesh.startDiscovery(SignalType.bluetooth);
+    _log("[ROUTING] Upstream lost → discovery");
+  }
+
   // ====================== PUBLIC ======================
   void start() {
     _listenBattery();
+    _routingCleanupTimer?.cancel();
+    _routingCleanupTimer = Timer.periodic(const Duration(seconds: 5), (_) => _runRoutingCleanup());
     // Добавляем Jitter: каждый телефон просыпается в свое время
     final jitter = Duration(milliseconds: _rng.nextInt(5000));
     Future.delayed(Duration(seconds: 2 + _rng.nextInt(10)),
@@ -541,15 +585,32 @@ class TacticalMeshOrchestrator {
 // Не забудь добавить Extension (если еще не добавил),
 // чтобы превращать пульс в байты для BLE
 
-  void processRoutingPulse(RoutingPulse pulse) {
+  void processRoutingPulse(RoutingPulse pulse, {String? connectionType, String? bridgeToken}) {
     _routingTable[pulse.nodeId] = RouteInfo(
       nodeId: pulse.nodeId,
       hopsToInternet: pulse.hopsToInternet,
       batteryLevel: pulse.batteryLevel,
       lastSeen: DateTime.now(),
       queuePressure: pulse.queuePressure,
+      bridgeToken: bridgeToken,
+      connectionType: connectionType,
     );
     _updateMyGradient();
+  }
+
+  /// TTL self-healing: update lastSeen (and optionally connectionType) when a packet is received from this peer.
+  void touchPeer(String nodeId, {String? connectionType}) {
+    final r = _routingTable[nodeId];
+    if (r == null) return;
+    _routingTable[nodeId] = RouteInfo(
+      nodeId: r.nodeId,
+      hopsToInternet: r.hopsToInternet,
+      batteryLevel: r.batteryLevel,
+      lastSeen: DateTime.now(),
+      queuePressure: r.queuePressure,
+      bridgeToken: r.bridgeToken,
+      connectionType: connectionType ?? r.connectionType,
+    );
   }
 
   Future<void> dispatchMessage(ChatMessage msg) async {
@@ -613,8 +674,7 @@ class TacticalMeshOrchestrator {
     // Ищем лучший аплинк в таблице
     int minHopsNearby = 254;
     for (var route in _routingTable.values) {
-      // Aging: если соседа не видели > 2 минут, не верим ему
-      if (DateTime.now().difference(route.lastSeen).inMinutes > 2) continue;
+      if (DateTime.now().difference(route.lastSeen) >= _nodeTimeout) continue;
 
       if (route.hopsToInternet < minHopsNearby) {
         minHopsNearby = route.hopsToInternet;

@@ -59,4 +59,52 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get odysseyComplete => '人生旅程完成度';
+
+  @override
+  String get donateAppBarTitle => 'SUPPORT THE GRID';
+
+  @override
+  String get donateHeaderLine1 =>
+      'Support the project. Crypto below — no middleman, no signup.';
+
+  @override
+  String get donateHeaderLine2 =>
+      'Your anonymity and the project\'s anonymity are preserved: direct transfer to wallet, no one stores your data.';
+
+  @override
+  String get donateSectionCrypto => 'CRYPTO — NO MIDDLEMAN';
+
+  @override
+  String get donateSectionOther => 'OTHER (LESS ANONYMOUS)';
+
+  @override
+  String get donatePrivacyNote =>
+      'Crypto donations: anonymous, no link to identity. Preferred way to preserve privacy on both sides.';
+
+  @override
+  String donateAddressCopied(Object label) {
+    return '$label — address copied';
+  }
+
+  @override
+  String get donateGitHubTitle => 'GitHub Sponsors';
+
+  @override
+  String get donateGitHubSubtitle =>
+      'Optional. Application pending; for full anonymity use crypto above.';
+
+  @override
+  String get donateLabelBtc => 'BTC';
+
+  @override
+  String get donateLabelEth => 'ETH';
+
+  @override
+  String get donateLabelBnb => 'BNB Chain (BEP-20)';
+
+  @override
+  String get donateLabelUsdtTrx => 'USDT (TRC-20 / Tron)';
+
+  @override
+  String get donateLabelXmrSolana => 'XMR (Monero) on Solana';
 }

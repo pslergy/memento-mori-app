@@ -238,7 +238,8 @@ class MainActivity : FlutterFragmentActivity() {
                 "startAdvertising" -> {
                     val localName = call.argument<String>("localName") ?: ""
                     val manufacturerData = call.argument<ByteArray>("manufacturerData") ?: byteArrayOf()
-                    val success = nativeBleAdvertiser?.startAdvertising(localName, manufacturerData) ?: false
+                    val singleStrategyOnly = call.argument<Boolean>("singleStrategyOnly") ?: false
+                    val success = nativeBleAdvertiser?.startAdvertising(localName, manufacturerData, singleStrategyOnly) ?: false
                     result.success(success)
                 }
                 "stopAdvertising" -> {

@@ -221,6 +221,90 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'of your Odyssey complete'**
   String get odysseyComplete;
+
+  /// No description provided for @donateAppBarTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'SUPPORT THE GRID'**
+  String get donateAppBarTitle;
+
+  /// No description provided for @donateHeaderLine1.
+  ///
+  /// In en, this message translates to:
+  /// **'Support the project. Crypto below — no middleman, no signup.'**
+  String get donateHeaderLine1;
+
+  /// No description provided for @donateHeaderLine2.
+  ///
+  /// In en, this message translates to:
+  /// **'Your anonymity and the project\'s anonymity are preserved: direct transfer to wallet, no one stores your data.'**
+  String get donateHeaderLine2;
+
+  /// No description provided for @donateSectionCrypto.
+  ///
+  /// In en, this message translates to:
+  /// **'CRYPTO — NO MIDDLEMAN'**
+  String get donateSectionCrypto;
+
+  /// No description provided for @donateSectionOther.
+  ///
+  /// In en, this message translates to:
+  /// **'OTHER (LESS ANONYMOUS)'**
+  String get donateSectionOther;
+
+  /// No description provided for @donatePrivacyNote.
+  ///
+  /// In en, this message translates to:
+  /// **'Crypto donations: anonymous, no link to identity. Preferred way to preserve privacy on both sides.'**
+  String get donatePrivacyNote;
+
+  /// No description provided for @donateAddressCopied.
+  ///
+  /// In en, this message translates to:
+  /// **'{label} — address copied'**
+  String donateAddressCopied(Object label);
+
+  /// No description provided for @donateGitHubTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'GitHub Sponsors'**
+  String get donateGitHubTitle;
+
+  /// No description provided for @donateGitHubSubtitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Optional. Application pending; for full anonymity use crypto above.'**
+  String get donateGitHubSubtitle;
+
+  /// No description provided for @donateLabelBtc.
+  ///
+  /// In en, this message translates to:
+  /// **'BTC'**
+  String get donateLabelBtc;
+
+  /// No description provided for @donateLabelEth.
+  ///
+  /// In en, this message translates to:
+  /// **'ETH'**
+  String get donateLabelEth;
+
+  /// No description provided for @donateLabelBnb.
+  ///
+  /// In en, this message translates to:
+  /// **'BNB Chain (BEP-20)'**
+  String get donateLabelBnb;
+
+  /// No description provided for @donateLabelUsdtTrx.
+  ///
+  /// In en, this message translates to:
+  /// **'USDT (TRC-20 / Tron)'**
+  String get donateLabelUsdtTrx;
+
+  /// No description provided for @donateLabelXmrSolana.
+  ///
+  /// In en, this message translates to:
+  /// **'XMR (Monero) on Solana'**
+  String get donateLabelXmrSolana;
 }
 
 class _AppLocalizationsDelegate

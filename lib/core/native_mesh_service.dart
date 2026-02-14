@@ -474,7 +474,8 @@ class NativeMeshService {
     }
   }
 
-  static Future<void> connect(String address, {String? networkName, String? passphrase}) async {
+  static Future<void> connect(String address,
+      {String? networkName, String? passphrase, int groupOwnerIntent = 15}) async {
     if (address.isEmpty || address == "null") {
       print("❌ [Native] Connection aborted: Target address is empty.");
       return;
@@ -484,6 +485,7 @@ class NativeMeshService {
         'deviceAddress': address,
         if (networkName != null && networkName.isNotEmpty) 'networkName': networkName,
         if (passphrase != null && passphrase.isNotEmpty) 'passphrase': passphrase,
+        'groupOwnerIntent': groupOwnerIntent.clamp(0, 15),
       });
     } catch (e) {
       print("❌ [Native] Connection Error: $e");

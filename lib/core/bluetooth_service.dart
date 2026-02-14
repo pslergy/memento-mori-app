@@ -3377,7 +3377,9 @@ class BluetoothMeshService {
       _log("[BLE-TIMING] Pre-write settle: 500ms (GHOST↔GHOST stability)");
       await Future.delayed(const Duration(milliseconds: 500));
 
-      // 🔥 ШАГ 1: Отправляем ВСЕ сообщения в рамках одного подключения (до включения notify)
+      // 🔥 ШАГ 1: Отправляем сообщения. Для OUTBOX_REQUEST включаем notify ДО записи, чтобы central получил ответ периферии.
+      final shouldEnableNotify = characteristic!.properties.notify &&
+          (writeStrategy == null || writeStrategy!.useNotify);
       _stateMachine.forceTransition(BleState.TRANSFERRING);
       _gattTransition(BleGattSessionState.TRANSFERRING);
       _log("[GATT][STATE] TRANSFERRING — WRITE OK");
@@ -3404,6 +3406,30 @@ class BluetoothMeshService {
 
         try {
           final message = messages[i];
+          // 🔥 OUTBOX_REQUEST: enable notify BEFORE sending so central receives peripheral's outbox response
+          final bool isOutboxRequest = message.toString().contains('OUTBOX_REQUEST');
+          if (isOutboxRequest && shouldEnableNotify && batchNotifySub == null) {
+            if (writeStrategy?.delayNotify == true) {
+              _log("[BLE][ADAPTIVE] delayNotify: 300ms before enable notify");
+              await Future.delayed(const Duration(milliseconds: 300));
+            }
+            try {
+              await characteristic!.setNotifyValue(true).timeout(
+                Duration(seconds: _notifyEnableTimeoutSeconds),
+                onTimeout: () => throw TimeoutException('Notify enable (before OUTBOX_REQUEST)'),
+              );
+              _ghostNotifyBuffer.clear();
+              _ghostNotifyExpectedLength = -1;
+              final bridgeAddress = device.remoteId.str;
+              batchNotifySub = characteristic!.lastValueStream.listen(
+                (value) => _onNotifyChunkFromBridge(bridgeAddress, value),
+                onError: (e) => _log("⚠️ [BATCH] Notify stream error: $e"),
+              );
+              _log("📥 [BATCH] Notify enabled before OUTBOX_REQUEST — subscribed to BRIDGE notify");
+            } catch (e) {
+              _log("⚠️ [BATCH] Notify enable before OUTBOX_REQUEST failed (non-blocking): $e");
+            }
+          }
           // 🔥 §6.17: Ограничение размера по BLE — большие сообщения пропускаем, остаются для TCP/cloud
           if (message.length > kMaxBlePayloadBytes) {
             _log(
@@ -3573,12 +3599,8 @@ class BluetoothMeshService {
       _log(
           "📊 [BATCH-$batchId] END: $sentCount/${messages.length} sent in ${totalMs}ms");
 
-      // 🔥 ШАГ 2: После записи включаем notify для окна listen (BRIDGE→GHOST relay). Не до записи — на Huawei
-      // таймаут notify оставлял стек в WRITE_REQUEST_BUSY и запись не проходила.
-      // ADAPTIVE: pair strategy can disable notify or delay it.
-      final shouldEnableNotify = characteristic!.properties.notify &&
-          (writeStrategy == null || writeStrategy!.useNotify);
-      if (shouldEnableNotify) {
+      // 🔥 ШАГ 2: После записи включаем notify для окна listen (BRIDGE→GHOST relay). Если уже включили до OUTBOX_REQUEST — пропускаем.
+      if (shouldEnableNotify && batchNotifySub == null) {
         if (writeStrategy?.delayNotify == true) {
           _log("[BLE][ADAPTIVE] delayNotify: 300ms before enable notify");
           await Future.delayed(const Duration(milliseconds: 300));

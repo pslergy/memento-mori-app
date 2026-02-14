@@ -50,33 +50,36 @@ class EncryptionService {
   }
 
   /// 🔒 SECURITY FIX: Per-user key derivation instead of hardcoded key
-  /// Generates unique key for each chat using user-specific salt
+  /// Generates unique key for each chat using user-specific salt.
+  /// THE_BEACON_GLOBAL uses a shared fixed seed so all devices can decrypt mesh messages in global chat.
   Future<SecretKey> getChatKey(String chatId) async {
-    // 🔒 Get user-specific salt (unique per device/user)
-    final userSalt = await _getUserSalt();
-
     String derivationId = chatId;
-
     if (chatId == "GLOBAL" || chatId == "THE_BEACON_GLOBAL") {
       derivationId = "THE_BEACON_GLOBAL";
     } else if (chatId.startsWith("GHOST_")) {
       derivationId = "TACTICAL_MESH_LINK_V1";
     }
 
-    // 🔒 SECURITY FIX: PBKDF2 with 100,000 iterations (OWASP recommendation)
     final pbkdf2 = Pbkdf2(
       macAlgorithm: Hmac.sha256(),
       iterations: _pbkdf2Iterations,
       bits: 256,
     );
 
-    // 🔒 Derive key using user salt + chat ID
-    final secretKey = await pbkdf2.deriveKey(
+    // 🔒 THE_BEACON_GLOBAL: shared key so mesh peers can decrypt each other's messages
+    if (chatId == "GLOBAL" || chatId == "THE_BEACON_GLOBAL") {
+      const fixedSeed = "MEMENTO_BEACON_GLOBAL_SHARED_V1";
+      return pbkdf2.deriveKey(
+        secretKey: SecretKey(utf8.encode(fixedSeed)),
+        nonce: utf8.encode(derivationId),
+      );
+    }
+
+    final userSalt = await _getUserSalt();
+    return pbkdf2.deriveKey(
       secretKey: SecretKey(base64.decode(userSalt)),
       nonce: utf8.encode(derivationId),
     );
-
-    return secretKey;
   }
 
   /// 🔒 SECURITY FIX: System key now uses user-specific derivation
@@ -96,12 +99,23 @@ class EncryptionService {
     );
   }
 
+  /// Этап 1: макс. длина случайного padding (байт) для рандомизации размера пакета.
+  static const int _paddingMaxBytes = 64;
+
   // Шифрование данных
   Future<String> encrypt(String text, SecretKey key) async {
-    // В пакете 'cryptography' метод encrypt по умолчанию генерирует
-    // случайный 96-битный Nonce (IV) для каждого вызова. Это ПРАВИЛЬНО.
+    // Этап 1: случайный padding для рандомизации длины (снижение паттернов).
+    final rnd = math.Random.secure();
+    final padLen = rnd.nextInt(_paddingMaxBytes + 1);
+    final padBytes = padLen > 0
+        ? Uint8List.fromList(List.generate(padLen, (_) => rnd.nextInt(256)))
+        : null;
+    final plaintext = padBytes != null
+        ? '$text\x00${base64.encode(padBytes)}'
+        : text;
+
     final secretBox = await _algorithm.encrypt(
-      utf8.encode(text),
+      utf8.encode(plaintext),
       secretKey: key,
     );
 
@@ -185,11 +199,14 @@ class EncryptionService {
 
       final decryptedBytes =
           await _algorithm.decrypt(secretBox, secretKey: key);
-      return utf8.decode(decryptedBytes);
+      final decoded = utf8.decode(decryptedBytes);
+      // Этап 1: убираем padding (формат content + "\x00" + base64)
+      final idx = decoded.indexOf('\x00');
+      return idx >= 0 ? decoded.substring(0, idx) : decoded;
     } catch (e) {
-      // Если это не Base64 или ошибка ключа — не паникуем, отдаем оригинал
-      print("⚠️ [Decrypt] Not a valid ciphertext or wrong key. Returning raw.");
-      return cipherText;
+      // Не показываем сырой шифртекст в UI — возвращаем placeholder
+      print("⚠️ [Decrypt] Not a valid ciphertext or wrong key. Returning placeholder.");
+      return "[Secure message unavailable]";
     }
   }
 

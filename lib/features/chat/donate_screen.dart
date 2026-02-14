@@ -2,8 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'package:memento_mori_app/features/theme/app_colors.dart';
+import 'package:memento_mori_app/l10n/app_localizations.dart';
 
-/// Экран поддержки проекта: крипто-адреса (без посредников) и опциональная ссылка.
+/// Экран поддержки проекта: крипто-адреса (без посредников), анонимность донора и проекта.
 /// Стиль — тактический, в духе приложения.
 class DonateScreen extends StatelessWidget {
   const DonateScreen({super.key});
@@ -11,16 +12,19 @@ class DonateScreen extends StatelessWidget {
   static const String _btcAddress = 'bc1q7308mnt0yarq5s9ngvjvurp3juggn9jy9yh53p';
   static const String _ethAddress = '0xd642d38532FE3c2B5Fa0547556fff2d9388621E6';
   static const String _bnbAddress = '0xd642d38532FE3c2B5Fa0547556fff2d9388621E6'; // BNB Chain (BEP-20)
-  /// GitHub Sponsors — заявка подана, пока не одобрена; задел на будущее.
+  static const String _usdtTrxAddress = 'TBXUd9XyFYfZE9m3BdJ76659As5dm8DdKD'; // USDT в сети TRX (Tron)
+  static const String _xmrSolanaAddress = '8wTydu2jav9uKjUatC5i4PBuXT5EJkSQ9yvva21aK3GA'; // Monero (XMR) в сети Solana
+  /// GitHub Sponsors — опционально; крипто предпочтительнее для анонимности.
   static const String _githubSponsorsUrl = 'https://github.com/sponsors/pslergy';
 
   @override
   Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context)!;
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        title: const Text(
-          'SUPPORT THE GRID',
+        title: Text(
+          l.donateAppBarTitle,
           style: TextStyle(
             letterSpacing: 2,
             fontWeight: FontWeight.bold,
@@ -37,17 +41,23 @@ class DonateScreen extends StatelessWidget {
       body: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         children: [
-          _buildHeader(),
+          _buildHeader(context),
           const SizedBox(height: 20),
-          _buildSectionTitle('CRYPTO — NO MIDDLEMAN'),
+          _buildSectionTitle(context, l.donateSectionCrypto),
           const SizedBox(height: 8),
-          _buildCryptoCard(context, 'BTC', _btcAddress, Colors.orangeAccent),
+          _buildCryptoCard(context, l.donateLabelBtc, _btcAddress, Colors.orangeAccent),
           const SizedBox(height: 8),
-          _buildCryptoCard(context, 'ETH', _ethAddress, Colors.blueAccent),
+          _buildCryptoCard(context, l.donateLabelEth, _ethAddress, Colors.blueAccent),
           const SizedBox(height: 8),
-          _buildCryptoCard(context, 'BNB Chain (BEP-20)', _bnbAddress, Colors.amber),
+          _buildCryptoCard(context, l.donateLabelBnb, _bnbAddress, Colors.amber),
+          const SizedBox(height: 8),
+          _buildCryptoCard(context, l.donateLabelUsdtTrx, _usdtTrxAddress, Colors.greenAccent),
+          const SizedBox(height: 8),
+          _buildCryptoCard(context, l.donateLabelXmrSolana, _xmrSolanaAddress, Color(0xFFFF6600)),
+          const SizedBox(height: 12),
+          _buildPrivacyNote(context),
           const SizedBox(height: 24),
-          _buildSectionTitle('GITHUB SPONSORS'),
+          _buildSectionTitle(context, l.donateSectionOther),
           const SizedBox(height: 8),
           _buildGitHubSponsorsCard(context),
         ],
@@ -55,7 +65,8 @@ class DonateScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildHeader() {
+  Widget _buildHeader(BuildContext context) {
+    final l = AppLocalizations.of(context)!;
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -63,18 +74,33 @@ class DonateScreen extends StatelessWidget {
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: AppColors.sonarPurple.withOpacity(0.25)),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(Icons.volunteer_activism, color: AppColors.sonarPurple, size: 32),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              'Help the project and speed up development. Crypto below — no middleman. GitHub Sponsors coming soon.',
-              style: TextStyle(
-                color: Colors.white.withOpacity(0.9),
-                fontSize: 12,
-                height: 1.3,
+          Row(
+            children: [
+              Icon(Icons.volunteer_activism, color: AppColors.sonarPurple, size: 32),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  l.donateHeaderLine1,
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(0.9),
+                    fontSize: 12,
+                    height: 1.3,
+                  ),
+                ),
               ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            l.donateHeaderLine2,
+            style: TextStyle(
+              color: Colors.white.withOpacity(0.6),
+              fontSize: 10,
+              height: 1.35,
+              fontStyle: FontStyle.italic,
             ),
           ),
         ],
@@ -82,7 +108,32 @@ class DonateScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildSectionTitle(String title) {
+  Widget _buildPrivacyNote(BuildContext context) {
+    final l = AppLocalizations.of(context)!;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.03),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.shield_outlined, color: Colors.white24, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              l.donatePrivacyNote,
+              style: TextStyle(color: Colors.white38, fontSize: 10, height: 1.3),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSectionTitle(BuildContext context, String title) {
     return Padding(
       padding: const EdgeInsets.only(left: 4),
       child: Text(
@@ -97,73 +148,83 @@ class DonateScreen extends StatelessWidget {
     );
   }
 
+  void _copyAddressAndSnackbar(BuildContext context, String label, String address) {
+    final l = AppLocalizations.of(context)!;
+    Clipboard.setData(ClipboardData(text: address));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(l.donateAddressCopied(label)),
+        backgroundColor: Colors.grey[900],
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
   Widget _buildCryptoCard(
     BuildContext context,
     String label,
     String address,
     Color accent,
   ) {
-    return Container(
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [accent.withOpacity(0.12), Colors.transparent],
-          begin: Alignment.centerLeft,
-          end: Alignment.centerRight,
-        ),
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: () => _copyAddressAndSnackbar(context, label, address),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: accent.withOpacity(0.3)),
-      ),
-      child: ListTile(
-        leading: Container(
-          width: 36,
-          height: 36,
+        child: Container(
           decoration: BoxDecoration(
-            color: accent.withOpacity(0.2),
-            borderRadius: BorderRadius.circular(8),
+            gradient: LinearGradient(
+              colors: [accent.withOpacity(0.12), Colors.transparent],
+              begin: Alignment.centerLeft,
+              end: Alignment.centerRight,
+            ),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: accent.withOpacity(0.3)),
           ),
-          alignment: Alignment.center,
-          child: Text(
-            label.split(' ').first.substring(0, 1),
-            style: TextStyle(color: accent, fontWeight: FontWeight.bold, fontSize: 14),
-          ),
-        ),
-        title: Text(
-          label,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 12,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        subtitle: Text(
-          address,
-          style: TextStyle(
-            color: Colors.white54,
-            fontSize: 10,
-            fontFamily: 'monospace',
-          ),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-        trailing: IconButton(
-          icon: Icon(Icons.copy, color: accent, size: 20),
-          onPressed: () {
-            Clipboard.setData(ClipboardData(text: address));
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('$label address copied'),
-                backgroundColor: Colors.grey[900],
-                duration: const Duration(seconds: 2),
+          child: ListTile(
+            leading: Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                color: accent.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(8),
               ),
-            );
-          },
-          tooltip: 'Copy',
+              alignment: Alignment.center,
+              child: Text(
+                label.split(' ').first.substring(0, 1),
+                style: TextStyle(color: accent, fontWeight: FontWeight.bold, fontSize: 14),
+              ),
+            ),
+            title: Text(
+              label,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            subtitle: Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                address,
+                style: TextStyle(
+                  color: Colors.white54,
+                  fontSize: 10,
+                  fontFamily: 'monospace',
+                ),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            trailing: Icon(Icons.copy, color: accent.withOpacity(0.9), size: 20),
+          ),
         ),
       ),
     );
   }
 
   Widget _buildGitHubSponsorsCard(BuildContext context) {
+    final l = AppLocalizations.of(context)!;
     return Container(
       decoration: BoxDecoration(
         color: AppColors.gridCyan.withOpacity(0.08),
@@ -172,16 +233,16 @@ class DonateScreen extends StatelessWidget {
       ),
       child: ListTile(
         leading: Icon(Icons.volunteer_activism, color: AppColors.gridCyan, size: 24),
-        title: const Text(
-          'GitHub Sponsors',
-          style: TextStyle(
+        title: Text(
+          l.donateGitHubTitle,
+          style: const TextStyle(
             color: Colors.white,
             fontSize: 12,
             fontWeight: FontWeight.bold,
           ),
         ),
         subtitle: Text(
-          'Application pending — link will work once approved.',
+          l.donateGitHubSubtitle,
           style: TextStyle(
             color: Colors.white54,
             fontSize: 10,

@@ -1,5 +1,7 @@
-import 'dart:typed_data';
 import 'dart:convert';
+import 'dart:typed_data';
+
+import 'device_capability.dart';
 
 /// Uplink Candidate - устойчивый контекст обнаружения
 /// 
@@ -38,6 +40,9 @@ class UplinkCandidate {
 
   /// Wi-Fi Direct network name / SSID (из manufacturerData BRIDGE)
   final String? wifiDirectNetworkName;
+
+  /// [CAPABILITY] Peer is Huawei/Honor (from BLE advertising capability byte). For Wi‑Fi: Huawei MUST be GO.
+  final bool? wifiLikelyUnstableCentral;
   
   /// Время последнего подтверждения (когда кандидат был обнаружен)
   final DateTime lastSeen;
@@ -131,6 +136,7 @@ class UplinkCandidate {
     this.bridgeToken,
     this.wifiDirectPassphrase,
     this.wifiDirectNetworkName,
+    this.wifiLikelyUnstableCentral,
     DateTime? lastSeen,
     DateTime? createdAt,
     this.confidence = 0.5,
@@ -153,6 +159,7 @@ class UplinkCandidate {
     String? bridgeToken,
     String? wifiDirectPassphrase,
     String? wifiDirectNetworkName,
+    bool? wifiLikelyUnstableCentral,
     DateTime? lastSeen,
     double? confidence,
     String? discoverySource,
@@ -186,6 +193,7 @@ class UplinkCandidate {
       bridgeToken: bridgeToken ?? this.bridgeToken,
       wifiDirectPassphrase: wifiDirectPassphrase ?? this.wifiDirectPassphrase,
       wifiDirectNetworkName: wifiDirectNetworkName ?? this.wifiDirectNetworkName,
+      wifiLikelyUnstableCentral: wifiLikelyUnstableCentral ?? this.wifiLikelyUnstableCentral,
       lastSeen: lastSeen ?? DateTime.now(),
       createdAt: createdAt,
       confidence: newConfidence,
@@ -338,6 +346,16 @@ class UplinkCandidate {
       }
     }
 
+    // [CAPABILITY] Last byte of manufacturerData = capability bitmask (peer Huawei-like => Wi‑Fi GO policy).
+    bool? wifiLikelyUnstableCentral;
+    if (manufacturerData != null) {
+      final mf = manufacturerData[0xFFFF];
+      if (mf != null && mf.length >= 3) {
+        final cap = DeviceCapability.fromCapabilityByte(mf[mf.length - 1]);
+        wifiLikelyUnstableCentral = cap.wifiLikelyUnstableCentral;
+      }
+    }
+
     // 🔥 КРИТИЧНО: Используем logical ID вместо MAC для идентификации BRIDGE; для GHOST — deviceUuid если есть
     final candidateId = deviceUuidHex ?? logicalId ?? peerId;
 
@@ -358,6 +376,7 @@ class UplinkCandidate {
       bridgeToken: bridgeToken ?? extractedToken,
       wifiDirectPassphrase: wifiDirectPassphrase ?? parsedWifiPassphrase,
       wifiDirectNetworkName: wifiDirectNetworkName ?? parsedWifiNetworkName,
+      wifiLikelyUnstableCentral: wifiLikelyUnstableCentral,
       confidence: confidence.clamp(0.0, 1.0),
       discoverySources: {"BLE"},
       ttlSeconds: role == "BRIDGE" ? 120 : 60,

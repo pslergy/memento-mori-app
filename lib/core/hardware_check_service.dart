@@ -1,5 +1,7 @@
-import 'package:device_info_plus/device_info_plus.dart';
+import 'dart:convert';
 import 'dart:io';
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// Read-only facts from device + doc (brand, sdk, manufacturer quirks).
 /// Policy stays in HardwareCheckService; this is structural only for future separation.
@@ -53,7 +55,44 @@ class HardwareCheckService {
   /// Самоадаптация: score по отпечатку (N failures → same boolean as before).
   /// Threshold 2: after 2 failures, preferGattPeripheral override for non-known-good vendors.
   static const int _kBleCentralFailureThreshold = 2;
+  static const String _kPrefBleCentralFailures = 'ble_central_failure_count';
   final Map<String, int> _bleCentralFailureCountByFingerprint = {};
+  bool _bleFailuresLoaded = false;
+
+  /// Load persisted BLE central failure counts. Call from _ensureDeviceInfo or before first use.
+  Future<void> _loadPersistedBleFailures() async {
+    if (_bleFailuresLoaded) return;
+    _bleFailuresLoaded = true;
+    if (!Platform.isAndroid) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final json = prefs.getString(_kPrefBleCentralFailures);
+      if (json == null || json.isEmpty) return;
+      final map = jsonDecode(json) as Map<String, dynamic>?;
+      if (map == null) return;
+      for (final e in map.entries) {
+        if (e.value is int) _bleCentralFailureCountByFingerprint[e.key] = e.value as int;
+      }
+    } catch (_) {}
+  }
+
+  /// Persist BLE central failure counts (after recording a failure).
+  Future<void> _persistBleFailures() async {
+    if (!Platform.isAndroid) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kPrefBleCentralFailures, jsonEncode(_bleCentralFailureCountByFingerprint));
+    } catch (_) {}
+  }
+
+  /// True if this device has had >2 BLE central timeouts (persisted). Used for capability bitmask.
+  Future<bool> get bleCentralUnstable async {
+    await _ensureDeviceInfo();
+    await _loadPersistedBleFailures();
+    final fp = await getDeviceFingerprint();
+    if (fp == 'unknown') return false;
+    return _bleCentralFailureScoreForFingerprint(fp) > 2;
+  }
 
   /// Отпечаток устройства для кэша самоадаптации. Вызывать после _ensureDeviceInfo().
   Future<String> getDeviceFingerprint() async {
@@ -68,13 +107,15 @@ class HardwareCheckService {
 
   /// Вызвать при неудаче попытки BLE Central (connect timeout/error). После _kBleCentralFailureThreshold
   /// неудач для этого отпечатка в профиле включается preferGattPeripheral (не инициировать GATT).
-  /// Не трогаем известные вендоры (Huawei/Tecno/Xiaomi) — только для «неизвестных» устройств.
+  /// Persists count so capability survives restart. Не трогаем известные вендоры (Huawei/Tecno/Xiaomi).
   Future<void> recordBleCentralFailure() async {
     if (!Platform.isAndroid) return;
+    await _loadPersistedBleFailures();
     final fp = await getDeviceFingerprint();
     if (fp == 'unknown') return;
     _bleCentralFailureCountByFingerprint[fp] =
         _bleCentralFailureScoreForFingerprint(fp) + 1;
+    await _persistBleFailures();
     if (_bleCentralFailureScoreForFingerprint(fp) >= _kBleCentralFailureThreshold) {
       _cachedProfile = null;
     }
@@ -90,6 +131,7 @@ class HardwareCheckService {
   /// Логика совпадает с CONNECTION_PATTERNS_SNAPSHOT.md — не менять результат.
   Future<void> _ensureDeviceInfo() async {
     if (_cachedProfile != null) return;
+    await _loadPersistedBleFailures();
     try {
       if (!Platform.isAndroid) {
         _cachedProfile = const _DeviceConnectionProfile(

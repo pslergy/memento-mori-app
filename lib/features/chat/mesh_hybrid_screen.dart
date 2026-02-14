@@ -438,7 +438,7 @@ class _MeshHybridScreenState extends State<MeshHybridScreen>
                     itemBuilder: (context, i) {
                       final line = _terminalLogs[i];
                       final lineText = "> $line";
-                      final isDiag = line.contains('MESH_DIAG');
+                      final isDiag = line.contains('MESH_DIAG') || line.contains('WIFI-DIAG');
                       return Padding(
                         padding: const EdgeInsets.symmetric(vertical: 2),
                         child: InkWell(

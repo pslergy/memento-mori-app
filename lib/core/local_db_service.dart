@@ -749,6 +749,17 @@ class LocalDatabaseService {
   /// is already encrypted (do not double-encrypt). Default false = encrypt before store.
   Future<void> saveMessage(ChatMessage msg, String chatId,
       {bool contentAlreadyEncrypted = false}) async {
+    // 🔒 SECURITY: Use same key source as getMessages — never EncryptionService(null), or decrypt on load fails.
+    if (!locator.isRegistered<EncryptionService>() &&
+        !locator.isRegistered<VaultInterface>()) {
+      print(
+          "⚠️ [DB] saveMessage skipped: CORE not ready (no EncryptionService/Vault) — message not persisted");
+      return;
+    }
+    final encryptionService = locator.isRegistered<EncryptionService>()
+        ? locator<EncryptionService>()
+        : EncryptionService(locator<VaultInterface>());
+
     final db = await database;
     final currentUserId = await _getCurrentUserId();
     if (msg.clientTempId != null) {
@@ -756,10 +767,6 @@ class LocalDatabaseService {
           .delete('messages', where: 'id = ?', whereArgs: [msg.clientTempId]);
     }
 
-    // 🔒 SECURITY: Store encrypted. Use same EncryptionService as app (vault) so decrypt in getMessages succeeds.
-    final encryptionService = locator.isRegistered<EncryptionService>()
-        ? locator<EncryptionService>()
-        : EncryptionService();
     final chatKey = await encryptionService.getChatKey(chatId);
     final String encryptedContent = contentAlreadyEncrypted
         ? msg.content
@@ -813,10 +820,15 @@ class LocalDatabaseService {
           'createdAt ASC, senderId ASC, id ASC', // 🔥 Сортировка по (created_at, author_id, message_id)
       // НЕ используем receivedAt или vectorClock для сортировки
     );
-    // 🔒 SECURITY: Decrypt with same key as encrypt (use locator EncryptionService when available).
+    // 🔒 SECURITY: Use only Vault-bound crypto so cold start (camouflage → code → chat) decrypts with same salt.
+    // Never create EncryptionService(null) — that uses a different salt and breaks decrypt after app kill.
+    if (!locator.isRegistered<EncryptionService>() &&
+        !locator.isRegistered<VaultInterface>()) {
+      return []; // CORE not ready; UI should wait and retry or show empty until CORE is up
+    }
     final encryptionService = locator.isRegistered<EncryptionService>()
         ? locator<EncryptionService>()
-        : EncryptionService();
+        : EncryptionService(locator<VaultInterface>());
     final chatKey = await encryptionService.getChatKey(chatId);
 
     // 🔒 Fix Database N+1: Convert dates efficiently (could be optimized further by storing DateTime directly)
@@ -873,10 +885,14 @@ class LocalDatabaseService {
       offset: offset,
     );
 
-    // 🔒 SECURITY: Decrypt with same key as encrypt (use locator EncryptionService when available).
+    // 🔒 SECURITY: Use only Vault-bound crypto (same as getMessages) — never EncryptionService(null).
+    if (!locator.isRegistered<EncryptionService>() &&
+        !locator.isRegistered<VaultInterface>()) {
+      return [];
+    }
     final encryptionService = locator.isRegistered<EncryptionService>()
         ? locator<EncryptionService>()
-        : EncryptionService();
+        : EncryptionService(locator<VaultInterface>());
     final chatKey = await encryptionService.getChatKey(chatId);
 
     final decryptedMessages = <ChatMessage>[];
@@ -995,11 +1011,16 @@ class LocalDatabaseService {
   static const int maxPendingMessages =
       50; // Max 50 incomplete messages at a time
 
+  /// [chatId] and [senderId] required for first fragment: creates placeholder in
+  /// messages so message_fragments FK is satisfied (incoming fragments have no
+  /// message row until assembly).
   Future<bool> saveFragment(
       {required String messageId,
       required int index,
       required int total,
-      required String data}) async {
+      required String data,
+      String? chatId,
+      String? senderId}) async {
     // 🛡️ FRAGMENT FLOODING PROTECTION
     if (total > maxFragmentsPerMessage) {
       print(
@@ -1052,6 +1073,27 @@ class LocalDatabaseService {
       // Clean up oldest incomplete messages
       await _cleanupOldestIncompleteMessages(db, maxPendingMessages ~/ 4);
       return false;
+    }
+
+    // 🔥 FK FIX: message_fragments.messageId REFERENCES messages(id). For incoming
+    // fragments the message row is created only after assembly; insert a
+    // placeholder so the first fragment insert does not fail with FOREIGN KEY.
+    if (existingForMessage.isEmpty && chatId != null && chatId.isNotEmpty && senderId != null && senderId.isNotEmpty) {
+      final ownerId = await _getCurrentUserId();
+      await db.insert(
+          'messages',
+          {
+            'id': messageId,
+            'ownerId': ownerId,
+            'content': '',
+            'chatRoomId': chatId,
+            'senderId': senderId,
+            'createdAt': now,
+            'receivedAt': now,
+            'status': 'pending_fragments',
+            'isEncrypted': 0,
+          },
+          conflictAlgorithm: ConflictAlgorithm.ignore);
     }
 
     // 🔥 ДЕДУПЛИКАЦИЯ: Проверяем, не получали ли мы уже этот фрагмент
@@ -1110,6 +1152,10 @@ class LocalDatabaseService {
       final messageId = msg['messageId'] as String;
       await db.delete('message_fragments',
           where: 'messageId = ?', whereArgs: [messageId]);
+      // Remove placeholder message row created for FK (pending_fragments)
+      await db.delete('messages',
+          where: 'id = ? AND status = ?',
+          whereArgs: [messageId, 'pending_fragments']);
       print("🧹 [FRAGMENT] Cleaned up incomplete message: $messageId");
     }
   }
@@ -1154,7 +1200,7 @@ class LocalDatabaseService {
     if (!contentAlreadyEncrypted) {
       final encryptionService = locator.isRegistered<EncryptionService>()
           ? locator<EncryptionService>()
-          : EncryptionService();
+          : EncryptionService(locator.isRegistered<VaultInterface>() ? locator<VaultInterface>() : null);
       final chatKey = await encryptionService.getChatKey(chatId);
       contentToStore = await encryptionService.encrypt(msg.content, chatKey);
     }
@@ -1385,6 +1431,16 @@ class LocalDatabaseService {
     ]);
 
     return result;
+  }
+
+  /// Анонимный счётчик SOS за последние 24 ч (для Sector map — без секторов и локаций).
+  Future<int> getSosSignalsCountLast24h() async {
+    final db = await database;
+    final result = await db.rawQuery('''
+      SELECT COALESCE(SUM(count), 0) as total FROM sos_signals WHERE timestamp > ?
+    ''', [DateTime.now().subtract(const Duration(hours: 24)).millisecondsSinceEpoch]);
+    final v = result.isNotEmpty ? result.first['total'] : 0;
+    return (v is int) ? v : (v is num ? v.toInt() : 0);
   }
 
   /// Помечает SOS сигналы как синхронизированные

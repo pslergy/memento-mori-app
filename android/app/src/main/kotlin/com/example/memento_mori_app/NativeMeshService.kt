@@ -83,8 +83,9 @@ class NativeMeshService(
                 val addr = call.argument<String>("deviceAddress")
                 val networkName = call.argument<String>("networkName")
                 val passphrase = call.argument<String>("passphrase")
+                val groupOwnerIntent = call.argument<Int>("groupOwnerIntent") ?: 15
                 if (addr != null) {
-                    p2pHelper?.connect(addr, networkName, passphrase)
+                    p2pHelper?.connect(addr, networkName, passphrase, groupOwnerIntent)
                     result.success(true)
                 } else result.error("ERR", "No address", null)
             }
