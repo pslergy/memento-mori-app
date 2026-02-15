@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class NativeBleAdvertiser(
     private val context: Context,
     private val methodChannel: MethodChannel?
-) {
+) : GattServerHelper.PassiveWindowController {
     companion object {
         private const val TAG = "NativeBleAdvertiser"
         private val SERVICE_UUID = UUID.fromString("bf27730d-860a-4e09-889c-2d8b6a9e0fe7")
@@ -39,6 +39,52 @@ class NativeBleAdvertiser(
         private const val RETRY_DELAY_MS_MIN = 8000
         private const val RETRY_DELAY_MS_MAX = 10000
         private const val STOP_WAIT_MS = 400
+        /** Huawei GATT stabilization: passive window after client connect (no outgoing GATT until first central write). */
+        private const val PASSIVE_WINDOW_MS = 7000L
+    }
+
+    // ---------------------------------------------------------------------------
+    // Passive peripheral window: prevent WRITE_REQUEST_BUSY (201) on Huawei
+    // ---------------------------------------------------------------------------
+    @Volatile
+    private var firstWriteReceived = false
+    @Volatile
+    private var passiveWindowActive = false
+    @Volatile
+    private var passiveWindowStartTs: Long = 0L
+
+    override fun onGattClientConnected() {
+        firstWriteReceived = false
+        passiveWindowActive = true
+        passiveWindowStartTs = System.currentTimeMillis()
+        Log.i(TAG, "[GATT] Passive window started")
+    }
+
+    override fun onGattClientDisconnected() {
+        firstWriteReceived = false
+        passiveWindowActive = false
+    }
+
+    override fun onFirstWriteFromCentral() {
+        if (!firstWriteReceived) {
+            firstWriteReceived = true
+            passiveWindowActive = false
+            Log.i(TAG, "[GATT] First central write received, passive window closed")
+        }
+    }
+
+    override fun shouldSuppressOutgoingGatt(): Boolean {
+        if (passiveWindowActive && !firstWriteReceived) {
+            val elapsed = System.currentTimeMillis() - passiveWindowStartTs
+            if (elapsed < PASSIVE_WINDOW_MS) {
+                Log.i(TAG, "[GATT] Suppressing outgoing operation during passive window")
+                return true
+            } else {
+                passiveWindowActive = false
+                Log.i(TAG, "[GATT] Passive window expired")
+            }
+        }
+        return false
     }
 
     private var bluetoothAdapter: BluetoothAdapter? = null
@@ -73,6 +119,7 @@ class NativeBleAdvertiser(
 
     fun setGattServerHelper(helper: GattServerHelper?) {
         gattServerHelper = helper
+        helper?.setPassiveWindowController(this)
     }
 
     /** Huawei-like device: use minimal AdvertiseData to avoid DATA_TOO_LARGE. */

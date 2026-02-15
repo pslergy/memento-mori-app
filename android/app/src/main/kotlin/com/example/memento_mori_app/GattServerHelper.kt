@@ -24,6 +24,23 @@ class GattServerHelper(
     private val context: Context,
     private val resultChannel: MethodChannel?
 ) {
+    /**
+     * Huawei GATT stabilization: controller for passive peripheral window.
+     * Prevents outgoing GATT (notify, etc.) until first central write or window expiry.
+     */
+    interface PassiveWindowController {
+        fun onGattClientConnected()
+        fun onGattClientDisconnected()
+        fun onFirstWriteFromCentral()
+        fun shouldSuppressOutgoingGatt(): Boolean
+    }
+
+    private var passiveWindowController: PassiveWindowController? = null
+
+    fun setPassiveWindowController(controller: PassiveWindowController?) {
+        passiveWindowController = controller
+    }
+
     companion object {
         private const val MESH_DIAGNOSTICS = false
         /** Скрывает начало MAC в логах (только последние 5 символов, чтобы нельзя было отследить устройство). */
@@ -111,6 +128,7 @@ class GattServerHelper(
                 BluetoothProfile.STATE_CONNECTED -> {
                     Log.d(TAG, "✅ [GATT-SERVER] Device connected: ${maskMacForLog(device.address)}")
                     connectedDevices.add(device)
+                    passiveWindowController?.onGattClientConnected()
                     
                     // Уведомляем Flutter о подключении (на главном потоке)
                     mainHandler.post {
@@ -127,6 +145,7 @@ class GattServerHelper(
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.d(TAG, "❌ [GATT-SERVER] Device disconnected: ${maskMacForLog(device.address)}")
                     connectedDevices.remove(device)
+                    passiveWindowController?.onGattClientDisconnected()
                     
                     // 🔥 Очищаем буфер для отключившегося устройства
                     clearBufferForDevice(device.address)
@@ -151,6 +170,7 @@ class GattServerHelper(
             value: ByteArray?
         ) {
             super.onCharacteristicWriteRequest(device, requestId, characteristic, preparedWrite, responseNeeded, offset, value)
+            passiveWindowController?.onFirstWriteFromCentral()
             
             val chunkSize = value?.size ?: 0
             Log.d(TAG, "📥 [GATT-SERVER] Write request from ${maskMacForLog(device.address)}, size: $chunkSize")
@@ -187,6 +207,35 @@ class GattServerHelper(
                         } catch (e: Exception) {
                             Log.e(TAG, "❌ [GATT-SERVER] sendResponse(fail) failed: $e")
                         }
+                    }
+                }
+            }
+        }
+        
+        override fun onDescriptorWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            descriptor: android.bluetooth.BluetoothGattDescriptor,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray?
+        ) {
+            super.onDescriptorWriteRequest(device, requestId, descriptor, preparedWrite, responseNeeded, offset, value)
+            // 🔥 FIX: Respond to CCCD write (enable/disable notify) so Central's setNotifyValue() completes.
+            // Without this, Central times out and subsequent characteristic writes get 201 WRITE_REQUEST_BUSY.
+            if (responseNeeded && gattServer != null) {
+                val server = gattServer
+                val dev = device
+                val id = requestId
+                val off = offset
+                val valCopy = value?.copyOf()
+                mainHandler.post {
+                    try {
+                        server?.sendResponse(dev, id, BluetoothGatt.GATT_SUCCESS, off, valCopy)
+                        Log.d(TAG, "📤 [GATT-SERVER] Descriptor write response sent (notify enable/disable)")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "❌ [GATT-SERVER] sendResponse(descriptor) failed: $e")
                     }
                 }
             }
@@ -611,6 +660,10 @@ class GattServerHelper(
      * Используется BRIDGE для отправки сообщений GHOST устройствам
      */
     fun sendMessageToClient(deviceAddress: String, messageJson: String): Boolean {
+        if (passiveWindowController?.shouldSuppressOutgoingGatt() == true) {
+            Log.i(TAG, "[GATT] Suppressing outgoing operation during passive window")
+            return false
+        }
         Log.d(TAG, "📤 [GATT-SERVER] Sending message to client: ${maskMacForLog(deviceAddress)}")
         Log.d(TAG, "   📋 Message length: ${messageJson.length} bytes")
         

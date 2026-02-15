@@ -1326,15 +1326,26 @@ class MeshService with ChangeNotifier {
         return tcpSent;
       }
 
+      // 🔒 DEDUP: GHOST не ставит сообщения в BLE-очередь из sendAuto — только каскад отправляет по BLE.
+      // Иначе одно и то же сообщение уходит и из sendAuto, и из каскада → дубликат у получателя.
+      final bool skipBleInSendAuto = currentRole == MeshRole.GHOST;
       if (bleFirst) {
         _log("   📋 [HW] BLE-first mode (weak Wi-Fi Direct hardware)");
-        await _sendViaBle();
-        if (bluetoothNodes.isNotEmpty) messageDeliveredToNetwork = true;
+        if (!skipBleInSendAuto) {
+          await _sendViaBle();
+          if (bluetoothNodes.isNotEmpty) messageDeliveredToNetwork = true;
+        } else {
+          _log("   📋 [SEND-AUTO] GHOST: BLE left to cascade only (avoid duplicate)");
+        }
         if (await _sendViaWifi()) messageDeliveredToNetwork = true;
       } else {
         if (await _sendViaWifi()) messageDeliveredToNetwork = true;
-        await _sendViaBle();
-        if (bluetoothNodes.isNotEmpty) messageDeliveredToNetwork = true;
+        if (!skipBleInSendAuto) {
+          await _sendViaBle();
+          if (bluetoothNodes.isNotEmpty) messageDeliveredToNetwork = true;
+        } else {
+          _log("   📋 [SEND-AUTO] GHOST: BLE left to cascade only (avoid duplicate)");
+        }
       }
 
       // GHOST via Router (same LAN): когда нет Wi-Fi Direct, пробуем TCP по подсети к BRIDGE
@@ -6105,14 +6116,32 @@ class MeshService with ChangeNotifier {
             _log("🚀 [Mesh] Complete message - relaying to UI stream.");
             _log(
                 "   📋 isForMe: $isForMe, isGlobal: $isGlobal, incomingChatId: '$incomingChatId'");
+            // Копия для UI: расшифровываем контент до показа в чате (BLE/relay присылают isEncrypted).
+            // Оригинал data без изменений уходит в gossip для сохранения и ретрансляции.
+            final Map<String, dynamic> dataForUi = Map<String, dynamic>.from(data);
+            dataForUi['senderIp'] = senderIp;
+            if (dataForUi['isEncrypted'] == true) {
+              final String rawContent = dataForUi['content']?.toString() ?? '';
+              if (rawContent.isNotEmpty && locator.isRegistered<EncryptionService>()) {
+                try {
+                  final encryption = locator<EncryptionService>();
+                  final chatKey = await encryption.getChatKey(incomingChatId.isNotEmpty ? incomingChatId : 'THE_BEACON_GLOBAL');
+                  final decrypted = await encryption.decrypt(rawContent, chatKey);
+                  dataForUi['content'] = decrypted.isNotEmpty ? decrypted : '[Secure Message Captured]';
+                  dataForUi['isEncrypted'] = false;
+                } catch (_) {
+                  dataForUi['content'] = '[Secure Message Captured]';
+                  dataForUi['isEncrypted'] = false;
+                }
+              }
+            }
             _log(
-                "   📋 Content preview: ${(data['content']?.toString() ?? '').substring(0, (data['content']?.toString() ?? '').length > 50 ? 50 : (data['content']?.toString() ?? '').length)}");
-            data['senderIp'] = senderIp; // Прокидываем IP для контекста
+                "   📋 Content preview: ${(dataForUi['content']?.toString() ?? '').substring(0, (dataForUi['content']?.toString() ?? '').length > 50 ? 50 : (dataForUi['content']?.toString() ?? '').length)}");
             // 🔄 Event Bus: Fire message received event
-            _eventBus.bus.fire(MessageReceivedEvent(data));
+            _eventBus.bus.fire(MessageReceivedEvent(dataForUi));
             // Legacy StreamController (for backward compatibility)
             _messageController
-                .add(data); // Отправляем в стрим для ConversationScreen
+                .add(dataForUi); // Отправляем в стрим для ConversationScreen
             _log(
                 "   ✅ [UI] Message added to messageStream (should appear in chat)");
           } else if (isFragment) {

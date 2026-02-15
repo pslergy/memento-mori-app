@@ -233,6 +233,74 @@ class BluetoothMeshService {
     _log("[GATT][STATE] $from -> $to");
   }
 
+  // ---------------------------------------------------------------------------
+  // 🔒 GattOperationGate: only ONE GATT operation (write / descriptor / MTU / read) at a time.
+  // ---------------------------------------------------------------------------
+  bool _gattBusy = false;
+  final Queue<void Function()> _gattQueue = Queue<void Function()>();
+
+  static bool _isGattBusyError(Object e) {
+    final s = e.toString();
+    return s.contains('201') || s.contains('WRITE_REQUEST_BUSY');
+  }
+
+  void _gattAbortAndClear() {
+    _gattQueue.clear();
+    _gattBusy = false;
+    _log("⚠️ [GATT-GATE] BUSY abort: queue cleared, gattBusy=false");
+  }
+
+  void _onGattOperationComplete() {
+    if (_gattQueue.isNotEmpty) {
+      final next = _gattQueue.removeFirst();
+      next();
+    } else {
+      _gattBusy = false;
+    }
+  }
+
+  /// Enqueue a GATT operation. Only one runs at a time; completion triggers next or clears busy.
+  Future<T> _enqueueGattOperation<T>(Future<T> Function() operation) async {
+    final completer = Completer<T>();
+    void runOne() {
+      final f = operation();
+      f.then(completer.complete, onError: completer.completeError);
+      f.whenComplete(_onGattOperationComplete);
+    }
+    if (!_gattBusy) {
+      _gattBusy = true;
+      runOne();
+    } else {
+      _gattQueue.add(runOne);
+    }
+    return completer.future;
+  }
+
+  /// Single GATT write through the gate. On GATT_WRITE_REQUEST_BUSY (201): retry ONCE after 800ms; if still busy, abort and clear queue.
+  Future<void> _gattWrite(
+    BluetoothCharacteristic c,
+    List<int> chunk, {
+    required bool withoutResponse,
+  }) async {
+    await _enqueueGattOperation(() async {
+      try {
+        await c.write(chunk, withoutResponse: withoutResponse);
+      } catch (e) {
+        if (!_isGattBusyError(e)) rethrow;
+        _log("⚠️ [GATT-GATE] WRITE_REQUEST_BUSY (201) — retry once after 800ms");
+        await Future.delayed(const Duration(milliseconds: 800));
+        try {
+          await c.write(chunk, withoutResponse: withoutResponse);
+        } catch (e2) {
+          if (_isGattBusyError(e2)) {
+            _gattAbortAndClear();
+          }
+          rethrow;
+        }
+      }
+    });
+  }
+
   /// 🔒 [BLE][QUEUE] Centralized enqueue — single path for all BLE sends.
   /// Returns count of messages successfully sent. Callers MUST use this, never sendMessage directly.
   /// [messageIds], [sentFragmentIndices], [onFragmentSent] — для BLE resume по фрагментам (см. §6.19).
@@ -423,6 +491,54 @@ class BluetoothMeshService {
     } catch (e) {
       _log("❌ [GATT-SERVER] Failed to send message to ${maskMacForLog(deviceAddress)}: $e");
       return false;
+    }
+  }
+
+  /// OUTBOX_REQUEST response: Peripheral (Huawei) sends pending outbox messages to Central via notify.
+  /// Uses stored encrypted payload as-is; existing fragmentation; no re-encryption.
+  Future<void> _handleOutboxRequest(String centralAddress) async {
+    try {
+      final db = locator<LocalDatabaseService>();
+      final pending = await db.getPendingFromOutbox();
+      if (pending.isEmpty) {
+        _log("   ℹ️ [OUTBOX_REQUEST] No pending messages — nothing to send");
+        return;
+      }
+      _log("   📋 [OUTBOX_REQUEST] Sending ${pending.length} pending message(s) via notify");
+      for (final row in pending) {
+        final id = row['id'] as String? ?? '';
+        final content = row['content'] as String? ?? '';
+        final chatRoomId = row['chatRoomId'] as String? ?? 'THE_BEACON_GLOBAL';
+        final senderId = row['senderId'] as String? ?? 'GHOST_NODE';
+        final createdAt = row['createdAt'] as int? ?? DateTime.now().millisecondsSinceEpoch;
+        final isEncrypted = row['isEncrypted'] == 1;
+        final msg = <String, dynamic>{
+          'type': 'OFFLINE_MSG',
+          'h': id,
+          'content': content,
+          'chatId': chatRoomId,
+          'senderId': senderId,
+          'timestamp': createdAt,
+          'ts': createdAt,
+          'ttl': 5,
+        };
+        if (isEncrypted) msg['isEncrypted'] = true;
+        final messageJson = jsonEncode(msg);
+        final fragments = _fragmentMessage(messageJson);
+        for (final frag in fragments) {
+          final fragJson = jsonEncode(frag);
+          final success = await sendMessageToGattClient(centralAddress, fragJson);
+          if (!success) {
+            _log("   ⚠️ [OUTBOX_REQUEST] Failed to send fragment for $id");
+            break;
+          }
+          await Future.delayed(const Duration(milliseconds: 50));
+        }
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
+      _log("   ✅ [OUTBOX_REQUEST] Outbox pull completed");
+    } catch (e) {
+      _log("   ❌ [OUTBOX_REQUEST] Error: $e");
     }
   }
 
@@ -629,6 +745,14 @@ class BluetoothMeshService {
       _log(
           "   📋 Message ID: ${messageId.toString().substring(0, messageId.toString().length > 8 ? 8 : messageId.toString().length)}...");
 
+      // OUTBOX_REQUEST: Central (Tecno) asks Peripheral (Huawei) to send pending outbox messages via notify.
+      // Huawei stays PERIPHERAL-only; we respond by sending each pending message (fragmented) via notify.
+      if (messageType == 'OUTBOX_REQUEST') {
+        _log("   📥 [OUTBOX_REQUEST] Central requested outbox pull — responding via notify");
+        unawaited(_handleOutboxRequest(deviceAddress));
+        return;
+      }
+
       // Добавляем senderIp в данные для обработки
       jsonData['senderIp'] = deviceAddress;
 
@@ -787,7 +911,9 @@ class BluetoothMeshService {
       await enterCentralMode();
       await device.connect(
           timeout: const Duration(seconds: 15), autoConnect: false);
-      if (Platform.isAndroid) await device.requestMtu(247);
+      if (Platform.isAndroid) {
+        await _enqueueGattOperation(() => device.requestMtu(247));
+      }
 
       final services = await device.discoverServices();
       final targetService =
@@ -795,7 +921,7 @@ class BluetoothMeshService {
       final targetChar = targetService.characteristics
           .firstWhere((c) => c.uuid.toString() == CHAR_UUID);
 
-      await targetChar.write(pulse, withoutResponse: true);
+      await _gattWrite(targetChar, pulse, withoutResponse: true);
       _log("🛰️ Tactical pulse delivered to ${maskMacForLog(device.remoteId.str)}");
     } catch (e) {
       _log("⚠️ QuickLink failed: $e");
@@ -829,6 +955,11 @@ class BluetoothMeshService {
   }
 
   Future<void> startAdvertising(String myName) async {
+    // 🔒 Scan/Advertising safety: only when IDLE (no overlapping with GATT transaction).
+    if (_bleTransactionState != BleTransactionState.IDLE) {
+      _log("⚠️ [ADV] startAdvertising skipped — BleTransactionState != IDLE ($_bleTransactionState)");
+      return;
+    }
     // 🔥 ОПТИМИЗАЦИЯ ДЛЯ КИТАЙСКИХ УСТРОЙСТВ: Проверяем минимальный интервал
     if (_lastAdvOperation != null) {
       final timeSinceLastOp = DateTime.now().difference(_lastAdvOperation!);
@@ -1264,6 +1395,10 @@ class BluetoothMeshService {
   /// GHOST извлекает passphrase из manufacturerData и использует при Wi-Fi Direct connect
   Future<void> updateAdvertisingWithGroupInfo(
       String networkName, String passphrase) async {
+    if (_bleTransactionState != BleTransactionState.IDLE) {
+      _log("⚠️ [ADV] updateAdvertisingWithGroupInfo skipped — BleTransactionState != IDLE");
+      return;
+    }
     if (NetworkMonitor().currentRole != MeshRole.BRIDGE) return;
     if (_lastAdvertisingName == null) {
       _log(
@@ -1466,6 +1601,11 @@ class BluetoothMeshService {
           "[BLE-INVARIANT] PERIPHERAL must not enter QUIET; aborting enterCentralMode (stay advertising)");
       throw StateError(
           'PERIPHERAL must not enter QUIET_PRE_CONNECT; only CENTRAL may. FSM state=${_stateMachine.state}');
+    }
+    // 🔒 Scan/Advertising safety: only run stopScan/stopAdvertising when IDLE.
+    if (_bleTransactionState != BleTransactionState.IDLE) {
+      _log("⚠️ [BLE-QUIET] enterCentralMode skipped — BleTransactionState != IDLE ($_bleTransactionState)");
+      return;
     }
     _transitionTransaction(BleTransactionState.QUIET_PRE_CONNECT);
     final isHuawei = await HardwareCheckService().isHuaweiOrHonor();
@@ -1947,7 +2087,7 @@ class BluetoothMeshService {
     // If lastScanResults empty, do a short rescan so we don't use stale or missing data.
     const Duration kScanResultStaleRescanDuration = Duration(seconds: 2);
     List<ScanResult> lastScanResults = await FlutterBluePlus.lastScanResults;
-    if (lastScanResults.isEmpty) {
+    if (lastScanResults.isEmpty && _bleTransactionState == BleTransactionState.IDLE) {
       _log(
           "🔍 [PRE-CONNECT] No scan results — brief rescan to ensure peer is advertising connectable");
       try {
@@ -2595,7 +2735,7 @@ class BluetoothMeshService {
             _log(
                 "📐 [MTU] Requesting MTU 158 (safe value for most devices)...");
             _log("🦷🔍 [BT-DIAG] Requesting MTU...");
-            await device.requestMtu(158);
+            await _enqueueGattOperation(() => device.requestMtu(158));
             await Future.delayed(
                 const Duration(milliseconds: 300)); // 🔥 Увеличили паузу
 
@@ -2788,10 +2928,10 @@ class BluetoothMeshService {
             }));
           }
           try {
-            await c.setNotifyValue(true).timeout(
+            await _enqueueGattOperation(() => c.setNotifyValue(true).timeout(
               Duration(seconds: _notifyEnableTimeoutSeconds),
               onTimeout: () => throw TimeoutException('Notify enable'),
-            );
+            ));
             if (kMeshDiagnostics && _diagnosticAttemptStartTime != null) {
               final elapsed =
                   DateTime.now().difference(_diagnosticAttemptStartTime!).inMilliseconds;
@@ -2865,63 +3005,48 @@ class BluetoothMeshService {
                 "📤 [WRITE] Fragment ${fragIndex + 1}/${fragments.length}, chunk ${chunkCount + 1} (${chunk.length} bytes, offset $i)...");
             final writeStart = DateTime.now();
 
-            // 🔥 BLE FIX: При WRITE_REQUEST_BUSY — повторы с backoff 500, 1000, 2000 ms
-            const backoffMs = [500, 1000, 2000];
-            bool chunkWritten = false;
-            for (int attempt = 0; attempt <= backoffMs.length && !chunkWritten; attempt++) {
-              try {
-                if (attempt > 0) {
-                  await Future.delayed(Duration(milliseconds: backoffMs[attempt - 1]));
-                  _log(
-                      "⚠️ [WRITE] WRITE_REQUEST_BUSY retry $attempt/${backoffMs.length} after ${backoffMs[attempt - 1]}ms...");
-                }
-                await c.write(chunk, withoutResponse: true);
-                chunkWritten = true;
-                if (kMeshDiagnostics && !_diagnosticFirstWriteLogged) {
-                  _diagnosticFirstWriteLogged = true;
-                  final elapsed = _diagnosticAttemptStartTime != null
-                      ? DateTime.now()
-                          .difference(_diagnosticAttemptStartTime!)
-                          .inMilliseconds
-                      : 0;
-                  _log(meshDiagLog('first_characteristic_write', {
-                    'target': device.remoteId.str,
-                    'elapsedMs': '$elapsed',
-                    'chunkLen': '${chunk.length}',
-                    ...?_diagnosticContext,
-                  }));
-                  _log(meshDiagLog('write_result', {
-                    'result': 'success',
-                    'target': device.remoteId.str,
-                    'elapsedMs': '$elapsed',
-                    ...?_diagnosticContext,
-                  }));
-                }
-              } catch (writeErr) {
-                final errStr = writeErr.toString();
-                if ((errStr.contains('201') || errStr.contains('WRITE_REQUEST_BUSY')) &&
-                    attempt < backoffMs.length) {
-                  continue;
-                }
-                if (kMeshDiagnostics && _diagnosticAttemptStartTime != null) {
-                  final elapsed =
-                      DateTime.now().difference(_diagnosticAttemptStartTime!).inMilliseconds;
-                  _log(meshDiagLog('write_result', {
-                    'result': 'error',
-                    'target': device.remoteId.str,
-                    'elapsedMs': '$elapsed',
-                    'error': writeErr.toString().replaceAll(' ', '_'),
-                    ...?_diagnosticContext,
-                  }));
-                }
-                recordBleInteraction(BleInteractionStats(
-                  peerId: device.remoteId.str,
-                  attemptedAction: BleAttemptedAction.write,
-                  result: BleInteractionResult.failed,
-                  timestamp: DateTime.now(),
-                ));
-                rethrow;
+            // 🔒 GattOperationGate: single write (BUSY retry once 800ms inside _gattWrite)
+            try {
+              await _gattWrite(c, chunk, withoutResponse: true);
+              if (kMeshDiagnostics && !_diagnosticFirstWriteLogged) {
+                _diagnosticFirstWriteLogged = true;
+                final elapsed = _diagnosticAttemptStartTime != null
+                    ? DateTime.now()
+                        .difference(_diagnosticAttemptStartTime!)
+                        .inMilliseconds
+                    : 0;
+                _log(meshDiagLog('first_characteristic_write', {
+                  'target': device.remoteId.str,
+                  'elapsedMs': '$elapsed',
+                  'chunkLen': '${chunk.length}',
+                  ...?_diagnosticContext,
+                }));
+                _log(meshDiagLog('write_result', {
+                  'result': 'success',
+                  'target': device.remoteId.str,
+                  'elapsedMs': '$elapsed',
+                  ...?_diagnosticContext,
+                }));
               }
+            } catch (writeErr) {
+              if (kMeshDiagnostics && _diagnosticAttemptStartTime != null) {
+                final elapsed =
+                    DateTime.now().difference(_diagnosticAttemptStartTime!).inMilliseconds;
+                _log(meshDiagLog('write_result', {
+                  'result': 'error',
+                  'target': device.remoteId.str,
+                  'elapsedMs': '$elapsed',
+                  'error': writeErr.toString().replaceAll(' ', '_'),
+                  ...?_diagnosticContext,
+                }));
+              }
+              recordBleInteraction(BleInteractionStats(
+                peerId: device.remoteId.str,
+                attemptedAction: BleAttemptedAction.write,
+                result: BleInteractionResult.failed,
+                timestamp: DateTime.now(),
+              ));
+              rethrow;
             }
 
             final writeElapsed = DateTime.now().difference(writeStart);
@@ -3272,7 +3397,7 @@ class BluetoothMeshService {
       // Запрашиваем MTU
       if (Platform.isAndroid) {
         try {
-          await device.requestMtu(158);
+          await _enqueueGattOperation(() => device.requestMtu(158));
           await Future.delayed(const Duration(milliseconds: 300));
         } catch (e) {
           _log("⚠️ [BATCH] MTU request failed: $e");
@@ -3377,9 +3502,32 @@ class BluetoothMeshService {
       _log("[BLE-TIMING] Pre-write settle: 500ms (GHOST↔GHOST stability)");
       await Future.delayed(const Duration(milliseconds: 500));
 
-      // 🔥 ШАГ 1: Отправляем сообщения. Для OUTBOX_REQUEST включаем notify ДО записи, чтобы central получил ответ периферии.
+      // 🔥 Notify at connection stage (not before OUTBOX_REQUEST): so Central can receive outbox pull response from Peripheral.
       final shouldEnableNotify = characteristic!.properties.notify &&
           (writeStrategy == null || writeStrategy!.useNotify);
+      if (shouldEnableNotify && batchNotifySub == null) {
+        if (writeStrategy?.delayNotify == true) {
+          _log("[BLE][ADAPTIVE] delayNotify: 300ms before enable notify");
+          await Future.delayed(const Duration(milliseconds: 300));
+        }
+          try {
+            await _enqueueGattOperation(() => characteristic!.setNotifyValue(true).timeout(
+              Duration(seconds: _notifyEnableTimeoutSeconds),
+              onTimeout: () => throw TimeoutException('Notify enable'),
+            ));
+          _ghostNotifyBuffer.clear();
+          _ghostNotifyExpectedLength = -1;
+          final bridgeAddress = device.remoteId.str;
+          batchNotifySub = characteristic!.lastValueStream.listen(
+            (value) => _onNotifyChunkFromBridge(bridgeAddress, value),
+            onError: (e) => _log("⚠️ [BATCH] Notify stream error: $e"),
+          );
+          _log("📥 [BATCH] Notify enabled at connection stage — subscribed to BRIDGE notify");
+        } catch (e) {
+          _log("⚠️ [BATCH] Notify enable at connection stage failed (non-blocking): $e");
+        }
+      }
+
       _stateMachine.forceTransition(BleState.TRANSFERRING);
       _gattTransition(BleGattSessionState.TRANSFERRING);
       _log("[GATT][STATE] TRANSFERRING — WRITE OK");
@@ -3406,30 +3554,6 @@ class BluetoothMeshService {
 
         try {
           final message = messages[i];
-          // 🔥 OUTBOX_REQUEST: enable notify BEFORE sending so central receives peripheral's outbox response
-          final bool isOutboxRequest = message.toString().contains('OUTBOX_REQUEST');
-          if (isOutboxRequest && shouldEnableNotify && batchNotifySub == null) {
-            if (writeStrategy?.delayNotify == true) {
-              _log("[BLE][ADAPTIVE] delayNotify: 300ms before enable notify");
-              await Future.delayed(const Duration(milliseconds: 300));
-            }
-            try {
-              await characteristic!.setNotifyValue(true).timeout(
-                Duration(seconds: _notifyEnableTimeoutSeconds),
-                onTimeout: () => throw TimeoutException('Notify enable (before OUTBOX_REQUEST)'),
-              );
-              _ghostNotifyBuffer.clear();
-              _ghostNotifyExpectedLength = -1;
-              final bridgeAddress = device.remoteId.str;
-              batchNotifySub = characteristic!.lastValueStream.listen(
-                (value) => _onNotifyChunkFromBridge(bridgeAddress, value),
-                onError: (e) => _log("⚠️ [BATCH] Notify stream error: $e"),
-              );
-              _log("📥 [BATCH] Notify enabled before OUTBOX_REQUEST — subscribed to BRIDGE notify");
-            } catch (e) {
-              _log("⚠️ [BATCH] Notify enable before OUTBOX_REQUEST failed (non-blocking): $e");
-            }
-          }
           // 🔥 §6.17: Ограничение размера по BLE — большие сообщения пропускаем, остаются для TCP/cloud
           if (message.length > kMaxBlePayloadBytes) {
             _log(
@@ -3486,13 +3610,11 @@ class BluetoothMeshService {
                   ? j + chunkSize
                   : framedMessage.length;
               final chunk = framedMessage.sublist(j, end);
-              bool chunkWritten = false;
+              // 🔒 GattOperationGate: single write (BUSY retry once 800ms inside _gattWrite)
               if (writeStrategy != null) {
-                // ADAPTIVE: pair-specific write — try strategy once, on failure switch once then abort (no retry same strategy)
                 final useWithout = !writeStrategy!.useWriteWithResponse;
                 try {
-                  await characteristic.write(chunk, withoutResponse: useWithout);
-                  chunkWritten = true;
+                  await _gattWrite(characteristic, chunk, withoutResponse: useWithout);
                   if (kMeshDiagnostics && !_diagnosticFirstWriteLogged) {
                     _diagnosticFirstWriteLogged = true;
                     final elapsed = _diagnosticAttemptStartTime != null
@@ -3508,63 +3630,33 @@ class BluetoothMeshService {
                 } catch (firstErr) {
                   _log("⚠️ [BATCH][ADAPTIVE] First write failed, switching strategy once: $firstErr");
                   try {
-                    await characteristic.write(chunk, withoutResponse: !useWithout);
-                    chunkWritten = true;
+                    await _gattWrite(characteristic, chunk, withoutResponse: !useWithout);
                   } catch (_) {
                     rethrow;
                   }
                 }
               } else {
-                // Default: backoff + fallback (unchanged)
-                const backoffMs = [500, 1000, 2000, 3000, 4000];
-                for (int attempt = 0; attempt <= backoffMs.length && !chunkWritten; attempt++) {
+                try {
+                  await _gattWrite(characteristic, chunk, withoutResponse: true);
+                  if (kMeshDiagnostics && !_diagnosticFirstWriteLogged) {
+                    _diagnosticFirstWriteLogged = true;
+                    final elapsed = _diagnosticAttemptStartTime != null
+                        ? DateTime.now()
+                            .difference(_diagnosticAttemptStartTime!)
+                            .inMilliseconds
+                        : 0;
+                    _log(meshDiagLog('first_characteristic_write', {
+                      'target': targetMac,
+                      'elapsedMs': '$elapsed',
+                      'chunkLen': '${chunk.length}',
+                      ...?_diagnosticContext,
+                    }));
+                  }
+                } catch (writeErr) {
                   try {
-                    if (attempt > 0) {
-                      await Future.delayed(Duration(milliseconds: backoffMs[attempt - 1]));
-                      _log(
-                          "⚠️ [BATCH] WRITE_REQUEST_BUSY retry $attempt/${backoffMs.length} after ${backoffMs[attempt - 1]}ms...");
-                    }
-                    await characteristic.write(chunk, withoutResponse: true);
-                    chunkWritten = true;
-                    if (kMeshDiagnostics && !_diagnosticFirstWriteLogged) {
-                      _diagnosticFirstWriteLogged = true;
-                      final elapsed = _diagnosticAttemptStartTime != null
-                          ? DateTime.now()
-                              .difference(_diagnosticAttemptStartTime!)
-                              .inMilliseconds
-                          : 0;
-                      _log(meshDiagLog('first_characteristic_write', {
-                        'target': targetMac,
-                        'elapsedMs': '$elapsed',
-                        'chunkLen': '${chunk.length}',
-                      }));
-                    }
-                  } catch (writeErr) {
-                    final errStr = writeErr.toString();
-                    if ((errStr.contains('201') || errStr.contains('WRITE_REQUEST_BUSY')) &&
-                        attempt < backoffMs.length) {
-                      continue;
-                    }
-                    try {
-                      await characteristic.write(chunk, withoutResponse: false);
-                      chunkWritten = true;
-                      if (kMeshDiagnostics && !_diagnosticFirstWriteLogged) {
-                        _diagnosticFirstWriteLogged = true;
-                        final elapsed = _diagnosticAttemptStartTime != null
-                            ? DateTime.now()
-                                .difference(_diagnosticAttemptStartTime!)
-                                .inMilliseconds
-                            : 0;
-                        _log(meshDiagLog('first_characteristic_write', {
-                          'target': targetMac,
-                          'elapsedMs': '$elapsed',
-                          'chunkLen': '${chunk.length}',
-                          ...?_diagnosticContext,
-                        }));
-                      }
-                    } catch (_) {
-                      rethrow;
-                    }
+                    await _gattWrite(characteristic, chunk, withoutResponse: false);
+                  } catch (_) {
+                    rethrow;
                   }
                 }
               }
@@ -3592,6 +3684,34 @@ class BluetoothMeshService {
           }
         } catch (e) {
           _log("   ⚠️ [BATCH] Failed to send message ${i + 1}: $e");
+          if (_isGattBusyError(e)) {
+            batchAborted = true;
+          }
+        }
+      }
+
+      // Pull outbox from Peripheral (Huawei): send OUTBOX_REQUEST so it responds with pending messages via notify.
+      if (device.isConnected && characteristic != null) {
+        try {
+          final outboxRequestJson = jsonEncode(<String, String>{'type': 'OUTBOX_REQUEST'});
+          final outboxPayload = utf8.encode(outboxRequestJson);
+          final outboxFramed = _createFramedMessage(outboxPayload);
+          const int chunkSize = 60;
+          for (int j = 0; j < outboxFramed.length; j += chunkSize) {
+            final end = (j + chunkSize < outboxFramed.length) ? j + chunkSize : outboxFramed.length;
+            final chunk = outboxFramed.sublist(j, end);
+            if (writeStrategy != null) {
+              await _gattWrite(characteristic!, chunk, withoutResponse: !writeStrategy!.useWriteWithResponse);
+            } else {
+              await _gattWrite(characteristic!, chunk, withoutResponse: true);
+            }
+            if (end < outboxFramed.length) {
+              await Future.delayed(const Duration(milliseconds: 100));
+            }
+          }
+          _log("📤 [BATCH] OUTBOX_REQUEST sent — waiting for BRIDGE outbox via notify");
+        } catch (e) {
+          _log("⚠️ [BATCH] OUTBOX_REQUEST write failed (non-blocking): $e");
         }
       }
 
@@ -3616,10 +3736,10 @@ class BluetoothMeshService {
           }));
         }
         try {
-          await characteristic!.setNotifyValue(true).timeout(
+          await _enqueueGattOperation(() => characteristic!.setNotifyValue(true).timeout(
             Duration(seconds: _notifyEnableTimeoutSeconds),
             onTimeout: () => throw TimeoutException('Notify enable'),
-          );
+          ));
           if (kMeshDiagnostics) {
             final elapsed =
                 DateTime.now().difference(batchStartTime).inMilliseconds;
