@@ -132,7 +132,7 @@ The project has a static site (mission, status, use cases, roadmap) hosted on **
 
 **https://pslergy.github.io/memento-mori-app/**
 
-Source: `docs/` (and `website/` as the editing source; run `scripts/sync-website-to-docs.ps1` to update `docs/`). To enable or change the URL: repo **Settings → Pages → Source**: Deploy from branch, branch `main`, folder `/docs`.
+
 
 ---
 
