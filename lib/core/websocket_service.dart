@@ -87,7 +87,7 @@ class WebSocketService {
 
       if (data['type'] == 'newMessage' && data['message'] != null) {
         var msg = data['message'];
-        final String chatId = msg['chatRoomId'] ?? "GLOBAL";
+        final String chatId = msg['chatRoomId'] ?? "THE_BEACON_GLOBAL";
         final String senderId = msg['senderId'].toString();
         final String myId = locator.isRegistered<ApiService>()
             ? locator<ApiService>().currentUserId

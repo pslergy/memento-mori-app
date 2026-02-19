@@ -7,6 +7,7 @@ import 'fragment_security_service.dart';
 
 import 'api_service.dart';
 import 'ble_session.dart';
+import 'bluetooth_service.dart';
 import 'hardware_check_service.dart';
 import 'mesh_service.dart';
 import 'local_db_service.dart';
@@ -716,19 +717,25 @@ class GossipManager {
         _mesh.addLog("   📤 Relaying to ${node.name} (MAC: $shortMac)...");
 
         final device = BluetoothDevice.fromId(deviceId);
-        final success = await btService.sendMessage(device, packetJson);
+        final result = await btService.sendMessageForRelay(device, packetJson);
 
-        if (success) {
-          successCount++;
-          peerCache.recordSuccess(
-              peerId: deviceId, latency: Duration.zero, channel: 'bleNearby');
-          _mesh.addLog(
-              "   ✅ Successfully relayed to ${node.name} (MAC: $shortMac)");
-        } else {
-          peerCache.recordFailure(
-              peerId: deviceId, channel: 'bleNearby', reason: null);
-          _mesh
-              .addLog("   ⚠️ Failed to relay to ${node.name} (MAC: $shortMac)");
+        switch (result) {
+          case BleRelayResult.success:
+            successCount++;
+            peerCache.recordSuccess(
+                peerId: deviceId, latency: Duration.zero, channel: 'bleNearby');
+            _mesh.addLog(
+                "   ✅ Successfully relayed to ${node.name} (MAC: $shortMac)");
+            break;
+          case BleRelayResult.skippedDueToRole:
+            // Transport not eligible (e.g. PERIPHERAL). Not an error — do not record failure.
+            break;
+          case BleRelayResult.failure:
+            peerCache.recordFailure(
+                peerId: deviceId, channel: 'bleNearby', reason: null);
+            _mesh.addLog(
+                "   ⚠️ Failed to relay to ${node.name} (MAC: $shortMac)");
+            break;
         }
       } catch (e) {
         peerCache.recordFailure(
@@ -912,15 +919,20 @@ class GossipManager {
         _mesh.addLog("🦷 [Gossip] Attempting BLE relay to ${node.name}...");
 
         try {
-          // Используем существующий механизм ретрансляции через BLE
           final device = BluetoothDevice.fromId(node.id);
           final packetJson = jsonEncode(packet);
-          final success = await mesh.btService.sendMessage(device, packetJson);
+          final result = await mesh.btService.sendMessageForRelay(device, packetJson);
 
-          if (success) {
-            _mesh.addLog("✅ [Gossip] BLE relay successful to ${node.name}");
-          } else {
-            _mesh.addLog("⚠️ [Gossip] BLE relay failed to ${node.name}");
+          switch (result) {
+            case BleRelayResult.success:
+              _mesh.addLog("✅ [Gossip] BLE relay successful to ${node.name}");
+              break;
+            case BleRelayResult.skippedDueToRole:
+              // Transport not eligible (e.g. PERIPHERAL). Not an error — continue epidemic round.
+              break;
+            case BleRelayResult.failure:
+              _mesh.addLog("⚠️ [Gossip] BLE relay failed to ${node.name}");
+              break;
           }
         } catch (e) {
           _mesh.addLog("⚠️ [Gossip] BLE relay failed: $e");

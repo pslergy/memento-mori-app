@@ -1,7 +1,7 @@
 name: memento_mori_app
 description: "Tactical Mesh Messenger"
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.0.0+2
 
 environment:
   sdk: '>=3.1.0 <4.0.0'
@@ -29,6 +29,7 @@ dependencies:
   wakelock_plus: ^1.2.8
   permission_handler: ^11.3.1
   device_info_plus: ^10.1.0
+  package_info_plus: ^8.0.0
   shared_preferences: ^2.2.2
   sensors_plus: ^6.1.1 # 🔥 БЫЛО ПОТЕРЯНО
 

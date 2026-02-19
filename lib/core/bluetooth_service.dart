@@ -39,6 +39,13 @@ enum BleAdvertiseState {
   stopping,
 }
 
+/// Result of a BLE relay attempt. skippedDueToRole = transport not eligible (e.g. PERIPHERAL); not a failure.
+enum BleRelayResult {
+  success,
+  failure,
+  skippedDueToRole,
+}
+
 class BluetoothMeshService {
   final String SERVICE_UUID = "bf27730d-860a-4e09-889c-2d8b6a9e0fe7";
   final String CHAR_UUID = "c22d1e32-0310-4062-812e-89025078da9c";
@@ -69,6 +76,13 @@ class BluetoothMeshService {
   static const Duration _minAdvInterval =
       Duration(seconds: 2); // Минимум 2 секунды между операциями
 
+  // 🔍 OUTBOX BOOST: при 0→1 в outbox — 8s окно ускоренного discovery (чаще scan/adv). Не трогает FSM/transport.
+  DateTime? _outboxBoostUntil;
+  DateTime? _lastOutboxBoostTime;
+  Timer? _outboxBoostTimer;
+  static const Duration _outboxBoostWindow = Duration(seconds: 8);
+  static const Duration _outboxBoostMinInterval = Duration(seconds: 15);
+
   // 🔒 Fix BLE state machine: Use Completer instead of busy wait
   Completer<void>? _stateIdleCompleter;
 
@@ -83,6 +97,10 @@ class BluetoothMeshService {
   // IDLE -> CONNECTING -> CONNECTED -> DISCONNECTED
   String _gattConnectionState = 'IDLE';
   String get gattConnectionState => _gattConnectionState;
+
+  /// [ACTIVE-SYNC] When Central in a CRDT-only session: used to write HEAD_EXCHANGE/REQUEST_RANGE/LOG_ENTRIES to peer.
+  BluetoothCharacteristic? _crdtOnlyCentralCharacteristic;
+  String? _crdtOnlyCentralTargetMac;
 
   // 🔒 BLE SESSION OWNERSHIP: single owner for all BLE ops. No parallel connects.
   BleSessionOwner _sessionOwner = BleSessionOwner.none;
@@ -287,6 +305,9 @@ class BluetoothMeshService {
         await c.write(chunk, withoutResponse: withoutResponse);
       } catch (e) {
         if (!_isGattBusyError(e)) rethrow;
+        try {
+          locator<MeshService>().reportMeshHealthBleBusy();
+        } catch (_) {}
         _log("⚠️ [GATT-GATE] WRITE_REQUEST_BUSY (201) — retry once after 800ms");
         await Future.delayed(const Duration(milliseconds: 800));
         try {
@@ -390,6 +411,25 @@ class BluetoothMeshService {
     );
   }
 
+  /// Sync optimization: when CRDT diff=0, close connection to free the channel (central only).
+  void requestGracefulDisconnectForSync(String peerAddress) {
+    if (peerAddress.isEmpty || !peerAddress.contains(':')) return;
+    if (NetworkMonitor().currentRole == MeshRole.BRIDGE) return;
+    unawaited(_doGracefulDisconnectForSync(peerAddress));
+  }
+
+  Future<void> _doGracefulDisconnectForSync(String peerAddress) async {
+    try {
+      final device = BluetoothDevice.fromId(peerAddress);
+      if (device.isConnected) {
+        _log("🔌 [CRDT] Diff=0 — graceful disconnect from ${maskMacForLog(peerAddress)}");
+        await device.disconnect();
+      }
+    } catch (e) {
+      _log("⚠️ [CRDT] Graceful disconnect failed: $e");
+    }
+  }
+
   /// 🔥 FIX: Public method to force reset GATT state after external timeout
   void forceResetGattState(String reason) {
     if (_gattSessionState == BleGattSessionState.TRANSFERRING) {
@@ -423,6 +463,8 @@ class BluetoothMeshService {
 
   // 🔥 WI-FI DIRECT: Последнее имя для advertising (нужно для updateAdvertisingWithGroupInfo)
   String? _lastAdvertisingName;
+  Uint8List? _lastManufacturerDataBase; // без байта intent (has_outbox), для refresh
+  String? _lastSafeName;
 
   // [GATT][STATE] Single-shot GATT ready flag — set on onGattReady, reset on stopGattServer
   bool _gattServerReady = false;
@@ -451,6 +493,13 @@ class BluetoothMeshService {
 
   BleAdvertiseState get state => _advState; // Legacy getter
   BleState get fsmState => _stateMachine.state; // New FSM getter
+
+  /// Transport capability: true only when FSM allows initiating CENTRAL connection (enterCentralMode).
+  /// Gossip BLE relay must check this before calling sendMessage; PERIPHERAL must not enter QUIET.
+  bool canInitiateCentralConnection() {
+    final s = _stateMachine.state;
+    return s == BleState.IDLE || s == BleState.SCANNING;
+  }
 
   /// 🔒 SECURITY FIX #4: Check if any GATT clients are active (connected or within grace period)
   /// This is used by BRIDGE to prevent token rotation while GHOST is connected
@@ -537,8 +586,15 @@ class BluetoothMeshService {
         await Future.delayed(const Duration(milliseconds: 100));
       }
       _log("   ✅ [OUTBOX_REQUEST] Outbox pull completed");
+      if (locator.isRegistered<MeshService>()) {
+        _log("[BEACON-SYNC] Outbox done — starting THE BEACON chat sync (CRDT) with peer");
+        locator<MeshService>().startCrdtDigestExchange(centralAddress);
+      } else {
+        _log("[BEACON-SYNC] Chat sync skipped: MeshService not ready (CRDT not started)");
+      }
     } catch (e) {
       _log("   ❌ [OUTBOX_REQUEST] Error: $e");
+      _log("[BEACON-SYNC] Outbox error — CRDT not started, chat may stay out of sync");
     }
   }
 
@@ -610,9 +666,86 @@ class BluetoothMeshService {
     }
   }
 
+  /// True во время Boost Window (8s после перехода outbox 0→1). Используется для scan/adv без изменения FSM.
+  bool get isOutboxBoostActive =>
+      _outboxBoostUntil != null && DateTime.now().isBefore(_outboxBoostUntil!);
+
   BluetoothMeshService() {
     _setupGattServerListener();
     _checkNativeAdvertiserSupport();
+    _setupOutboxBoostListener();
+  }
+
+  void _setupOutboxBoostListener() {
+    try {
+      locator<EventBusService>().on<OutboxFirstMessageEvent>((_) {
+        _requestOutboxBoost();
+        _refreshAdvertisingIntentFlag();
+      });
+      locator<EventBusService>().on<OutboxEmptyEvent>((_) {
+        _refreshAdvertisingIntentFlag();
+      });
+    } catch (_) {}
+  }
+
+  /// Обновляет только байт intent (has_outbox) в BLE advertisement без смены FSM/подключений.
+  void _refreshAdvertisingIntentFlag() {
+    if (_lastManufacturerDataBase == null || _lastSafeName == null) return;
+    if (!_stateMachine.isInState(BleState.ADVERTISING) &&
+        _advState != BleAdvertiseState.advertising) return;
+    if (_lastAdvOperation != null &&
+        DateTime.now().difference(_lastAdvOperation!) < _minAdvInterval) return;
+    _refreshAdvertisingIntentFlagAsync();
+  }
+
+  Future<void> _refreshAdvertisingIntentFlagAsync() async {
+    if (_lastManufacturerDataBase == null || _lastSafeName == null) return;
+    bool hasOutbox = false;
+    try {
+      hasOutbox = (await locator<LocalDatabaseService>().getPendingFromOutbox()).isNotEmpty;
+    } catch (_) {}
+    final newData = Uint8List.fromList([..._lastManufacturerDataBase!, hasOutbox ? 1 : 0]);
+    _lastAdvOperation = DateTime.now();
+    try {
+      if (_nativeAdvertisingStarted && Platform.isAndroid) {
+        await _nativeAdvChannel.invokeMethod('stopAdvertising');
+        await Future.delayed(const Duration(milliseconds: 500));
+        final success = await _nativeAdvChannel.invokeMethod<bool>('startAdvertising', {
+          'localName': _lastSafeName,
+          'manufacturerData': newData,
+        });
+        if (success == true) _log("🔍 [ADV] Intent flag updated (native): has_outbox=$hasOutbox");
+      } else if (_advertisingStartedSuccessfully) {
+        await _blePeripheral.stop();
+        await Future.delayed(const Duration(milliseconds: 500));
+        await _blePeripheral.start(advertiseData: AdvertiseData(
+          serviceUuid: SERVICE_UUID,
+          localName: _lastSafeName,
+          includeDeviceName: false,
+          manufacturerId: 0xFFFF,
+          manufacturerData: newData,
+        ));
+        _log("🔍 [ADV] Intent flag updated (peripheral): has_outbox=$hasOutbox");
+      }
+    } catch (e) {
+      _log("⚠️ [ADV] Intent flag refresh failed: $e");
+    }
+  }
+
+  void _requestOutboxBoost() {
+    final now = DateTime.now();
+    if (_lastOutboxBoostTime != null &&
+        now.difference(_lastOutboxBoostTime!) < _outboxBoostMinInterval) {
+      return; // Idempotent: max 1 boost every 15s
+    }
+    _lastOutboxBoostTime = now;
+    _outboxBoostTimer?.cancel();
+    _outboxBoostUntil = now.add(_outboxBoostWindow);
+    _log("🔍 [OUTBOX-BOOST] Boost window started (8s) — increased scan/adv discovery");
+    _outboxBoostTimer = Timer(_outboxBoostWindow, () {
+      _outboxBoostUntil = null;
+      _log("🔍 [OUTBOX-BOOST] Boost window ended — normal scan/adv params");
+    });
   }
 
   /// Проверяет, нужно ли использовать native advertiser
@@ -865,6 +998,23 @@ class BluetoothMeshService {
     } catch (e) {
       _log("❌ [SEND-MSG] Failed for $shortMac: $e");
       return false;
+    }
+  }
+
+  /// BLE relay entry point: guard by transport capability. Use for Gossip/Epidemic relay only.
+  /// Returns skippedDueToRole when FSM is not eligible for central (e.g. ADVERTISING); not an error.
+  Future<BleRelayResult> sendMessageForRelay(BluetoothDevice device, String message) async {
+    if (!canInitiateCentralConnection()) {
+      _log(
+          "[BLE-RELAY] Skipped: transport not eligible for central connect. state=${_stateMachine.state}");
+      return BleRelayResult.skippedDueToRole;
+    }
+    try {
+      final ok = await sendMessage(device, message);
+      return ok ? BleRelayResult.success : BleRelayResult.failure;
+    } catch (e) {
+      _log("❌ [BLE-RELAY] sendMessage error: $e");
+      return BleRelayResult.failure;
     }
   }
 
@@ -1186,7 +1336,15 @@ class BluetoothMeshService {
       // manufacturerData должен быть Uint8List, а не Map
       // Используем manufacturerId = 0xFFFF (зарезервированный для тестирования)
       // 🔥 КРИТИЧНО: Для BRIDGE ВСЕГДА добавляем token в manufacturerData (даже если localName пустое)
-      Uint8List manufacturerData;
+      // 🔍 INTENT: последний байт = has_outbox (bit 0): 1 если outbox > 0, иначе 0 (<= 31 bytes legacy)
+      bool hasOutbox = false;
+      try {
+        final pending = await locator<LocalDatabaseService>().getPendingFromOutbox();
+        hasOutbox = pending.isNotEmpty;
+      } catch (_) {}
+      final int flagsByte = hasOutbox ? 1 : 0;
+
+      Uint8List baseMf;
       if (isBridge) {
         if (extractedToken != null && extractedToken.isNotEmpty) {
           final tokenBytes = utf8.encode(extractedToken);
@@ -1195,28 +1353,28 @@ class BluetoothMeshService {
               ? tokenBytes.sublist(0, maxTokenBytes)
               : tokenBytes;
 
-          manufacturerData =
-              Uint8List.fromList([0x42, 0x52, ...truncatedToken]);
+          baseMf = Uint8List.fromList([0x42, 0x52, ...truncatedToken]);
           _log(
-              "🔍 [ADV] BRIDGE with token in manufacturerData: ${extractedToken.length > 8 ? extractedToken.substring(0, 8) : extractedToken}... (${manufacturerData.length} bytes)");
+              "🔍 [ADV] BRIDGE with token in manufacturerData: ${extractedToken.length > 8 ? extractedToken.substring(0, 8) : extractedToken}... (${baseMf.length + 1} bytes + intent)");
           _log(
               "   📋 Token bytes: ${truncatedToken.length} bytes (original: ${tokenBytes.length} bytes)");
         } else {
-          manufacturerData = Uint8List.fromList([0x42, 0x52]);
+          baseMf = Uint8List.fromList([0x42, 0x52]);
           _log(
               "⚠️ [ADV] BRIDGE without token in manufacturerData (token extraction failed)");
           _log("   📋 Original name: '$myName'");
           _log("   📋 Safe name: '$safeName'");
         }
       } else if (myName.contains("RELAY")) {
-        // "RL" + 8-byte device UUID hash (stable across MAC rotation)
         final deviceUuidBytes = _deviceUuidHashBytes();
-        manufacturerData = Uint8List.fromList([0x52, 0x4C, ...deviceUuidBytes]);
+        baseMf = Uint8List.fromList([0x52, 0x4C, ...deviceUuidBytes]);
       } else {
-        // "GH" + 8-byte device UUID hash (stable across MAC rotation)
         final deviceUuidBytes = _deviceUuidHashBytes();
-        manufacturerData = Uint8List.fromList([0x47, 0x48, ...deviceUuidBytes]);
+        baseMf = Uint8List.fromList([0x47, 0x48, ...deviceUuidBytes]);
       }
+      _lastManufacturerDataBase = baseMf;
+      _lastSafeName = safeName;
+      final manufacturerData = Uint8List.fromList([...baseMf, flagsByte]);
 
       final data = AdvertiseData(
         serviceUuid: SERVICE_UUID,
@@ -1264,9 +1422,18 @@ class BluetoothMeshService {
       // Fallback или стандартный путь
       if (!advertisingStarted) {
         try {
-          await _blePeripheral.start(advertiseData: data);
+          // 🔍 OUTBOX-BOOST: при активном boost — более частый advertise (interval LOW ≈100ms)
+          if (isOutboxBoostActive && Platform.isAndroid) {
+            await _blePeripheral.start(
+                advertiseData: data,
+                advertiseSetParameters: AdvertiseSetParameters(
+                    interval: 160)); // 160 = INTERVAL_LOW (high frequency)
+            _log("✅ [ADV] flutter_ble_peripheral started (boost: high freq)");
+          } else {
+            await _blePeripheral.start(advertiseData: data);
+            _log("✅ [ADV] flutter_ble_peripheral started successfully");
+          }
           advertisingStarted = true;
-          _log("✅ [ADV] flutter_ble_peripheral started successfully");
         } catch (e) {
           _log("❌ [ADV] flutter_ble_peripheral failed to start: $e");
           advertisingStarted = false;
@@ -1323,15 +1490,20 @@ class BluetoothMeshService {
           if (Platform.isAndroid && !_useNativeAdvertiser) {
             _log("   🔧 Trying native BLE advertiser as fallback...");
             try {
-              // В catch manufacturerData из try недоступна — собираем заново (GH/BR/RL + deviceUuid)
+              // В catch manufacturerData из try недоступна — собираем заново (GH/BR/RL + deviceUuid + intent)
               final role = NetworkMonitor().currentRole;
               final isBridgeRole = role == MeshRole.BRIDGE;
               final uuidBytes = _deviceUuidHashBytes();
-              final fallbackMfData = isBridgeRole
+              Uint8List baseFallback = isBridgeRole
                   ? Uint8List.fromList([0x42, 0x52])
                   : (myName.contains("RELAY")
                       ? Uint8List.fromList([0x52, 0x4C, ...uuidBytes])
                       : Uint8List.fromList([0x47, 0x48, ...uuidBytes]));
+              bool fbHasOutbox = false;
+              try {
+                fbHasOutbox = (await locator<LocalDatabaseService>().getPendingFromOutbox()).isNotEmpty;
+              } catch (_) {}
+              final fallbackMfData = Uint8List.fromList([...baseFallback, fbHasOutbox ? 1 : 0]);
 
               final success = await _nativeAdvChannel
                   .invokeMethod<bool>('startAdvertising', {
@@ -1427,8 +1599,12 @@ class BluetoothMeshService {
         ? passphrase.substring(0, 8)
         : passphrase.padRight(8, ' ');
     final passphraseBytes = utf8.encode(pass8);
+    bool hasOutbox = false;
+    try {
+      hasOutbox = (await locator<LocalDatabaseService>().getPendingFromOutbox()).isNotEmpty;
+    } catch (_) {}
     final manufacturerData = Uint8List.fromList(
-        [0x42, 0x52, ...tokenBytes, 0x7C, ...passphraseBytes]);
+        [0x42, 0x52, ...tokenBytes, 0x7C, ...passphraseBytes, hasOutbox ? 1 : 0]);
     final safeName = myName.length > 20 ? myName.substring(0, 20) : myName;
     _log(
         "📡 [ADV] Updating with passphrase for Wi-Fi Direct (GHOST will receive)");
@@ -1941,9 +2117,12 @@ class BluetoothMeshService {
   /// and applied so that GATT server ready state is never lost; completer is completed if a waiter exists.
   void _onGattReady({int? generation}) {
     _log("[GATT][STATE] onGattReady received (gen: $generation)");
-    if (generation != null &&
-        _expectedGattGen >= 0 &&
-        generation != _expectedGattGen) {
+    if (_expectedGattGen < 0) {
+      _log("🚫 [GATT-SERVER] DROP onGattReady — server already stopped");
+      _log("[GATT-GUARD] Rejecting onGattReady after stop");
+      return;
+    }
+    if (generation != null && generation != _expectedGattGen) {
       _log(
           "🚫 [GATT-SERVER] DROP stale onGattReady — gen $generation != expected $_expectedGattGen (server restarted)");
       return;
@@ -2092,7 +2271,10 @@ class BluetoothMeshService {
           "🔍 [PRE-CONNECT] No scan results — brief rescan to ensure peer is advertising connectable");
       try {
         await FlutterBluePlus.startScan(
-            timeout: kScanResultStaleRescanDuration);
+            timeout: kScanResultStaleRescanDuration,
+            androidScanMode: isOutboxBoostActive
+                ? AndroidScanMode.lowLatency
+                : AndroidScanMode.balanced);
         await Future.delayed(const Duration(milliseconds: 2500));
         await FlutterBluePlus.stopScan();
         await Future.delayed(const Duration(milliseconds: 200));
@@ -2615,6 +2797,10 @@ class BluetoothMeshService {
           try {
             await device.disconnect();
             _log("🔌 [CONNECT] Forced disconnect after connect failure");
+            try {
+              locator<MeshService>().reportMeshHealthBleDisconnect();
+              locator<MeshService>().resetCrdtSessionForPeer(device.remoteId.str);
+            } catch (_) {}
           } catch (e) {
             _log("⚠️ [CONNECT] Cleanup disconnect failed: $e");
           }
@@ -2705,6 +2891,9 @@ class BluetoothMeshService {
         _log(
             "✅ [SUCCESS] Link Established after ${connectElapsed.inSeconds}s!");
         _gattConnectionState = 'CONNECTED';
+        try {
+          locator<MeshService>().reportMeshHealthBleConnectionSuccess();
+        } catch (_) {}
         try {
           await _stateMachine.transition(BleState.CONNECTED);
         } catch (e) {
@@ -3066,6 +3255,9 @@ class BluetoothMeshService {
         }
         _log(
             "✅ [WRITE] All data sent successfully (${totalBytes} bytes total, with length headers)");
+        try {
+          locator<MeshService>().reportMeshHealthBleWriteSuccess();
+        } catch (_) {}
         recordBleInteraction(BleInteractionStats(
           peerId: device.remoteId.str,
           attemptedAction: BleAttemptedAction.write,
@@ -3099,6 +3291,10 @@ class BluetoothMeshService {
         try {
           await device.disconnect();
           _log("✅ [GHOST] Disconnected successfully");
+          try {
+            locator<MeshService>().reportMeshHealthBleDisconnect();
+            locator<MeshService>().resetCrdtSessionForPeer(device.remoteId.str);
+          } catch (_) {}
         } catch (e) {
           _log("⚠️ [GHOST] Error disconnecting: $e");
         }
@@ -3163,6 +3359,10 @@ class BluetoothMeshService {
           // 1. Принудительно отключаемся
           try {
             await device.disconnect();
+            try {
+              locator<MeshService>().reportMeshHealthBleDisconnect();
+              locator<MeshService>().resetCrdtSessionForPeer(device.remoteId.str);
+            } catch (_) {}
             await Future.delayed(const Duration(milliseconds: 500));
           } catch (_) {}
 
@@ -3320,6 +3520,10 @@ class BluetoothMeshService {
       }
       if (locator.isRegistered<NetworkPhaseContext>()) {
         locator<NetworkPhaseContext>().onBleTransferStarted();
+      }
+      if (_stateMachine.state == BleState.ADVERTISING) {
+        _log("[FSM] Controlled demotion ADVERTISING → IDLE for relay");
+        await stopAdvertising(keepGattServer: true);
       }
       await enterCentralMode();
       _transitionTransaction(BleTransactionState.CONNECTING);
@@ -3542,6 +3746,7 @@ class BluetoothMeshService {
         if (batchAborted) {
           _log(
               "⏸️ [BATCH] Hard limit reached - stopping at message ${i}/${messages.length}");
+          _log("[BEACON-SYNC] Connection time limit reached — CRDT/listen window may be short; chat may stay out of sync");
           break;
         }
 
@@ -3784,6 +3989,7 @@ class BluetoothMeshService {
       final batchDuration = DateTime.now().difference(batchStartTime);
       _log(
           "📊 [BATCH] Batch duration: ${batchDuration.inMilliseconds}ms (limit: ${_batchHardLimitSeconds}s)");
+      _log("[BEACON-SYNC] Entering listen window (${batchAborted ? 3 : 6}s) for CRDT/outbox from peer — chat sync runs in this window");
 
       _transitionTransaction(BleTransactionState.LISTENING);
       final listenWindowSeconds = batchAborted ? 3 : 6;
@@ -3841,6 +4047,113 @@ class BluetoothMeshService {
     return sentCount;
   }
 
+  /// [ACTIVE-SYNC] CRDT-only session: connect → discover → enable notify → send HEAD_EXCHANGE → listen 6s → disconnect.
+  /// No outbox cascade. Uses same FSM/connect path; does not change transport state machine.
+  /// Call only when no other BLE session is active. Max 1 connection per epoch.
+  Future<bool> runCrdtOnlySession(BluetoothDevice device) async {
+    final targetMac = device.remoteId.str;
+    if (!tryAcquireOwner(BleSessionOwner.activeSyncCrdt)) {
+      _log("[ACTIVE-SYNC] Skip: session owned by $_sessionOwner");
+      return false;
+    }
+    if (_isGattConnecting || _bleTransactionState != BleTransactionState.IDLE) {
+      releaseOwner(BleSessionOwner.activeSyncCrdt);
+      _log("[ACTIVE-SYNC] Skip: GATT busy or transaction not IDLE");
+      return false;
+    }
+    _isGattConnecting = true;
+    _currentGattTargetMac = targetMac;
+    StreamSubscription<BluetoothConnectionState>? stateSub;
+    StreamSubscription<List<int>>? notifySub;
+    BluetoothCharacteristic? characteristic;
+    try {
+      await enterCentralMode();
+      _gattTransition(BleGattSessionState.CONNECTING);
+      _transitionTransaction(BleTransactionState.CONNECTING);
+      _stateMachine.forceTransition(BleState.CONNECTING);
+      _log("[ACTIVE-SYNC] Connecting to ${maskMacForLog(targetMac)} for CRDT-only sync...");
+      await device.connect(timeout: const Duration(seconds: 15), autoConnect: false);
+      if (!device.isConnected) {
+        _log("[ACTIVE-SYNC] Connect failed: not connected");
+        return false;
+      }
+      _gattTransition(BleGattSessionState.CONNECTED);
+      _transitionTransaction(BleTransactionState.STABILIZING_POST_CONNECT);
+      await Future.delayed(Duration(milliseconds: _postConnectStabilizationMs));
+      _transitionTransaction(BleTransactionState.DISCOVERING);
+      if (Platform.isAndroid) {
+        try {
+          await _enqueueGattOperation(() => device.requestMtu(158));
+          await Future.delayed(const Duration(milliseconds: 300));
+        } catch (_) {}
+      }
+      List<BluetoothService> services = await device.discoverServices();
+      await Future.delayed(Duration(milliseconds: _postDiscoverSettleMs));
+      var matchingServices = services
+          .where((s) => s.uuid.toString().toLowerCase() == SERVICE_UUID.toLowerCase())
+          .toList();
+      if (matchingServices.isEmpty) {
+        _log("[ACTIVE-SYNC] Service not found");
+        return false;
+      }
+      final service = matchingServices.first;
+      characteristic = service.characteristics.firstWhere(
+        (c) => c.uuid.toString() == CHAR_UUID,
+        orElse: () => throw Exception("Char not found"),
+      );
+      _gattTransition(BleGattSessionState.DISCOVERED);
+      await Future.delayed(const Duration(milliseconds: 500));
+      await _enqueueGattOperation(() => characteristic!.setNotifyValue(true).timeout(
+        Duration(seconds: _notifyEnableTimeoutSeconds),
+        onTimeout: () => throw TimeoutException('Notify enable'),
+      ));
+      _ghostNotifyBuffer.clear();
+      _ghostNotifyExpectedLength = -1;
+      _crdtOnlyCentralCharacteristic = characteristic;
+      _crdtOnlyCentralTargetMac = targetMac;
+      notifySub = characteristic!.lastValueStream.listen(
+        (value) => _onNotifyChunkFromBridge(targetMac, value),
+        onError: (e) => _log("⚠️ [ACTIVE-SYNC] Notify error: $e"),
+      );
+      _log("[ACTIVE-SYNC] Notify enabled — sending HEAD_EXCHANGE");
+      if (locator.isRegistered<MeshService>()) {
+        locator<MeshService>().startCrdtDigestExchange(targetMac);
+      }
+      _transitionTransaction(BleTransactionState.LISTENING);
+      _log("[ACTIVE-SYNC] Listen window 6s for CRDT response");
+      await Future.delayed(const Duration(seconds: 6));
+      await notifySub.cancel();
+      _ghostNotifyBuffer.clear();
+      _ghostNotifyExpectedLength = -1;
+      _log("[ACTIVE-SYNC] Session complete");
+      return true;
+    } catch (e) {
+      _log("[ACTIVE-SYNC] Error: $e");
+      return false;
+    } finally {
+      _crdtOnlyCentralCharacteristic = null;
+      _crdtOnlyCentralTargetMac = null;
+      try {
+        await stateSub?.cancel();
+        if (device.isConnected) await device.disconnect();
+      } catch (_) {}
+      _gattTransition(BleGattSessionState.DONE);
+      _releaseGattMutex("active-sync crdt-only completed");
+      releaseOwner(BleSessionOwner.activeSyncCrdt);
+      if (locator.isRegistered<MeshService>()) {
+        locator<MeshService>().resetCrdtSessionForPeer(targetMac);
+      }
+      if (locator.isRegistered<NetworkPhaseContext>()) {
+        locator<NetworkPhaseContext>().onBleTransferEnded();
+      }
+      _gattTransition(BleGattSessionState.IDLE);
+      _stateMachine.forceTransition(BleState.IDLE);
+      _transitionTransaction(BleTransactionState.QUIET_POST_DISCONNECT);
+      await Future.delayed(Duration(milliseconds: _quietPostDisconnectMs));
+      _transitionTransaction(BleTransactionState.IDLE);
+    }
+  }
+
   /// 🔥 BRIDGE→GHOST: обрабатывает чанки notify от BRIDGE, собирает в полное сообщение и передаёт в mesh
   /// Формат как у GattServerHelper: [4 bytes length Big-Endian][N bytes JSON]
   void _onNotifyChunkFromBridge(String bridgeAddress, List<int> chunk) {
@@ -3886,6 +4199,29 @@ class BluetoothMeshService {
       } catch (e) {
         _log("⚠️ [GHOST] Notify reassembly error: $e");
       }
+    }
+  }
+
+  /// [ACTIVE-SYNC] Write payload to connected peer when we are Central (CRDT-only session). Same framing as batch.
+  /// Returns true if write was performed; false if not in CRDT-only session or peer mismatch.
+  Future<bool> writeFromCentralToPeer(String peerAddress, String payloadJson) async {
+    if (_crdtOnlyCentralTargetMac != peerAddress || _crdtOnlyCentralCharacteristic == null) {
+      return false;
+    }
+    try {
+      final payload = utf8.encode(payloadJson);
+      final framed = _createFramedMessage(payload);
+      const int chunkSize = 60;
+      for (int j = 0; j < framed.length; j += chunkSize) {
+        final end = (j + chunkSize < framed.length) ? j + chunkSize : framed.length;
+        final chunk = framed.sublist(j, end);
+        await _gattWrite(_crdtOnlyCentralCharacteristic!, chunk, withoutResponse: true);
+        if (end < framed.length) await Future.delayed(const Duration(milliseconds: 100));
+      }
+      return true;
+    } catch (e) {
+      _log("⚠️ [ACTIVE-SYNC] writeFromCentralToPeer failed: $e");
+      return false;
     }
   }
 

@@ -16,6 +16,9 @@ class MessageStatus {
   static const String sending = 'SENDING'; // 🕓 Sending…
   static const String deliveredToNetwork = 'DELIVERED_TO_NETWORK'; // ✓ Delivered to network
   static const String deliveredToParticipants = 'DELIVERED_TO_PARTICIPANTS'; // ✓✓ Delivered to participants
+
+  /// Optimistic send: transport failed, show retry
+  static const String failed = 'FAILED';
   
   /// Get display text for status
   static String getDisplayText(String status) {
@@ -40,6 +43,8 @@ class MessageStatus {
         return '✓ Delivered to network';
       case deliveredToParticipants:
         return '✓✓ Delivered to participants';
+      case failed:
+        return 'Failed';
       default:
         return status;
     }
@@ -72,6 +77,8 @@ class MessageStatus {
         return '✓✓';
       case archived:
         return '📦';
+      case failed:
+        return '↻';
       default:
         return '🕓';
     }

@@ -76,3 +76,16 @@ class BleStateChangedEvent {
   
   BleStateChangedEvent(this.state);
 }
+
+/// Outbox transition 0 → 1: first message added. Used for discovery boost (scan/adv).
+class OutboxFirstMessageEvent {}
+
+/// Outbox became empty (1 → 0). Used to refresh BLE advertisement intent flag.
+class OutboxEmptyEvent {}
+
+/// CRDT LOG_ENTRIES merge completed for a chat — UI should reload messages from DB for this chat.
+/// Fired when messages were merged via BEACON-SYNC (no OFFLINE_MSG stream), so conversation screen must refresh.
+class ChatSyncCompletedEvent {
+  final String chatId;
+  ChatSyncCompletedEvent(this.chatId);
+}

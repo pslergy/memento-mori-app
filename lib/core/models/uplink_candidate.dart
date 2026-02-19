@@ -43,7 +43,10 @@ class UplinkCandidate {
 
   /// [CAPABILITY] Peer is Huawei/Honor (from BLE advertising capability byte). For Wi‑Fi: Huawei MUST be GO.
   final bool? wifiLikelyUnstableCentral;
-  
+
+  /// Intent flag from BLE advertisement: last byte bit 0 = 1 if peer has outbox (data to send). Used for connection priority only.
+  final bool hasOutboxFlag;
+
   /// Время последнего подтверждения (когда кандидат был обнаружен)
   final DateTime lastSeen;
   
@@ -88,14 +91,14 @@ class UplinkCandidate {
   
   /// Приоритет (выше = важнее)
   /// BRIDGE > RELAY > GHOST. Внутри роли: выше confidence = выше приоритет.
+  /// Узлы с hasOutboxFlag получают +15 для ускорения подключения (без смены ролей/арбитража).
   int get priority {
-    if (role == "BRIDGE") {
-      return (1000 + (confidence * 100)).toInt(); // BRIDGE: 1000-1100
-    }
-    if (role == "RELAY") {
-      return (500 + (confidence * 100)).toInt(); // RELAY: 500-600
-    }
-    return (confidence * 100).toInt(); // GHOST: 0-100
+    final base = role == "BRIDGE"
+        ? (1000 + (confidence * 100)).toInt()
+        : role == "RELAY"
+            ? (500 + (confidence * 100)).toInt()
+            : (confidence * 100).toInt();
+    return base + (hasOutboxFlag ? 15 : 0);
   }
   
   /// Проверка, валиден ли кандидат (не истёк ли TTL)
@@ -137,6 +140,7 @@ class UplinkCandidate {
     this.wifiDirectPassphrase,
     this.wifiDirectNetworkName,
     this.wifiLikelyUnstableCentral,
+    this.hasOutboxFlag = false,
     DateTime? lastSeen,
     DateTime? createdAt,
     this.confidence = 0.5,
@@ -160,6 +164,7 @@ class UplinkCandidate {
     String? wifiDirectPassphrase,
     String? wifiDirectNetworkName,
     bool? wifiLikelyUnstableCentral,
+    bool? hasOutboxFlag,
     DateTime? lastSeen,
     double? confidence,
     String? discoverySource,
@@ -194,6 +199,7 @@ class UplinkCandidate {
       wifiDirectPassphrase: wifiDirectPassphrase ?? this.wifiDirectPassphrase,
       wifiDirectNetworkName: wifiDirectNetworkName ?? this.wifiDirectNetworkName,
       wifiLikelyUnstableCentral: wifiLikelyUnstableCentral ?? this.wifiLikelyUnstableCentral,
+      hasOutboxFlag: hasOutboxFlag ?? this.hasOutboxFlag,
       lastSeen: lastSeen ?? DateTime.now(),
       createdAt: createdAt,
       confidence: newConfidence,
@@ -347,12 +353,18 @@ class UplinkCandidate {
     }
 
     // [CAPABILITY] Last byte of manufacturerData = capability bitmask (peer Huawei-like => Wi‑Fi GO policy).
+    // [INTENT] Same last byte bit 0 = has_outbox_flag (peer has data to send; used for connection priority).
     bool? wifiLikelyUnstableCentral;
+    bool hasOutboxFlag = false;
     if (manufacturerData != null) {
       final mf = manufacturerData[0xFFFF];
-      if (mf != null && mf.length >= 3) {
-        final cap = DeviceCapability.fromCapabilityByte(mf[mf.length - 1]);
-        wifiLikelyUnstableCentral = cap.wifiLikelyUnstableCentral;
+      if (mf != null && mf.length >= 1) {
+        final flagsByte = mf[mf.length - 1];
+        hasOutboxFlag = (flagsByte & 1) != 0;
+        if (mf.length >= 3) {
+          final cap = DeviceCapability.fromCapabilityByte(flagsByte);
+          wifiLikelyUnstableCentral = cap.wifiLikelyUnstableCentral;
+        }
       }
     }
 
@@ -377,6 +389,7 @@ class UplinkCandidate {
       wifiDirectPassphrase: wifiDirectPassphrase ?? parsedWifiPassphrase,
       wifiDirectNetworkName: wifiDirectNetworkName ?? parsedWifiNetworkName,
       wifiLikelyUnstableCentral: wifiLikelyUnstableCentral,
+      hasOutboxFlag: hasOutboxFlag,
       confidence: confidence.clamp(0.0, 1.0),
       discoverySources: {"BLE"},
       ttlSeconds: role == "BRIDGE" ? 120 : 60,

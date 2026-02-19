@@ -57,6 +57,7 @@ import 'ghost_transfer_manager.dart';
 import 'peer_cache_service.dart';
 import 'role/delivery_path.dart';
 import 'role/message_router.dart';
+import 'crdt_reconciliation.dart';
 
 // 🔒 EVOLUTION: мягкое охлаждение Wi-Fi Direct в sendAuto (Вариант A). Не меняет порядок каналов, не трогает BLE.
 // Влияние: только задержка перед попыткой Channel 2, если по опыту (PeerCache) у peer/channel плохая история.
@@ -262,6 +263,12 @@ class MeshService with ChangeNotifier {
 
       _log(
           "🧹 [Memory] Cleaned up expired cooldowns, IP locks, timestamps, _sentPayloads, retry info, transport latencies, and Grosii damping");
+    });
+
+    // [ACTIVE-SYNC] Bounded periodic CRDT-only sync (no outbox cascade). First run after 1 min.
+    Future.delayed(const Duration(minutes: 1), () {
+      if (!_isMeshEnabled) return;
+      _scheduleNextActiveSyncEpoch();
     });
 
     // 🔄 RELAY: периодическая проверка — стать релеятором (GHOST) или снять режим при отсутствии клиентов
@@ -509,6 +516,253 @@ class MeshService with ChangeNotifier {
   bool _isBtScanning = false;
   bool _p2pDiscoveryActive = false;
   Timer? _periodicDiscoveryTimer; // Таймер для периодического discovery
+  /// [WIFI-GUARD] Last time a Wi-Fi Direct start (discovery or connect) was attempted. Used for 20s cooldown.
+  DateTime? _lastWifiDirectAttemptTime;
+  static const int _wifiDirectCooldownSec = 20;
+  /// [WIFI] Connect-failed cooldown (CONNECT_FAILED code 0): no retry until this time. Huawei stabilization.
+  DateTime? _wifiConnectFailedCooldownUntil;
+  static const int _wifiConnectFailedCooldownSec = 20;
+  /// [WIFI] Peer we are currently connected to (target address used when connect succeeded). For state-aware connect.
+  String? _lastConnectedPeerAddress;
+  /// [WIFI] Target address of the current connect attempt. Set when starting connect, cleared on success/failure.
+  String? _connectTargetAddress;
+  /// [WIFI] After disconnect, retry connect to this peer. Cleared when onDisconnected fires and we schedule retry.
+  String? _pendingConnectAfterDisconnect;
+  String? _pendingConnectNetworkName;
+  String? _pendingConnectPassphrase;
+
+  /// [MESH-HEALTH] Runtime-only score 0–100 for transport decision layer. Not persisted.
+  int _meshHealthScore = _meshHealthDefault;
+  DateTime? _meshHealthLastUpdate;
+  static const int _meshHealthDefault = 70;
+  static const double _meshHealthDecayPerMinute = 0.33;
+  static const int _meshHealthMaxDeltaPerEvent = 20;
+  int get meshHealthScore => _meshHealthScore;
+
+  /// CRDT reconciliation (above transport). Lazy-init so sendToPeer can reference this.
+  CrdtReconciliation? _crdt;
+  CrdtReconciliation get _crdtOrCreate =>
+      _crdt ??= CrdtReconciliation(
+        sendToPeer: _sendToPeerForCrdt,
+        log: _log,
+        onDiffZero: _onCrdtDiffZero,
+        onDiffNonZero: _onCrdtDiffNonZero,
+      );
+
+  void _onCrdtDiffZero(String peerAddress) {
+    _recordCrdtSyncCompleted(peerAddress, hadDiff: false);
+    _activeSyncLastCrdtSyncHadDiff = false;
+    _btService.requestGracefulDisconnectForSync(peerAddress);
+  }
+
+  void _onCrdtDiffNonZero(String peerAddress) {
+    _recordCrdtSyncCompleted(peerAddress, hadDiff: true);
+    _activeSyncLastCrdtSyncHadDiff = true;
+    _activeSyncIntervalMinutes = _activeSyncBaseIntervalMinutes;
+    _relayWindowOpenUntil = DateTime.now().add(const Duration(seconds: 15));
+    _relayConnectCountThisWindow = 0;
+    _log('[ACTIVE-SYNC] Relay window opened 15s (diff>0 with ${maskMacForLog(peerAddress)})');
+    Future.delayed(const Duration(seconds: _relayPauseBetweenConnectsSeconds), () {
+      if (_relayWindowOpenUntil != null &&
+          DateTime.now().isBefore(_relayWindowOpenUntil!) &&
+          _relayConnectCountThisWindow < 1) {
+        _tryRelayConnect();
+      }
+    });
+  }
+
+  void _recordCrdtSyncCompleted(String peerAddress, {required bool hadDiff}) {
+    final now = DateTime.now();
+    _lastCrdtSyncTime = now;
+    _lastCrdtSyncPerPeer[peerAddress] = now;
+  }
+
+  // --- [ACTIVE-SYNC] Bounded periodic sync & relay (no FSM/role change) ---
+  static const int _activeSyncBaseIntervalMinutes = 7;
+  static const int _activeSyncMaxIntervalMinutes = 30;
+  static const int _activeSyncMinMinutesSinceLastSync = 3;
+  static const int _activeSyncSamePeerCooldownMinutes = 2;
+  static const int _relayPauseBetweenConnectsSeconds = 2;
+  DateTime? _lastCrdtSyncTime;
+  final Map<String, DateTime> _lastCrdtSyncPerPeer = {};
+  int _activeSyncIntervalMinutes = _activeSyncBaseIntervalMinutes;
+  bool _activeSyncLastCrdtSyncHadDiff = false;
+  Timer? _activeSyncEpochTimer;
+  DateTime? _relayWindowOpenUntil;
+  int _relayConnectCountThisWindow = 0;
+  String? _lastActiveSyncPeer;
+  DateTime? _lastActiveSyncPeerTime;
+  bool _activeSyncEpochRunning = false;
+
+  void _scheduleNextActiveSyncEpoch() {
+    _activeSyncEpochTimer?.cancel();
+    final interval = Duration(minutes: _activeSyncIntervalMinutes.clamp(
+        _activeSyncBaseIntervalMinutes, _activeSyncMaxIntervalMinutes));
+    _activeSyncEpochTimer = Timer(interval, () async {
+      if (!_isMeshEnabled) return;
+      await _tryActiveSyncEpoch();
+      _scheduleNextActiveSyncEpoch();
+    });
+    _log('[ACTIVE-SYNC] Next epoch in ${_activeSyncIntervalMinutes} min');
+  }
+
+  Future<void> _tryActiveSyncEpoch() async {
+    if (_activeSyncEpochRunning) return;
+    if (NetworkMonitor().currentRole != MeshRole.GHOST) return;
+    if (_btService.bleTransactionState != BleTransactionState.IDLE ||
+        _btService.isGattConnecting) return;
+    try {
+      final battery = Battery();
+      final level = await battery.batteryLevel;
+      if (level < 15) {
+        _log('[ACTIVE-SYNC] Skip: low battery $level%');
+        return;
+      }
+    } catch (_) {}
+    final now = DateTime.now();
+    final lastSync = _lastCrdtSyncTime;
+    if (lastSync != null &&
+        now.difference(lastSync).inMinutes < _activeSyncMinMinutesSinceLastSync) {
+      return;
+    }
+    final candidates = _getRecentVisiblePeersForActiveSync();
+    if (candidates.isEmpty) return;
+    final peerMac = _selectPeerForActiveSync(candidates, forRelay: false);
+    if (peerMac == null) return;
+    _activeSyncEpochRunning = true;
+    try {
+      _log('[ACTIVE-SYNC] Epoch: connecting to ${maskMacForLog(peerMac)} for CRDT-only');
+      final device = BluetoothDevice.fromId(peerMac);
+      final ok = await _btService.runCrdtOnlySession(device);
+      _lastActiveSyncPeer = peerMac;
+      _lastActiveSyncPeerTime = now;
+      if (ok && !_activeSyncLastCrdtSyncHadDiff) {
+        _activeSyncIntervalMinutes = (_activeSyncIntervalMinutes * 1.5)
+            .ceil()
+            .clamp(_activeSyncBaseIntervalMinutes, _activeSyncMaxIntervalMinutes);
+        _log('[ACTIVE-SYNC] Diff=0 — backoff next interval to $_activeSyncIntervalMinutes min');
+      } else if (ok) {
+        _activeSyncIntervalMinutes = _activeSyncBaseIntervalMinutes;
+      }
+    } catch (e) {
+      _log('[ACTIVE-SYNC] Epoch error: $e');
+    } finally {
+      _activeSyncEpochRunning = false;
+    }
+  }
+
+  Future<void> _tryRelayConnect() async {
+    if (_relayWindowOpenUntil == null ||
+        DateTime.now().isAfter(_relayWindowOpenUntil!)) return;
+    if (_relayConnectCountThisWindow >= 1) return;
+    if (NetworkMonitor().currentRole != MeshRole.GHOST) return;
+    if (_btService.bleTransactionState != BleTransactionState.IDLE ||
+        _btService.isGattConnecting) return;
+    final candidates = _getRecentVisiblePeersForActiveSync();
+    final peerMac = _selectPeerForActiveSync(candidates, forRelay: true);
+    if (peerMac == null) return;
+    _relayConnectCountThisWindow++;
+    _log('[ACTIVE-SYNC] Relay: 1 extra connect to ${maskMacForLog(peerMac)} (CRDT-only)');
+    await Future.delayed(const Duration(seconds: _relayPauseBetweenConnectsSeconds));
+    try {
+      final device = BluetoothDevice.fromId(peerMac);
+      await _btService.runCrdtOnlySession(device);
+    } catch (e) {
+      _log('[ACTIVE-SYNC] Relay error: $e');
+    }
+  }
+
+  List<UplinkCandidate> _getRecentVisiblePeersForActiveSync() {
+    const maxAge = Duration(minutes: 5);
+    final now = DateTime.now();
+    final ctx = locator<DiscoveryContextService>();
+    final all = ctx.validCandidates;
+    return all
+        .where((c) =>
+            c.mac.contains(':') &&
+            now.difference(c.lastSeen).inMilliseconds < maxAge.inMilliseconds)
+        .toList();
+  }
+
+  String? _selectPeerForActiveSync(List<UplinkCandidate> candidates,
+      {required bool forRelay}) {
+    final now = DateTime.now();
+    final cooldown = Duration(minutes: _activeSyncSamePeerCooldownMinutes);
+    final excluded = forRelay && _lastActiveSyncPeer != null
+        ? _lastActiveSyncPeer!
+        : null;
+    int bestScore = -1;
+    UplinkCandidate? best;
+    for (final c in candidates) {
+      if (excluded != null && c.mac == excluded) continue;
+      if (_lastActiveSyncPeerTime != null &&
+          c.mac == _lastActiveSyncPeer &&
+          now.difference(_lastActiveSyncPeerTime!).inMilliseconds <
+              cooldown.inMilliseconds) {
+        continue;
+      }
+      final lastSyncWithPeer = _lastCrdtSyncPerPeer[c.mac];
+      final minutesSinceSync = lastSyncWithPeer == null
+          ? 999
+          : now.difference(lastSyncWithPeer).inMinutes;
+      int score = minutesSinceSync.clamp(0, 60);
+      if (c.hasOutboxFlag) score += 10;
+      if (score > bestScore) {
+        bestScore = score;
+        best = c;
+      }
+    }
+    return best?.mac;
+  }
+
+  Future<void> _sendToPeerForCrdt(String peerAddress, String payloadJson) async {
+    if (peerAddress.contains(':')) {
+      // [ACTIVE-SYNC] When we are Central in a CRDT-only session, write to peer via characteristic.
+      final written = await _btService.writeFromCentralToPeer(peerAddress, payloadJson);
+      if (!written) {
+        await _btService.sendMessageToGattClient(peerAddress, payloadJson);
+      }
+    } else if (peerAddress.contains('.')) {
+      NativeMeshService.sendTcp(payloadJson, host: peerAddress);
+    }
+  }
+
+  /// Start CRDT digest exchange (call after OUTBOX pull completes). Used by Wi-Fi and BLE.
+  void startCrdtDigestExchange(String peerAddress) {
+    if (peerAddress.isEmpty) return;
+    unawaited(_crdtOrCreate.startDigestExchange(peerAddress));
+  }
+
+  /// Reset CRDT session for peer (call on transport disconnect so next meeting runs digest again).
+  void resetCrdtSessionForPeer(String peerAddress) {
+    _crdt?.resetSessionForPeer(peerAddress);
+  }
+
+  void _updateMeshHealthScore(int delta) {
+    final now = DateTime.now();
+    if (_meshHealthLastUpdate != null) {
+      final minutes = now.difference(_meshHealthLastUpdate!).inMinutes;
+      if (minutes > 0) {
+        final decay = (minutes * _meshHealthDecayPerMinute).floor();
+        _meshHealthScore = (_meshHealthScore - decay).clamp(0, 100);
+      }
+    }
+    _meshHealthLastUpdate = now;
+    final clampedDelta = delta.clamp(-_meshHealthMaxDeltaPerEvent, _meshHealthMaxDeltaPerEvent);
+    _meshHealthScore = (_meshHealthScore + clampedDelta).clamp(0, 100);
+    _log("[MESH-HEALTH] Score updated: $_meshHealthScore");
+  }
+
+  void reportMeshHealthBleConnectionSuccess() => _updateMeshHealthScore(10);
+  void reportMeshHealthBleWriteSuccess() => _updateMeshHealthScore(5);
+  void reportMeshHealthBleBusy() => _updateMeshHealthScore(-15);
+  void reportMeshHealthBleDisconnect() => _updateMeshHealthScore(-20);
+  void reportMeshHealthBlePassiveWindowOk() => _updateMeshHealthScore(5);
+  void reportMeshHealthWifiConnectSuccess() => _updateMeshHealthScore(10);
+  void reportMeshHealthWifiConnectFailed() => _updateMeshHealthScore(-15);
+  void reportMeshHealthWifiCooldownTriggered() => _updateMeshHealthScore(-5);
+  void reportMeshHealthWifiOutboxTransferSuccess() => _updateMeshHealthScore(10);
+
   LocalDatabaseService get db => _db;
 
   // Геттеры для UI
@@ -802,13 +1056,28 @@ class MeshService with ChangeNotifier {
 
   Future<void> connectToNode(String address,
       {String? networkName, String? passphrase}) async {
-    // Если уже идет процесс, не плодим запросы
     if (_isTransferring) {
       _log("⚠️ [Block] Connection already in progress. Wait for timeout.");
       return;
     }
 
-    // 🔥 WI-FI DIRECT: Получаем passphrase из DiscoveryContext если не передан
+    // [WIFI-GUARD] Block if BLE is active or conditions not met
+    final guardStart = await _evaluateWifiDirectGuard();
+    if (!guardStart.allowed) {
+      _log("[WIFI-GUARD] Conditions evaluated");
+      _log("[WIFI-GUARD] Blocked reason: ${guardStart.blockReason}");
+      return;
+    }
+    if (_wifiConnectFailedCooldownUntil != null &&
+        DateTime.now().isBefore(_wifiConnectFailedCooldownUntil!)) {
+      _log("[WIFI] Cooldown active");
+      return;
+    }
+    _log("[WIFI-GUARD] Conditions evaluated");
+    _log("[WIFI] Connect approved by guard");
+    _lastWifiDirectAttemptTime = DateTime.now();
+
+    // Resolve passphrase/networkName from DiscoveryContext if not provided
     String? usePassphrase = passphrase;
     String? useNetworkName = networkName;
     if (usePassphrase == null || useNetworkName == null) {
@@ -824,25 +1093,56 @@ class MeshService with ChangeNotifier {
       }
     }
 
+    // 1) If already connected to this peer, do nothing
+    if (_isP2pConnected && _lastConnectedPeerAddress == address) {
+      _log("[WIFI] Already connected to peer");
+      return;
+    }
+
+    // 2) If connected to a different peer: graceful disconnect, then retry after onDisconnected
+    final groupInfo = await NativeMeshService.getWifiDirectGroupInfo();
+    final hasGroup = groupInfo != null;
+    _log("[WIFI] Connect attempt started");
+    _log("[WIFI] Existing group state: ${hasGroup ? "exists" : "none"}");
+
+    if (_isP2pConnected && _lastConnectedPeerAddress != null && _lastConnectedPeerAddress != address) {
+      if (hasGroup) {
+        _log("[WIFI] Graceful disconnect from old peer");
+        _pendingConnectAfterDisconnect = address;
+        _pendingConnectNetworkName = useNetworkName;
+        _pendingConnectPassphrase = usePassphrase;
+        await NativeMeshService.removeWifiDirectGroup();
+      }
+      return;
+    }
+
+    _log("[WIFI] No reset required");
     _isTransferring = true;
-    _transferStartTime = DateTime.now(); // 🔥 FIX: Track start time
-    _log("🧨 [NUCLEAR-ATTACK] Target: $address. Engaging P2P Stack...");
+    _connectTargetAddress = address;
+    _transferStartTime = DateTime.now();
     notifyListeners();
 
-    // 🛡️ ТАЙМЕР-СТРАЖ (Watchdog)
     _transferGuardTimer?.cancel();
     _transferGuardTimer = Timer(const Duration(seconds: 20), () {
       if (_isTransferring && !_isP2pConnected) {
         _log("🚨 [WATCHDOG] Connection timed out. Resetting local state.");
         _isTransferring = false;
+        _connectTargetAddress = null;
         notifyListeners();
       }
     });
 
     try {
-      _log("☢️ Executing Pre-emptive Stack Reset...");
-      await NativeMeshService.forceReset();
-      await Future.delayed(const Duration(milliseconds: 1500));
+      // [WIFI-GUARD] BLE has priority: abort Wi-Fi connect only if BLE became active
+      final guardBeforeConnect = await _evaluateWifiDirectGuard();
+      if (!guardBeforeConnect.allowed) {
+        _log("[WIFI] Aborted due to BLE activity");
+        _isTransferring = false;
+        _transferGuardTimer?.cancel();
+        _connectTargetAddress = null;
+        notifyListeners();
+        return;
+      }
 
       _log(
           "🔗 Engaging Native Connect for $address${usePassphrase != null ? ' (with passphrase)' : ''}");
@@ -852,6 +1152,7 @@ class MeshService with ChangeNotifier {
       _log("❌ [Link Fault] $e");
       _isTransferring = false;
       _transferGuardTimer?.cancel();
+      _connectTargetAddress = null;
       notifyListeners();
     }
   }
@@ -1157,6 +1458,8 @@ class MeshService with ChangeNotifier {
 
     print(
         "📤 [SEND] === sendAuto START === target=$targetId length=${content.length}");
+    _log(
+        "[OUTBOX] sendAuto entered: target=$targetId role=${currentRole == MeshRole.BRIDGE ? 'BRIDGE' : 'GHOST'} messageId=${messageId ?? 'null'}");
     _log("🚀 Initiating Multi-Channel Uplink for: $targetId");
     _log("📤 [SEND-AUTO] Starting message send:");
     _log("   📋 Content length: ${content.length} chars");
@@ -1302,7 +1605,7 @@ class MeshService with ChangeNotifier {
         _log("✅ [SEND-AUTO] Channel 3: All BLE messages queued");
       }
 
-      /// Returns true only if TCP burst was actually sent (false when GO skips "would send to self" or no route).
+      /// [WIFI-PULL] Wi-Fi does not push outbox; only responds to OUTBOX_REQUEST. Same as BLE philosophy.
       Future<bool> _sendViaWifi() async {
         _log(
             "   📋 [Channel 2] _isP2pConnected=$_isP2pConnected isRouteReady=$isRouteReady");
@@ -1311,19 +1614,8 @@ class MeshService with ChangeNotifier {
             _log("⏳ Mesh: Link detected but route warming up. Skipping TCP.");
           return false;
         }
-        final cooldownMs = _getWifiDirectSoftCooldownMs();
-        if (cooldownMs > 0) {
-          _log(
-              "   ⏳ [COOLDOWN] Wi-Fi Direct soft cooldown ${cooldownMs}ms (experience-based)");
-          await Future.delayed(Duration(milliseconds: cooldownMs));
-        }
-        _log(
-            "📤 [SEND-AUTO] Channel 2: Wi-Fi Direct TCP (P2P connected, route ready)");
-        _log(
-            "📡 Mesh: Route is stable. Emitting TCP bursts to $_lastKnownPeerIp:${MeshService.meshTcpPort}...");
-        final tcpSent = await sendTcpBurst(offlinePacket);
-        _log("✅ [SEND-AUTO] Channel 2: TCP burst completed");
-        return tcpSent;
+        _log("   📋 [SEND-AUTO] Channel 2: Wi-Fi is pull-only (no auto-push); outbox via OUTBOX_REQUEST only");
+        return false;
       }
 
       // 🔒 DEDUP: GHOST не ставит сообщения в BLE-очередь из sendAuto — только каскад отправляет по BLE.
@@ -1422,6 +1714,7 @@ class MeshService with ChangeNotifier {
         await db.addToOutbox(myMsgEncrypted, targetId,
             contentAlreadyEncrypted: true);
         _log("🦠 Virus: Signal incubated in Outbox.");
+        _log("[OUTBOX] Message added to outbox (GHOST, messageId=null). id=$tempId");
 
         // 🔥 FIX: Автоматический триггер scan при добавлении сообщения в outbox
         // Это гарантирует, что GHOST начнет искать BRIDGE сразу после отправки сообщения
@@ -1441,6 +1734,7 @@ class MeshService with ChangeNotifier {
       await db.addToOutbox(myMsgEncrypted, targetId,
           contentAlreadyEncrypted: true);
       _log("🦠 Virus: Signal incubated in Outbox.");
+      _log("[OUTBOX] Message added to outbox (GHOST, not delivered). id=$tempId");
       print(
           "📤 [SEND] Message in outbox (GHOST, not delivered) → triggering auto-scan + Grosii");
 
@@ -1641,6 +1935,59 @@ class MeshService with ChangeNotifier {
 
   // --- СЕТЕВАЯ ЛОГИКА ---
 
+  /// [WIFI-GUARD] Evaluates whether Wi-Fi Direct may start/run. BLE always has priority.
+  /// [requirePendingAndCooldown] when true (discovery/connect): also block on zero pending and 20s cooldown.
+  /// [MESH-HEALTH] Score influences: recovery (<20), prefer BLE (≥70 = large payload only), escalation (<40).
+  Future<({bool allowed, String? blockReason})> _evaluateWifiDirectGuard(
+      {bool requirePendingAndCooldown = true}) async {
+    final score = _meshHealthScore;
+
+    // Active BLE GATT connection (server or client) or BLE transaction in progress
+    if (_btService.isInGattLifecycle) {
+      return (allowed: false, blockReason: 'active BLE GATT session');
+    }
+    if (_btService.bleTransactionState != BleTransactionState.IDLE) {
+      return (allowed: false, blockReason: 'BLE transfer in progress');
+    }
+    if (!_btService.canStartScan) {
+      return (allowed: false, blockReason: 'BLE GATT session or scan blocked');
+    }
+    if (FlutterBluePlus.isScanningNow) {
+      return (allowed: false, blockReason: 'BLE scan running');
+    }
+    if (!requirePendingAndCooldown) return (allowed: true, blockReason: null);
+
+    // [MESH-HEALTH] Recovery mode: do not spam reconnect
+    if (score < 20) {
+      _log("[MESH-HEALTH] Recovery mode");
+      return (allowed: false, blockReason: 'recovery mode (score < 20)');
+    }
+
+    final pendingCount = await _db.getOutboxCount();
+    if (pendingCount == 0) {
+      return (allowed: false, blockReason: 'zero pending messages for large transport');
+    }
+
+    // [MESH-HEALTH] Score ≥ 70: prefer BLE, Wi-Fi only for large payload
+    if (score >= 70) {
+      if (pendingCount < 2) {
+        _log("[MESH-HEALTH] BLE stable");
+        return (allowed: false, blockReason: 'large payload required when BLE stable');
+      }
+    } else if (score < 40) {
+      _log("[MESH-HEALTH] BLE unstable");
+      _log("[MESH-HEALTH] Wi-Fi escalation allowed");
+    }
+
+    if (_lastWifiDirectAttemptTime != null) {
+      final elapsed = DateTime.now().difference(_lastWifiDirectAttemptTime!).inSeconds;
+      if (elapsed < _wifiDirectCooldownSec) {
+        return (allowed: false, blockReason: 'Wi-Fi cooldown (${_wifiDirectCooldownSec}s)');
+      }
+    }
+    return (allowed: true, blockReason: null);
+  }
+
   Future<bool> startDiscovery(SignalType type) async {
     if (!_isMeshEnabled) return false;
 
@@ -1685,6 +2032,17 @@ class MeshService with ChangeNotifier {
         _log("⚠️ Wi-Fi Direct is disabled, skipping discovery");
         return false;
       }
+
+      // [WIFI-GUARD] Block Wi-Fi Direct if BLE is active or transport conditions not met
+      final guard = await _evaluateWifiDirectGuard();
+      if (!guard.allowed) {
+        _log("[WIFI-GUARD] Conditions evaluated");
+        _log("[WIFI-GUARD] Blocked reason: ${guard.blockReason}");
+        return false;
+      }
+      _log("[WIFI-GUARD] Conditions evaluated");
+      _log("[WIFI-GUARD] Approved → Starting Wi-Fi Direct");
+      _lastWifiDirectAttemptTime = DateTime.now();
 
       // 🔥 КРИТИЧНО: Проверяем, не активен ли уже discovery
       final isDiscoveryActive = await NativeMeshService.checkDiscoveryState();
@@ -2594,8 +2952,12 @@ class MeshService with ChangeNotifier {
       }
       try {
         // 🔥 FIX: Все устройства сканируют БЕЗ фильтра, чтобы видеть друг друга по тактическому имени
+        // 🔍 OUTBOX-BOOST: в течение 8s после 0→1 в outbox — lowLatency для быстрого discovery
         await FlutterBluePlus.startScan(
           timeout: scanDuration,
+          androidScanMode: _btService.isOutboxBoostActive
+              ? AndroidScanMode.lowLatency
+              : AndroidScanMode.balanced,
         );
         _log(
             "✅ [BT-SCAN] BLE scan started successfully (no filter - can see both BRIDGE and GHOST by tactical name)");
@@ -3047,16 +3409,8 @@ class MeshService with ChangeNotifier {
         return;
       }
 
-      // 🔥 ЛОГИРОВАНИЕ: Детальная информация о передаче через Wi-Fi Direct
-      _log("📤 [GHOST→BRIDGE] Stage 1: Wi-Fi Direct transmission");
-      _log("   📋 Messages in outbox: ${activePending.length}");
-      _log("   📋 Target: Wi-Fi Direct peer (BRIDGE)");
-      _log("   📋 Transport: TCP over Wi-Fi Direct");
-
-      // 🔥 FIX: Отправляем ВСЕ сообщения из outbox, а не только первое
-      // 🔥 FIX: Удаляем из outbox и выходим из каскада ТОЛЬКО если sendTcpBurst реально отправил (return true).
-      // Иначе GO "would send to self" не должен считаться успехом — сообщение остаётся в outbox, переходим в Stage 2.
-      _log("   📤 Sending ${activePending.length} message(s) via TCP...");
+      // [WIFI-PULL] Stage 1 Wi-Fi: no push. Outbox over Wi-Fi only via OUTBOX_REQUEST response (pull-only, same as BLE).
+      _log("📤 [GHOST→BRIDGE] Stage 1: Wi-Fi Direct — pull-only (no cascade push); ${activePending.length} in outbox");
       int sentCount = 0;
       for (var msgData in activePending) {
         final currentMsgId = msgData['id'] as String;
@@ -3064,26 +3418,9 @@ class MeshService with ChangeNotifier {
           _log("   ⏭️ Skipping already sent message: $currentMsgId");
           continue;
         }
-
-        final int ts = (msgData['createdAt'] as int?) ??
-            DateTime.now().millisecondsSinceEpoch;
-        final String payload = jsonEncode({
-          'type': 'OFFLINE_MSG',
-          'content': msgData['content'],
-          'senderId': _apiService.currentUserId,
-          'h': currentMsgId,
-          'ts': ts,
-          'ttl': 5,
-        });
-
         try {
-          if (kMeshDiagnostics) {
-            _log(meshDiagLog('cascade_tcp_attempt', {
-              'targetIp': _lastKnownPeerIp,
-              'msgId': '$currentMsgId',
-            }));
-          }
-          final bool actuallySent = await sendTcpBurst(payload);
+          // Wi-Fi does not push outbox here; skip TCP burst. Cascade continues to Stage 2 (BLE) if needed.
+          final bool actuallySent = false;
           if (actuallySent) {
             _sentPayloads[currentMsgId] = 'WIFI_DIRECT';
             await _db.removeFromOutbox(currentMsgId);
@@ -3100,7 +3437,7 @@ class MeshService with ChangeNotifier {
               await Future.delayed(const Duration(milliseconds: 50));
             }
           } else {
-            _log("   ⏭️ TCP burst skipped or failed for $currentMsgId (e.g. GO/no peer) — not removing from outbox");
+            _log("   ⏭️ Wi-Fi pull-only: not pushing $currentMsgId (outbox via OUTBOX_REQUEST only)");
           }
         } catch (e) {
           try {
@@ -4523,10 +4860,10 @@ class MeshService with ChangeNotifier {
           _log("📤 [GHOST→BRIDGE] Stage 2: BLE GATT transmission");
           _log("   📋 Message ID: $messageId");
           _log(
-              "   📋 Target MAC: ${targetMac.substring(targetMac.length - 8)}");
+              "   📋 Target MAC: ${targetMac.length >= 8 ? targetMac.substring(targetMac.length - 8) : targetMac}");
           _log("   📋 Transport: BLE GATT");
           _log(
-              "   📋 Token: ${originalToken != null ? '${originalToken.substring(0, 8)}...' : 'none'}");
+              "   📋 Token: ${originalToken != null ? '${originalToken.length > 8 ? originalToken.substring(0, 8) : originalToken}...' : 'none'}");
           _log("   📋 Latency: ${gattLatency.inMilliseconds}ms");
           _log("   ✅ Message delivered successfully via BLE GATT");
           _bleGattAttempts.remove(targetMac); // Сбрасываем счётчик при успехе
@@ -4541,7 +4878,7 @@ class MeshService with ChangeNotifier {
             );
             repeater.updateConnectionActivity(targetMac);
             _log(
-                "🔄 [REPEATER] BLE GATT connection registered: ${targetMac.substring(targetMac.length - 8)}");
+                "🔄 [REPEATER] BLE GATT connection registered: ${targetMac.length >= 8 ? targetMac.substring(targetMac.length - 8) : targetMac}");
           } catch (e) {
             _log("⚠️ [REPEATER] Failed to register GATT connection: $e");
           }
@@ -4909,10 +5246,11 @@ class MeshService with ChangeNotifier {
             _log("   📋 Message ID: $messageId");
             _log("   📋 Target IP: ${candidate.ip}:${candidate.port}");
             _log(
-                "   📋 Target MAC: ${targetMac.substring(targetMac.length - 8)}");
+                "   📋 Target MAC: ${targetMac.length >= 8 ? targetMac.substring(targetMac.length - 8) : targetMac}");
             _log("   📋 Transport: TCP");
             if (candidate.bridgeToken != null) {
-              _log("   📋 Token: ${candidate.bridgeToken!.substring(0, 8)}...");
+              final t = candidate.bridgeToken!;
+              _log("   📋 Token: ${t.length > 8 ? t.substring(0, 8) : t}...");
             } else {
               _log("   📋 Token: none (TCP fallback without token)");
             }
@@ -5173,7 +5511,12 @@ class MeshService with ChangeNotifier {
     _isP2pConnected = true;
     _isHost = isHost;
     _isTransferring = false;
-    _transferGuardTimer?.cancel(); // Выключаем стража
+    _transferGuardTimer?.cancel();
+    if (_connectTargetAddress != null) {
+      _lastConnectedPeerAddress = _connectTargetAddress;
+      _connectTargetAddress = null;
+    }
+    reportMeshHealthWifiConnectSuccess();
 
     if (kMeshDiagnostics) {
       _log(meshDiagLog('p2p_state_transition', {
@@ -5235,50 +5578,23 @@ class MeshService with ChangeNotifier {
       }
     }
 
-    // 2. ВЫГРУЗКА: только для CLIENT (GO не имеет peer для отправки — клиенты подключаются к нему)
-    await Future.delayed(const Duration(seconds: 5));
-    _log("🚀 [OFFLOAD] Sending signals...");
-
-    // 2. ВЫГРУЗКА: только для CLIENT (GHOST). GO ждёт клиентов — не шлёт на свой IP
+    // [WIFI-PULL] No auto-push. Same as BLE: only pull on request. Client (initiator) sends OUTBOX_REQUEST once.
     if (isHost) {
-      _log(
-          "   📋 [GO] Skipping OFFLOAD — we wait for clients to connect to us");
+      _log("   📋 [GO] Waiting for OUTBOX_REQUEST from client (no auto-push)");
       notifyListeners();
       return;
     }
-    final pending = await _db.getPendingFromOutbox();
-    if (pending.isNotEmpty) {
-      String targetIp =
-          _lastKnownPeerIp.isNotEmpty ? _lastKnownPeerIp : hostAddress;
-      if (targetIp.isEmpty) {
-        _log("⚠️ [OFFLOAD] No host address available, skipping TCP send");
-        notifyListeners();
-        return;
-      }
-
-      _log("🚀 [OFFLOAD] Pushing signals to $targetIp (client→GO)");
-
-      for (var msgData in pending) {
-        final int tsOffload = (msgData['createdAt'] as int?) ??
-            DateTime.now().millisecondsSinceEpoch;
-        final packet = jsonEncode({
-          'type': 'OFFLINE_MSG',
-          'chatId': msgData['chatRoomId'],
-          'content': msgData['content'],
-          'senderId': _apiService.currentUserId,
-          'h': msgData['id'],
-          'ts': tsOffload,
-        });
-
-        // Пробуем отправить
-        await NativeMeshService.sendTcp(packet, host: targetIp);
-
-        // 🔥 REPEATER: Обновляем активность соединения
-        try {
-          locator<RepeaterService>().updateConnectionActivity(hostAddress);
-        } catch (_) {}
-      }
-      _log("✅ [SUCCESS] Mesh transmission complete.");
+    final targetIp = hostAddress;
+    if (targetIp.isEmpty) {
+      notifyListeners();
+      return;
+    }
+    try {
+      final outboxRequest = jsonEncode(<String, String>{'type': 'OUTBOX_REQUEST'});
+      await NativeMeshService.sendTcp(outboxRequest, host: targetIp);
+      _log("[WIFI-PULL] OUTBOX_REQUEST sent");
+    } catch (e) {
+      _log("   ⚠️ [WIFI-PULL] OUTBOX_REQUEST send failed: $e");
     }
     notifyListeners();
   }
@@ -5575,7 +5891,97 @@ class MeshService with ChangeNotifier {
 
   String get lastKnownPeerIp => _lastKnownPeerIp;
 
-  // 🔥 ИСПРАВЛЕННЫЙ МЕТОД ОБРАБОТКИ ПАКЕТОВ
+  /// [WIFI-PULL] Same semantic as BLE: respond to OUTBOX_REQUEST with outbox contents (encryption/framing unchanged).
+  Future<void> _handleWifiOutboxRequest(String requesterIp) async {
+    try {
+      final pending = await _db.getPendingFromOutbox();
+      if (pending.isEmpty) {
+        _log("[WIFI-PULL] No pending messages");
+        return;
+      }
+      _log("[WIFI-PULL] Outbox size: ${pending.length}");
+      _log("[WIFI-PULL] Sending ${pending.length} messages");
+      for (final row in pending) {
+        final id = row['id'] as String? ?? '';
+        final content = row['content'] as String? ?? '';
+        final chatRoomId = row['chatRoomId'] as String? ?? 'THE_BEACON_GLOBAL';
+        final senderId = row['senderId'] as String? ?? 'GHOST_NODE';
+        final createdAt = row['createdAt'] as int? ?? DateTime.now().millisecondsSinceEpoch;
+        final isEncrypted = row['isEncrypted'] == 1;
+        final msg = <String, dynamic>{
+          'type': 'OFFLINE_MSG',
+          'h': id,
+          'content': content,
+          'chatId': chatRoomId,
+          'senderId': senderId,
+          'timestamp': createdAt,
+          'ts': createdAt,
+          'ttl': 5,
+        };
+        if (isEncrypted) msg['isEncrypted'] = true;
+        final messageJson = jsonEncode(msg);
+        final fragments = _fragmentMessageForWifi(messageJson);
+        for (final frag in fragments) {
+          await NativeMeshService.sendTcp(jsonEncode(frag), host: requesterIp);
+          await Future.delayed(const Duration(milliseconds: 50));
+        }
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
+      _log("[WIFI-PULL] Transfer complete");
+      reportMeshHealthWifiOutboxTransferSuccess();
+      unawaited(_crdtOrCreate.startDigestExchange(requesterIp));
+    } catch (e) {
+      _log("   ❌ [WIFI-PULL] Error: $e");
+    }
+  }
+
+  /// Same fragmentation as BLE (chunk 60, MSG_FRAG). Protocol unchanged.
+  List<Map<String, dynamic>> _fragmentMessageForWifi(String message) {
+    try {
+      final Map<String, dynamic> base = jsonDecode(message);
+      final String msgId = (base['h']?.toString().isNotEmpty == true)
+          ? base['h'].toString()
+          : DateTime.now().millisecondsSinceEpoch.toString();
+      final String chatId = base['chatId']?.toString() ?? 'THE_BEACON_GLOBAL';
+      final String senderId = base['senderId']?.toString() ?? 'UNKNOWN';
+      final String content = base['content']?.toString() ?? message;
+      const int chunkSize = 60;
+      final int total = (content.length / chunkSize).ceil().clamp(1, 9999);
+      if (total == 1) {
+        final single = <String, dynamic>{
+          'type': base['type'] ?? 'OFFLINE_MSG',
+          'chatId': chatId,
+          'senderId': senderId,
+          'h': msgId,
+          'content': content,
+          'ttl': base['ttl'] ?? 5,
+        };
+        if (base['isEncrypted'] == true) single['isEncrypted'] = true;
+        return [single];
+      }
+      final List<Map<String, dynamic>> frags = [];
+      for (int i = 0; i < total; i++) {
+        final start = i * chunkSize;
+        final end = (start + chunkSize < content.length) ? start + chunkSize : content.length;
+        frags.add({
+          'type': 'MSG_FRAG',
+          'mid': msgId,
+          'idx': i,
+          'tot': total,
+          'data': content.substring(start, end),
+          'chatId': chatId,
+          'senderId': senderId,
+          'ttl': base['ttl'] ?? 5,
+          'timestamp': DateTime.now().millisecondsSinceEpoch,
+        });
+      }
+      return frags;
+    } catch (_) {
+      return [
+        {'type': 'OFFLINE_MSG', 'content': message, 'h': DateTime.now().millisecondsSinceEpoch.toString(), 'ttl': 5}
+      ];
+    }
+  }
 
   /// Логика: Распаковка -> Дедупликация -> Peer Lock -> Маршрутизация.
   Future<void> processIncomingPacket(dynamic rawData) async {
@@ -5645,6 +6051,41 @@ class MeshService with ChangeNotifier {
       _log("   📋 Data keys: ${data.keys.toList()}");
       _log("   📋 Raw chatId from data: '${data['chatId']}'");
 
+      final String packetType = data['type'] ?? 'UNKNOWN';
+
+      // --- 2.5 [WIFI-PULL] OUTBOX_REQUEST: same semantic as BLE — respond with outbox, no auto-push ---
+      if (packetType == 'OUTBOX_REQUEST') {
+        if (senderIp != null && senderIp.isNotEmpty) {
+          unawaited(_handleWifiOutboxRequest(senderIp));
+        }
+        return;
+      }
+
+      // --- 2.6 [CRDT] Causal sync (HEAD_EXCHANGE, REQUEST_RANGE, LOG_ENTRIES) ---
+      if (senderIp != null && senderIp.isNotEmpty) {
+        if (packetType == 'HEAD_EXCHANGE') {
+          _log('[BEACON-SYNC] CRDT packet received: HEAD_EXCHANGE from peer — comparing chat heads');
+          unawaited(_crdtOrCreate.onHeadExchangeReceived(data, senderIp));
+          return;
+        }
+        if (packetType == 'REQUEST_RANGE') {
+          _log('[BEACON-SYNC] CRDT packet received: REQUEST_RANGE from peer — sending missing messages');
+          unawaited(_crdtOrCreate.onRequestRangeReceived(data, senderIp));
+          return;
+        }
+        if (packetType == 'LOG_ENTRIES') {
+          _log('[BEACON-SYNC] CRDT packet received: LOG_ENTRIES from peer — merging into THE BEACON chat');
+          unawaited(_crdtOrCreate.onLogEntriesReceived(data, senderIp).then((_) {
+            final chatId = data['chatId']?.toString();
+            if (chatId != null && chatId.isNotEmpty) {
+              _eventBus.bus.fire(ChatSyncCompletedEvent(chatId));
+              _log('[BEACON-SYNC] ChatSyncCompletedEvent fired for $chatId — UI can refresh');
+            }
+          }));
+          return;
+        }
+      }
+
       // --- 3. GOSSIP ДЕДУПЛИКАЦИЯ (Anti-Entropy Layer) ---
       // Генерируем или извлекаем уникальный хеш пакета.
       // 🔥 MSG_FRAG: каждый фрагмент должен иметь свой hash (mid+idx), иначе 2-й и 3-й отбрасываются как дубликат и сообщение не собирается.
@@ -5664,7 +6105,6 @@ class MeshService with ChangeNotifier {
       }
 
       // Извлекаем тактические метаданные (ДО использования в Peer Lock)
-      final String packetType = data['type'] ?? 'UNKNOWN';
       final String senderId = data['senderId'] ?? 'Unknown';
       // Нормализуем ID чата для стабильной фильтрации на разных устройствах
       final String incomingChatId =
@@ -6357,7 +6797,7 @@ class MeshService with ChangeNotifier {
         senderId: packet['senderId'] ?? 'GHOST',
         createdAt: DateTime.now(),
         status: 'MESH_RELAY');
-    await db.saveMessage(msg, packet['chatId'] ?? 'GLOBAL',
+    await db.saveMessage(msg, packet['chatId'] ?? 'THE_BEACON_GLOBAL',
         contentAlreadyEncrypted: true);
 
     // 3. Рассылаем всем Wi-Fi нодам в радиусе
@@ -6431,9 +6871,9 @@ class MeshService with ChangeNotifier {
       final String targetChatId = data['chatId'] ?? "THE_BEACON_GLOBAL";
       final bool alreadyEncrypted = data['isEncrypted'] == true;
 
-      // 3. Сохраняем в SQLite (не шифруем повторно, если пришло уже зашифрованным)
+      // 3. Сохраняем в SQLite (idempotent merge: no overwrite, no duplicate — CRDT)
       await db.saveMessage(msg, targetChatId,
-          contentAlreadyEncrypted: alreadyEncrypted);
+          contentAlreadyEncrypted: alreadyEncrypted, idempotentMerge: true);
 
       _log("💾 [Storage] Offline packet cached for chat: $targetChatId");
     } catch (e) {
@@ -6629,6 +7069,13 @@ class MeshService with ChangeNotifier {
     final tcpAttemptStart = DateTime.now();
     _log("📤 [TCP-BURST] Starting TCP burst transmission");
     _log("   📋 Message length: ${message.length} bytes");
+
+    // [WIFI-GUARD] Do not use Wi-Fi transport (TCP burst) when BLE is active; no pending/cooldown check
+    final guard = await _evaluateWifiDirectGuard(requirePendingAndCooldown: false);
+    if (!guard.allowed) {
+      _log("[WIFI-GUARD] Blocked reason: ${guard.blockReason}");
+      return false;
+    }
 
     if (!_isP2pConnected) {
       if (kMeshDiagnostics) {
@@ -7404,7 +7851,24 @@ class MeshService with ChangeNotifier {
     }
     _isP2pConnected = false;
     _isRouteReady = false;
-    _isTransferring = false; // СБРОС: линк упал, флаг больше не нужен
+    _isTransferring = false;
+    _lastConnectedPeerAddress = null;
+    if (_lastKnownPeerIp.isNotEmpty) resetCrdtSessionForPeer(_lastKnownPeerIp);
+
+    // [WIFI] Retry connect to pending peer after state callback (no reset, no removeGroup)
+    final pendingAddr = _pendingConnectAfterDisconnect;
+    final pendingNN = _pendingConnectNetworkName;
+    final pendingPP = _pendingConnectPassphrase;
+    _pendingConnectAfterDisconnect = null;
+    _pendingConnectNetworkName = null;
+    _pendingConnectPassphrase = null;
+    if (pendingAddr != null) {
+      _log("[WIFI] State settled after disconnect, retrying connect to pending peer");
+      Future.delayed(const Duration(seconds: 2), () {
+        connectToNode(pendingAddr, networkName: pendingNN, passphrase: pendingPP);
+      });
+    }
+
     _log("🔌 Link severed.");
 
     // 🔥 REPEATER: Уведомляем о разрыве соединения
@@ -7427,6 +7891,18 @@ class MeshService with ChangeNotifier {
 
   /// Обработка ошибок подключения Wi-Fi Direct
   void onNetworkConnectionFailed(String error, String message, int? code) {
+    _isTransferring = false;
+    _transferGuardTimer?.cancel();
+    _connectTargetAddress = null;
+
+    if (code == 0) {
+      reportMeshHealthWifiConnectFailed();
+      reportMeshHealthWifiCooldownTriggered();
+      _wifiConnectFailedCooldownUntil =
+          DateTime.now().add(Duration(seconds: _wifiConnectFailedCooldownSec));
+      _log("[WIFI] Connect failed, entering cooldown");
+    }
+
     _log("❌ [CONNECTION_FAILED] Wi-Fi Direct connection failed:");
     _log("   📋 Error: $error");
     _log("   📋 Message: $message");
@@ -8419,7 +8895,7 @@ class MeshService with ChangeNotifier {
   Future<void> _uploadToBridgeServer(String ip, int port, String token) async {
     _log("📤 [GHOST→BRIDGE] _uploadToBridgeServer: Starting upload process");
     _log("   📋 Target: $ip:$port");
-    _log("   📋 Token: ${token.substring(0, 8)}...");
+    _log("   📋 Token: ${token.length > 8 ? token.substring(0, 8) : token}...");
 
     final pending = await _db.getPendingFromOutbox();
     if (pending.isEmpty) {

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:animate_do/animate_do.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import 'package:memento_mori_app/core/api_service.dart';
 import 'package:memento_mori_app/core/decoy/app_mode.dart';
@@ -46,10 +47,14 @@ class _MainScreenState extends State<MainScreen> {
   late final List<Widget> _widgetOptions;
   late TacticalShakeDetector _shakeDetector;
   StreamSubscription? _linkSubscription;
+  String _appVersion = '—';
 
   @override
   void initState() {
     super.initState();
+    PackageInfo.fromPlatform().then((info) {
+      if (mounted) setState(() => _appVersion = 'v${info.version}+${info.buildNumber}');
+    });
 
     // Ensure SESSION (MeshService, etc.) is registered — do not reset when only MeshService was missing.
     if (!locator.isRegistered<MeshService>()) {
@@ -297,13 +302,30 @@ class _MainScreenState extends State<MainScreen> {
       return Container(
         color: AppColors.surface,
         padding: const EdgeInsets.only(top: 10),
-        child: Center(
-          child: Text('MODE: STEALTH',
-              style: TextStyle(
-                  color: AppColors.stealthOrange.withOpacity(0.8),
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 1)),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const SizedBox(width: 24),
+            Expanded(
+              child: Center(
+                child: Text('MODE: STEALTH',
+                    style: TextStyle(
+                        color: AppColors.stealthOrange.withOpacity(0.8),
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1)),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(right: 12),
+              child: Text(_appVersion,
+                  style: TextStyle(
+                      fontFamily: 'RobotoMono',
+                      color: AppColors.stealthOrange.withOpacity(0.6),
+                      fontSize: 9,
+                      letterSpacing: 0.5)),
+            ),
+          ],
         ),
       );
     }
@@ -333,21 +355,38 @@ class _MainScreenState extends State<MainScreen> {
                   bottom: BorderSide(
                       color: themeColor.withOpacity(0.3), width: 0.5)),
             ),
-            child: Center(
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  _PulseIcon(color: themeColor),
-                  const SizedBox(width: 8),
-                  Text(label,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const SizedBox(width: 24),
+                Expanded(
+                  child: Center(
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _PulseIcon(color: themeColor),
+                        const SizedBox(width: 8),
+                        Text(label,
+                            style: TextStyle(
+                                fontFamily: 'RobotoMono',
+                                color: themeColor,
+                                fontSize: 10,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 1)),
+                      ],
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(right: 12),
+                  child: Text(_appVersion,
                       style: TextStyle(
                           fontFamily: 'RobotoMono',
-                          color: themeColor,
-                          fontSize: 10,
-                          fontWeight: FontWeight.bold,
-                          letterSpacing: 1)),
-                ],
-              ),
+                          color: themeColor.withOpacity(0.7),
+                          fontSize: 9,
+                          letterSpacing: 0.5)),
+                ),
+              ],
             ),
           ),
         );

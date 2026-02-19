@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:get_it/get_it.dart';
 import 'package:path/path.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -14,6 +15,7 @@ import 'locator.dart';
 import 'models/ad_packet.dart';
 import 'room_events.dart' show RoomEvent, EventOrigin;
 import 'encryption_service.dart';
+import 'event_bus_service.dart';
 import 'storage_service.dart';
 
 /// SECURITY INVARIANT: REAL and DECOY use separate directories and DB files (no shared WAL/journals).
@@ -116,7 +118,7 @@ class LocalDatabaseService {
 
     return await openDatabase(
       path,
-      version: 16, // v16: outbox sentFragmentIndex для BLE resume по фрагментам
+      version: 17, // v17: CRDT log — sequence_number, previous_hash, fork_of_id (additive)
       onConfigure: (db) async {
         try {
           // WAL через rawQuery
@@ -411,10 +413,48 @@ class LocalDatabaseService {
             print("⚠️ [DB] Migration v16 error: $e");
           }
         }
+        if (oldVersion < 17) {
+          try {
+            var messagesInfo = await db.rawQuery('PRAGMA table_info(messages)');
+            var cols = messagesInfo.map((c) => c['name'] as String).toList();
+            if (!cols.contains('sequence_number')) {
+              await db.execute(
+                  'ALTER TABLE messages ADD COLUMN sequence_number INTEGER');
+            }
+            if (!cols.contains('previous_hash')) {
+              await db.execute(
+                  'ALTER TABLE messages ADD COLUMN previous_hash TEXT');
+            }
+            if (!cols.contains('fork_of_id')) {
+              await db.execute(
+                  'ALTER TABLE messages ADD COLUMN fork_of_id TEXT');
+            }
+            print(
+                "✅ [DB] Migration v17 completed: CRDT log columns (sequence_number, previous_hash, fork_of_id)");
+          } catch (e) {
+            print("⚠️ [DB] Migration v17 error: $e");
+          }
+        }
       },
       onOpen: (db) async {
         print("🚀 [DB] Global Handshake: Validating Grid Integrity...");
         try {
+          // Defensive: ensure CRDT columns exist (e.g. DB created at v17 via onCreate without them)
+          final messagesInfo = await db.rawQuery('PRAGMA table_info(messages)');
+          final cols = messagesInfo.map((c) => c['name'] as String).toList();
+          if (!cols.contains('sequence_number')) {
+            await db.execute('ALTER TABLE messages ADD COLUMN sequence_number INTEGER');
+            print("✅ [DB] onOpen: added missing sequence_number to messages");
+          }
+          if (!cols.contains('previous_hash')) {
+            await db.execute('ALTER TABLE messages ADD COLUMN previous_hash TEXT');
+            print("✅ [DB] onOpen: added missing previous_hash to messages");
+          }
+          if (!cols.contains('fork_of_id')) {
+            await db.execute('ALTER TABLE messages ADD COLUMN fork_of_id TEXT');
+            print("✅ [DB] onOpen: added missing fork_of_id to messages");
+          }
+
           // Вызов внутреннего обслуживания без рекурсии геттера
           await _performInternalMaintenance(db);
 
@@ -502,7 +542,10 @@ class LocalDatabaseService {
           receivedAt INTEGER,
           vectorClock TEXT,
           status TEXT,
-          isEncrypted INTEGER DEFAULT 0
+          isEncrypted INTEGER DEFAULT 0,
+          sequence_number INTEGER,
+          previous_hash TEXT,
+          fork_of_id TEXT
         )
       ''');
 
@@ -747,8 +790,9 @@ class LocalDatabaseService {
 
   /// [contentAlreadyEncrypted] — true when saving mesh/received message that
   /// is already encrypted (do not double-encrypt). Default false = encrypt before store.
+  /// [idempotentMerge] — when true use INSERT OR IGNORE (CRDT merge: no overwrite, no duplicate).
   Future<void> saveMessage(ChatMessage msg, String chatId,
-      {bool contentAlreadyEncrypted = false}) async {
+      {bool contentAlreadyEncrypted = false, bool idempotentMerge = false}) async {
     // 🔒 SECURITY: Use same key source as getMessages — never EncryptionService(null), or decrypt on load fails.
     if (!locator.isRegistered<EncryptionService>() &&
         !locator.isRegistered<VaultInterface>()) {
@@ -776,24 +820,251 @@ class LocalDatabaseService {
     final vectorClockJson =
         msg.vectorClock != null ? jsonEncode(msg.vectorClock) : null;
 
+    int? seqNum = msg.sequenceNumber;
+    String? prevHash = msg.previousHash;
+    Map<String, int>? vc = msg.vectorClock;
+    if (!idempotentMerge && (seqNum == null || prevHash == null || vc == null)) {
+      final next = await getNextSequenceAndVectorClock(chatId, msg.senderId);
+      seqNum ??= next.sequenceNumber;
+      prevHash ??= next.previousHash;
+      vc ??= next.vectorClock;
+    }
+    final row = <String, dynamic>{
+      'id': msg.id,
+      'ownerId': currentUserId,
+      'clientTempId': msg.clientTempId,
+      'content': encryptedContent,
+      'chatRoomId': chatId,
+      'senderId': msg.senderId,
+      'senderUsername': msg.senderUsername,
+      'createdAt': msg.createdAt.millisecondsSinceEpoch,
+      'receivedAt': msg.receivedAt?.millisecondsSinceEpoch,
+      'vectorClock': vc != null ? jsonEncode(vc) : vectorClockJson,
+      'status': msg.status,
+      'isEncrypted': 1,
+    };
+    if (seqNum != null) row['sequence_number'] = seqNum;
+    if (prevHash != null) row['previous_hash'] = prevHash;
+    if (msg.forkOfId != null) row['fork_of_id'] = msg.forkOfId;
+
     await db.insert(
       'messages',
-      {
-        'id': msg.id,
-        'ownerId': currentUserId,
-        'clientTempId': msg.clientTempId,
-        'content': encryptedContent, // 🔒 Encrypted content
-        'chatRoomId': chatId,
-        'senderId': msg.senderId,
-        'senderUsername': msg.senderUsername,
-        'createdAt': msg.createdAt.millisecondsSinceEpoch,
-        'receivedAt': msg.receivedAt?.millisecondsSinceEpoch,
-        'vectorClock': vectorClockJson,
-        'status': msg.status,
-        'isEncrypted': 1
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
+      row,
+      conflictAlgorithm:
+          idempotentMerge ? ConflictAlgorithm.ignore : ConflictAlgorithm.replace,
     );
+  }
+
+  /// CRDT: Next sequence number, previous_hash, and HEADS snapshot for (chatId, authorId).
+  Future<({int sequenceNumber, String previousHash, Map<String, int> vectorClock})>
+      getNextSequenceAndVectorClock(String chatId, String authorId) async {
+    final db = await database;
+    final currentUserId = await _getCurrentUserId();
+    if (currentUserId.isEmpty) {
+      return (sequenceNumber: 1, previousHash: '', vectorClock: {authorId: 1});
+    }
+    final maxRow = await db.rawQuery(
+      'SELECT MAX(COALESCE(sequence_number, 0)) AS mx FROM messages '
+      'WHERE ownerId = ? AND chatRoomId = ? AND senderId = ?',
+      [currentUserId, chatId, authorId],
+    );
+    final maxSeq = (maxRow.isNotEmpty && maxRow.first['mx'] != null)
+        ? (maxRow.first['mx'] is int
+            ? maxRow.first['mx'] as int
+            : int.tryParse(maxRow.first['mx'].toString()) ?? 0)
+        : 0;
+    final nextSeq = maxSeq + 1;
+    String previousHash = '';
+    if (maxSeq > 0) {
+      final prevRow = await db.rawQuery(
+        'SELECT id, content, previous_hash FROM messages '
+        'WHERE ownerId = ? AND chatRoomId = ? AND senderId = ? AND COALESCE(sequence_number, 0) = ?',
+        [currentUserId, chatId, authorId, maxSeq],
+      );
+      if (prevRow.isNotEmpty) {
+        final p = prevRow.first;
+        previousHash = _hashLogEntry(
+          p['id'], p['content'], p['previous_hash'], maxSeq,
+        );
+      }
+    }
+    final heads = await getHeads();
+    final chatHeads = heads[chatId] ?? {};
+    final vectorClock = Map<String, int>.from(chatHeads);
+    vectorClock[authorId] = nextSeq;
+    return (sequenceNumber: nextSeq, previousHash: previousHash, vectorClock: vectorClock);
+  }
+
+  static String _hashLogEntry(Object? id, Object? content, Object? prevHash, int seq) {
+    final bytes = utf8.encode('${id ?? ""}|${content ?? ""}|${prevHash ?? ""}|$seq');
+    final digest = sha256.convert(bytes);
+    return digest.toString();
+  }
+
+  /// CRDT HEADS: per chat, author_id → highest_valid_sequence (main chain only; excludes fork branches).
+  Future<Map<String, Map<String, int>>> getHeads() async {
+    final db = await database;
+    final currentUserId = await _getCurrentUserId();
+    if (currentUserId.isEmpty) return {};
+    final rows = await db.rawQuery(
+      'SELECT chatRoomId, senderId, MAX(COALESCE(sequence_number, 0)) AS maxSeq '
+      'FROM messages WHERE ownerId = ? AND (fork_of_id IS NULL OR fork_of_id = \'\') '
+      'GROUP BY chatRoomId, senderId',
+      [currentUserId],
+    );
+    final Map<String, Map<String, int>> out = {};
+    for (final r in rows) {
+      final chatId = (r['chatRoomId'] as String?) ?? '';
+      final authorId = (r['senderId'] as String?) ?? '';
+      final maxSeq = r['maxSeq'] is int ? r['maxSeq'] as int : int.tryParse(r['maxSeq'].toString()) ?? 0;
+      if (chatId.isEmpty || authorId.isEmpty) continue;
+      out.putIfAbsent(chatId, () => {})[authorId] = maxSeq;
+    }
+    return out;
+  }
+
+  /// CRDT: Log entries for (chatId, authorId) in range [fromSeq, toSeq] in sequence order.
+  Future<List<Map<String, dynamic>>> getLogEntriesByAuthorRange(
+      String chatId, String authorId, int fromSeq, int toSeq) async {
+    if (fromSeq > toSeq) return [];
+    final db = await database;
+    final currentUserId = await _getCurrentUserId();
+    if (currentUserId.isEmpty) return [];
+    final rows = await db.rawQuery(
+      'SELECT id, content, chatRoomId, senderId, senderUsername, createdAt, isEncrypted, '
+      'sequence_number, previous_hash, vectorClock FROM messages '
+      'WHERE ownerId = ? AND chatRoomId = ? AND senderId = ? '
+      'AND COALESCE(sequence_number, 0) BETWEEN ? AND ? AND (fork_of_id IS NULL OR fork_of_id = \'\') '
+      'ORDER BY sequence_number ASC',
+      [currentUserId, chatId, authorId, fromSeq, toSeq],
+    );
+    return rows;
+  }
+
+  /// Returns hash of our local entry at (chatId, authorId, seq) for chain validation.
+  Future<String?> getLocalEntryHashAt(String chatId, String authorId, int seq) async {
+    final db = await database;
+    final currentUserId = await _getCurrentUserId();
+    if (currentUserId.isEmpty) return null;
+    final rows = await db.rawQuery(
+      'SELECT id, content, previous_hash, sequence_number FROM messages '
+      'WHERE ownerId = ? AND chatRoomId = ? AND senderId = ? AND COALESCE(sequence_number, 0) = ? '
+      'AND (fork_of_id IS NULL OR fork_of_id = \'\') LIMIT 1',
+      [currentUserId, chatId, authorId, seq],
+    );
+    if (rows.isEmpty) return null;
+    final r = rows.first;
+    return _hashLogEntry(r['id'], r['content'], r['previous_hash'], seq);
+  }
+
+  /// CRDT sync: insert log entry with chain validation and fork detection.
+  /// Returns ({ inserted: true if stored, wasFork: true if stored as divergent branch }).
+  Future<({bool inserted, bool wasFork})> saveLogEntryFromSync({
+    required String chatId,
+    required String authorId,
+    required int sequenceNumber,
+    required String previousHash,
+    required Map<String, int> vectorClock,
+    required int timestamp,
+    required String encryptedPayload,
+    required String id,
+    String? senderUsername,
+  }) async {
+    final db = await database;
+    final currentUserId = await _getCurrentUserId();
+    if (currentUserId.isEmpty) return (inserted: false, wasFork: false);
+
+    final existing = await db.rawQuery(
+      'SELECT id, previous_hash, content FROM messages '
+      'WHERE ownerId = ? AND chatRoomId = ? AND senderId = ? AND COALESCE(sequence_number, 0) = ? '
+      'AND (fork_of_id IS NULL OR fork_of_id = \'\') LIMIT 1',
+      [currentUserId, chatId, authorId, sequenceNumber],
+    );
+    if (existing.isNotEmpty) {
+      final ex = existing.first;
+      final exHash = _hashLogEntry(ex['id'], ex['content'], ex['previous_hash'], sequenceNumber);
+      final incomingHash = _hashLogEntry(id, encryptedPayload, previousHash, sequenceNumber);
+      if (ex['previous_hash'] == previousHash && exHash == incomingHash) {
+        return (inserted: true, wasFork: false); // idempotent
+      }
+      // Fork: same (author_id, seq) different hash — store as divergent branch
+      final forkId = '${ex['id']}_fork_${incomingHash.substring(0, 8)}';
+      final msg = ChatMessage(
+        id: forkId,
+        content: encryptedPayload,
+        senderId: authorId,
+        senderUsername: senderUsername ?? 'Unknown',
+        createdAt: DateTime.fromMillisecondsSinceEpoch(timestamp),
+        status: 'MESH_LINK',
+        sequenceNumber: sequenceNumber,
+        previousHash: previousHash,
+        vectorClock: vectorClock,
+        forkOfId: ex['id'] as String?,
+      );
+      await saveMessage(msg, chatId, contentAlreadyEncrypted: true, idempotentMerge: true);
+      return (inserted: true, wasFork: true);
+    }
+
+    if (sequenceNumber > 1) {
+      final localPrevHash = await getLocalEntryHashAt(chatId, authorId, sequenceNumber - 1);
+      if (localPrevHash != previousHash) {
+        return (inserted: false, wasFork: false); // chain broken, reject
+      }
+    }
+
+    final msg = ChatMessage(
+      id: id,
+      content: encryptedPayload,
+      senderId: authorId,
+      senderUsername: senderUsername ?? 'Unknown',
+      createdAt: DateTime.fromMillisecondsSinceEpoch(timestamp),
+      status: 'MESH_LINK',
+      sequenceNumber: sequenceNumber,
+      previousHash: previousHash,
+      vectorClock: vectorClock,
+    );
+    await saveMessage(msg, chatId, contentAlreadyEncrypted: true, idempotentMerge: true);
+    return (inserted: true, wasFork: false);
+  }
+
+  /// CRDT reconciliation: per-chat list of message ids (for digest / divergence).
+  /// Returns map chatRoomId -> sorted list of message ids.
+  Future<Map<String, List<String>>> getMessageIdsByChat() async {
+    final db = await database;
+    final currentUserId = await _getCurrentUserId();
+    if (currentUserId.isEmpty) return {};
+    final List<Map<String, dynamic>> rows = await db.query(
+      'messages',
+      columns: ['id', 'chatRoomId', 'createdAt'],
+      where: 'ownerId = ?',
+      whereArgs: [currentUserId],
+      orderBy: 'chatRoomId ASC, createdAt ASC, id ASC',
+    );
+    final Map<String, List<String>> byChat = {};
+    for (final r in rows) {
+      final chatId = (r['chatRoomId'] as String?) ?? '';
+      final id = (r['id'] as String?) ?? '';
+      if (id.isEmpty) continue;
+      byChat.putIfAbsent(chatId, () => []).add(id);
+    }
+    return byChat;
+  }
+
+  /// CRDT reconciliation: full message rows by ids (for sending missing as OFFLINE_MSG).
+  /// Returns list of maps with id, content, chatRoomId, senderId, senderUsername, createdAt, isEncrypted.
+  Future<List<Map<String, dynamic>>> getMessagesByIds(
+      List<String> ids) async {
+    if (ids.isEmpty) return [];
+    final db = await database;
+    final currentUserId = await _getCurrentUserId();
+    if (currentUserId.isEmpty) return [];
+    final placeholders = List.filled(ids.length, '?').join(',');
+    final rows = await db.rawQuery(
+      'SELECT id, content, chatRoomId, senderId, senderUsername, createdAt, isEncrypted '
+      'FROM messages WHERE ownerId = ? AND id IN ($placeholders)',
+      [currentUserId, ...ids],
+    );
+    return rows;
   }
 
   /// Обновляет статус сообщения
@@ -812,13 +1083,18 @@ class LocalDatabaseService {
     final db = await database;
     final currentUserId = await _getCurrentUserId();
     if (currentUserId.isEmpty) return [];
-    final List<Map<String, dynamic>> maps = await db.query(
-      'messages',
-      where: 'chatRoomId = ? AND ownerId = ?',
-      whereArgs: [chatId, currentUserId],
-      orderBy:
-          'createdAt ASC, senderId ASC, id ASC', // 🔥 Сортировка по (created_at, author_id, message_id)
-      // НЕ используем receivedAt или vectorClock для сортировки
+    // THE_BEACON_GLOBAL: include legacy GLOBAL rows so one chat shows all (sync fix).
+    final String whereClause = (chatId == 'THE_BEACON_GLOBAL' || chatId == 'GLOBAL')
+        ? "(chatRoomId = 'THE_BEACON_GLOBAL' OR chatRoomId = 'GLOBAL') AND ownerId = ?"
+        : 'chatRoomId = ? AND ownerId = ?';
+    final List<dynamic> whereArgs = (chatId == 'THE_BEACON_GLOBAL' || chatId == 'GLOBAL')
+        ? [currentUserId]
+        : [chatId, currentUserId];
+    // CRDT display order: vector_clock causal order → timestamp → author_id → sequence_number (never arrival order).
+    final List<Map<String, dynamic>> maps = await db.rawQuery(
+      'SELECT * FROM messages WHERE $whereClause '
+      'ORDER BY createdAt ASC, senderId ASC, COALESCE(sequence_number, 0) ASC, id ASC',
+      whereArgs,
     );
     // 🔒 SECURITY: Use only Vault-bound crypto so cold start (camouflage → code → chat) decrypts with same salt.
     // Never create EncryptionService(null) — that uses a different salt and breaks decrypt after app kill.
@@ -876,13 +1152,15 @@ class LocalDatabaseService {
     final db = await database;
     final currentUserId = await _getCurrentUserId();
     if (currentUserId.isEmpty) return [];
-    final List<Map<String, dynamic>> maps = await db.query(
-      'messages',
-      where: 'chatRoomId = ? AND ownerId = ?',
-      whereArgs: [chatId, currentUserId],
-      orderBy: 'createdAt DESC',
-      limit: limit,
-      offset: offset,
+    final String whereClause = (chatId == 'THE_BEACON_GLOBAL' || chatId == 'GLOBAL')
+        ? "(chatRoomId = 'THE_BEACON_GLOBAL' OR chatRoomId = 'GLOBAL') AND ownerId = ?"
+        : 'chatRoomId = ? AND ownerId = ?';
+    final List<dynamic> whereArgs = (chatId == 'THE_BEACON_GLOBAL' || chatId == 'GLOBAL')
+        ? [currentUserId]
+        : [chatId, currentUserId];
+    final List<Map<String, dynamic>> maps = await db.rawQuery(
+      'SELECT * FROM messages WHERE $whereClause ORDER BY createdAt DESC LIMIT ? OFFSET ?',
+      [...whereArgs, limit, offset],
     );
 
     // 🔒 SECURITY: Use only Vault-bound crypto (same as getMessages) — never EncryptionService(null).
@@ -1195,31 +1473,55 @@ class LocalDatabaseService {
   Future<void> addToOutbox(ChatMessage msg, String chatId,
       {int? expiresAt, bool contentAlreadyEncrypted = false}) async {
     final db = await database;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final beforeRows = await db.query('outbox',
+        where: 'expiresAt IS NULL OR expiresAt > ?', whereArgs: [now]);
+    final countBefore = beforeRows.length;
+
     await _evictOutboxIfOverLimit(db, maxOutboxSize);
     String contentToStore = msg.content;
-    if (!contentAlreadyEncrypted) {
-      final encryptionService = locator.isRegistered<EncryptionService>()
-          ? locator<EncryptionService>()
-          : EncryptionService(locator.isRegistered<VaultInterface>() ? locator<VaultInterface>() : null);
-      final chatKey = await encryptionService.getChatKey(chatId);
-      contentToStore = await encryptionService.encrypt(msg.content, chatKey);
+    try {
+      if (!contentAlreadyEncrypted) {
+        final encryptionService = locator.isRegistered<EncryptionService>()
+            ? locator<EncryptionService>()
+            : EncryptionService(locator.isRegistered<VaultInterface>() ? locator<VaultInterface>() : null);
+        final chatKey = await encryptionService.getChatKey(chatId);
+        contentToStore = await encryptionService.encrypt(msg.content, chatKey);
+      }
+    } catch (e) {
+      print("[OUTBOX] addToOutbox FAILED (encrypt): $e");
+      rethrow;
     }
     final defaultExpiresAt = expiresAt ??
         DateTime.now().add(const Duration(hours: 1)).millisecondsSinceEpoch;
     final senderIdVal = msg.senderId;
-    await db.insert(
-        'outbox',
-        {
-          'id': msg.id,
-          'chatRoomId': chatId,
-          'content': contentToStore,
-          'isEncrypted': 1,
-          'createdAt': msg.createdAt.millisecondsSinceEpoch,
-          'expiresAt': defaultExpiresAt,
-          'routing_state': 'PENDING',
-          'senderId': senderIdVal,
-        },
-        conflictAlgorithm: ConflictAlgorithm.replace);
+    try {
+      await db.insert(
+          'outbox',
+          {
+            'id': msg.id,
+            'chatRoomId': chatId,
+            'content': contentToStore,
+            'isEncrypted': 1,
+            'createdAt': msg.createdAt.millisecondsSinceEpoch,
+            'expiresAt': defaultExpiresAt,
+            'routing_state': 'PENDING',
+            'senderId': senderIdVal,
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace);
+    } catch (e) {
+      print("[OUTBOX] addToOutbox FAILED (db.insert): $e");
+      rethrow;
+    }
+    print("[OUTBOX] addToOutbox OK: id=${msg.id} chatId=$chatId");
+
+    if (countBefore == 0) {
+      final afterRows = await db.query('outbox',
+          where: 'expiresAt IS NULL OR expiresAt > ?', whereArgs: [now]);
+      if (afterRows.isNotEmpty && locator.isRegistered<EventBusService>()) {
+        locator<EventBusService>().fire(OutboxFirstMessageEvent());
+      }
+    }
   }
 
   Future<List<Map<String, dynamic>>> getPendingFromOutbox() async {
@@ -1241,6 +1543,12 @@ class LocalDatabaseService {
   Future<void> removeFromOutbox(String id) async {
     final db = await database;
     await db.delete('outbox', where: 'id=?', whereArgs: [id]);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final afterRows = await db.query('outbox',
+        where: 'expiresAt IS NULL OR expiresAt > ?', whereArgs: [now]);
+    if (afterRows.isEmpty && locator.isRegistered<EventBusService>()) {
+      locator<EventBusService>().fire(OutboxEmptyEvent());
+    }
   }
 
   /// Обновляет прогресс отправки фрагментов по BLE (resume). Вызывать после каждой успешно отправленного фрагмента.

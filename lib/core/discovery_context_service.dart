@@ -241,6 +241,7 @@ class DiscoveryContextService {
         bridgeToken: updatedToken,
         wifiDirectPassphrase: newCandidate.wifiDirectPassphrase ?? existing.wifiDirectPassphrase,
         wifiDirectNetworkName: newCandidate.wifiDirectNetworkName ?? existing.wifiDirectNetworkName,
+        hasOutboxFlag: newCandidate.hasOutboxFlag,
         lastSeen: DateTime.now(),
         confidence: updatedConfidence,
         discoverySource: source,

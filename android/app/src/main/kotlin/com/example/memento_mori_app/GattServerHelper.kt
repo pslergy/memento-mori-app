@@ -92,6 +92,10 @@ class GattServerHelper(
     private val gattServerCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             super.onConnectionStateChange(device, status, newState)
+            if (!isServerRunning) {
+                Log.w(TAG, "[GATT-GUARD] Ignoring onConnectionStateChange after stop")
+                return
+            }
             if (MESH_DIAGNOSTICS) {
                 val stateStr = when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> "CONNECTED"
@@ -170,6 +174,10 @@ class GattServerHelper(
             value: ByteArray?
         ) {
             super.onCharacteristicWriteRequest(device, requestId, characteristic, preparedWrite, responseNeeded, offset, value)
+            if (!isServerRunning) {
+                Log.w(TAG, "[GATT-GUARD] Ignoring write request after stop")
+                return
+            }
             passiveWindowController?.onFirstWriteFromCentral()
             
             val chunkSize = value?.size ?: 0
@@ -222,6 +230,10 @@ class GattServerHelper(
             value: ByteArray?
         ) {
             super.onDescriptorWriteRequest(device, requestId, descriptor, preparedWrite, responseNeeded, offset, value)
+            if (!isServerRunning) {
+                Log.w(TAG, "[GATT-GUARD] Ignoring descriptor write after stop")
+                return
+            }
             // 🔥 FIX: Respond to CCCD write (enable/disable notify) so Central's setNotifyValue() completes.
             // Without this, Central times out and subsequent characteristic writes get 201 WRITE_REQUEST_BUSY.
             if (responseNeeded && gattServer != null) {
@@ -248,7 +260,10 @@ class GattServerHelper(
             characteristic: BluetoothGattCharacteristic
         ) {
             super.onCharacteristicReadRequest(device, requestId, offset, characteristic)
-            
+            if (!isServerRunning) {
+                Log.w(TAG, "[GATT-GUARD] Ignoring read request after stop")
+                return
+            }
             Log.d(TAG, "📤 [GATT-SERVER] Read request from ${maskMacForLog(device.address)}")
             
             if (characteristic.uuid == CHAR_UUID && gattServer != null) {
@@ -265,6 +280,7 @@ class GattServerHelper(
         
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
             super.onServiceAdded(status, service)
+            if (!isServerRunning) return
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "✅ [GATT-SERVER] Service added successfully")
                 

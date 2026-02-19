@@ -8,6 +8,8 @@ enum BleSessionOwner {
   gossip,
   cascade,
   batchSend,
+  /// Active Sync / Relay: CRDT-only session, no outbox cascade. Max 1–2 sequential connects.
+  activeSyncCrdt,
 }
 
 /// Hard GATT FSM states for client session.

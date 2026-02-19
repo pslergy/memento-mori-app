@@ -476,7 +476,7 @@ class _ChatListScreenState extends State<ChatListScreen>
                   fontSize: 8,
                   fontWeight: FontWeight.bold)),
           trailing: const Icon(Icons.chevron_right, color: Colors.white24),
-          onTap: () => _openChat('GLOBAL', 'THE BEACON', 'THE_BEACON_GLOBAL'),
+          onTap: () => _openChat('THE_BEACON_GLOBAL', 'THE BEACON', 'THE_BEACON_GLOBAL'),
         ),
       ),
     );
