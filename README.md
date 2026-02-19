@@ -108,71 +108,28 @@ cd memento-mori-app
 flutter pub get
 flutter run --release
 
-## ❤️ Support the Project
-
-**Memento Mori** is an independent open-source research project developed without corporate backing.
-
-If you find this work valuable and want to support:
-
-* long-term research into resilient offline communication
-* maintenance across diverse Android hardware
-* documentation, testing, and security audits
-
-You can support the project via **GitHub Sponsors**:
-
-👉 [https://github.com/sponsors/pslergy](https://github.com/sponsors/pslergy)
-
-Every contribution helps keep the project sustainable and open.
-
----
-
-## 📚 Project Documentation
-
-This repository is accompanied by a set of architectural and design documents
-that explain *why* Memento Mori exists and *how* it differs from conventional messengers.
-
-* **🧭 Architecture Overview**
-  → [`ARCHITECTURE.md`](ARCHITECTURE.md)
-  High-level system design, transport layers, orchestrator logic, and data flow.
-
-* **❓ Why this is not Signal or Matrix**
-  → [`WHY_NOT_SIGNAL_OR_MATRIX.md`](WHY_NOT_SIGNAL_OR_MATRIX.md)
-  Explicit comparison of assumptions, threat models, and architectural goals.
-
-* **🛡 Threat Model (coming soon)**
-  Offline-first security assumptions, adversarial environments, and OS hostility.
-
-These documents are considered part of the project specification.
-Core changes should remain consistent with them.
-
----
-
-
-### 🤝 Contributing
-
-This is an open research project. Contributions are welcome, especially in:
-
-* DSP / audio signal processing (Goertzel optimization)
-* Android HAL quirks (Samsung, Pixel, Xiaomi)
-* Cryptographic review and security testing
-
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening issues or pull requests.
-
-
----
-
-## 📄 License
-
-Licensed under the **GNU General Public License v3.0**.
-See the [LICENSE](LICENSE) file for details.
-
-> **Disclaimer:** Provided as-is for educational and defensive research purposes.
-> Authors are not responsible for misuse.
-
----
-
+❤️ Support the Research
+Memento Mori is an independent open-source research project developed without corporate backing.
+If you find this work valuable for privacy research or off-grid communication, please consider supporting:
+👉 Sponsor on GitHub
+📚 Documentation
+ARCHITECTURE.md — High-level system design and orchestrator logic.
+WHY_NOT_SIGNAL.md — Comparison with Signal/Matrix/Briar.
+SECURITY.md — Threat model and encryption details.
+🤝 Contributing
+Contributions are welcome, especially in:
+DSP / audio signal processing optimization
+Android HAL quirks (Samsung vs Pixel vs Xiaomi)
+Cryptographic review
+Please read CONTRIBUTING.md before opening issues.
+📄 License
+Licensed under the GNU General Public License v3.0.
+See the LICENSE file for details.
+Disclaimer: Provided as-is for educational and defensive research purposes. Authors are not responsible for misuse.
 <div align="center">
-  <sub><b>Memento Mori Project</b></sub><br>
-  <sub>High-Resilience Distributed Systems Research</sub><br>
-  <sub>Created by <b>Pslergy</b></sub>
+<sub><b>Memento Mori Project</b></sub><br>
+<sub>High-Resilience Distributed Systems Research</sub><br>
+<sub>Created by <b>Pslergy</b></sub>
+</div>
+```
 </div>
