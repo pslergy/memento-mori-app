@@ -148,6 +148,7 @@ git clone https://github.com/pslergy/memento-mori-app.git
 cd memento-mori-app
 flutter pub get
 flutter run --release
+```
 
 ---
 
