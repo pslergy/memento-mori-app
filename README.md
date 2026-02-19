@@ -148,3 +148,57 @@ git clone https://github.com/pslergy/memento-mori-app.git
 cd memento-mori-app
 flutter pub get
 flutter run --release
+
+---
+
+## ❤️ Support the Project
+
+Memento Mori is an independent open-source research project.
+
+If you find this work valuable for:
+
+- Privacy research  
+- Off-grid communication  
+- Humanitarian technology  
+
+Consider supporting via GitHub Sponsors:
+
+👉 https://github.com/sponsors/pslergy
+
+---
+
+## 📚 Documentation
+
+- `ARCHITECTURE.md` — System design & transport layers  
+- `WHY_NOT_SIGNAL.md` — Architectural comparison  
+- `SECURITY.md` — Threat model & cryptography  
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome.  
+Please read `CONTRIBUTING.md` before opening issues.
+
+**Areas of interest:**
+
+- DSP optimization  
+- Android HAL behavior  
+- Cryptographic review  
+
+---
+
+## 📄 License
+
+Licensed under **GNU GPL v3.0**.  
+See `LICENSE` for details.
+
+---
+
+<div align="center">
+
+**Memento Mori Project**  
+High-Resilience Distributed Systems Research  
+Created by **Pslergy**
+
+</div>
