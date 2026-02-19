@@ -34,7 +34,7 @@
 
 **Memento Mori** is a fault-tolerant autonomous mesh infrastructure designed to operate under **total network degradation**.
 
-The project implements a **shadow communication layer** beneath the traditional Internet, leveraging:
+The project implements a shadow communication layer beneath the traditional Internet, leveraging:
 
 - Acoustic signaling  
 - Radio-based discovery  
@@ -46,7 +46,7 @@ It is built for environments where connectivity is intermittent, hostile, monito
 
 ## 🧠 Core Engineering Innovations
 
-### 1️⃣ Advanced Hardware Interlock (Solving Android Fragmentation)
+### 1️⃣ Advanced Hardware Interlock (Android Fragmentation Solution)
 
 Standard Android APIs often fail on fragmented hardware (Huawei, Xiaomi, Samsung) due to aggressive battery optimization.
 
@@ -54,43 +54,34 @@ Memento Mori implements a custom **Hardware Abstraction Layer (HAL)**:
 
 - **Vendor-Specific Strategies**  
   Reverse-engineered BLE behavior to bypass background restrictions on Huawei/Honor devices.  
-  Uses inverted logic (Passive Peripheral vs Active Central) where standard libraries fail.
+  Uses inverted logic (Passive Peripheral vs Active Central).
 
 - **Finite State Machine (FSM)**  
-  Deterministic management of Bluetooth/Wi-Fi radios to prevent OS-level deadlocks (GATT 133 error).
+  Deterministic Bluetooth/Wi-Fi management preventing GATT 133 deadlocks.
 
 - **Biological Burst-Mode**  
-  Nodes synchronize wake cycles to exchange data in short high-throughput bursts — reducing battery usage by up to **90%**.
+  Nodes synchronize wake cycles and exchange data in short bursts — reducing battery usage by up to **90%**.
 
 ---
 
 ### 2️⃣ Multi-Layer Hybrid Transport
 
-Dynamic transport switching based on tactical conditions:
-
 - 🦇 **Acoustic Sonar (L2)**  
-  Air-gapped discovery using ultrasonic BFSK modulation (18–20 kHz).  
-  Uses the Goertzel algorithm for detection.
+  Ultrasonic BFSK modulation (18–20 kHz) using Goertzel detection.
 
 - 📡 **BLE Control Plane**  
-  Zero-connect topology inference.  
-  Nodes broadcast gradient state (hop counts) directly in advertising packets.
+  Zero-connect topology inference via advertising packets.
 
 - ⚡ **Wi-Fi Direct (Data Plane)**  
-  Automatic escalation to high-bandwidth Wi-Fi groups once a BLE link is verified.
+  Automatic high-bandwidth escalation after BLE verification.
 
 ---
 
 ### 3️⃣ Distributed Consistency (DTN)
 
-- **Store-and-Forward Architecture**  
-  Encrypted local Outbox for delayed delivery.
-
-- **Gossip Protocol**  
-  Epidemic propagation ensures eventual consistency without a central coordinator.
-
-- **CRDTs**  
-  Mathematical convergence guarantee during network partitions.
+- **Store-and-Forward Architecture** — encrypted local Outbox  
+- **Gossip Protocol** — epidemic propagation  
+- **CRDTs** — convergence guarantee during partitions  
 
 ---
 
@@ -98,11 +89,11 @@ Dynamic transport switching based on tactical conditions:
 
 - **Decoy Mode**  
   Dual-password architecture:
-  - Real Vault
+  - Real Vault  
   - Decoy Vault (identical UI)
 
 - **Panic Wipe**  
-  Shake-to-Kill instantly erases keys, logs, and messages.
+  Shake-to-Kill instantly erases keys and logs.
 
 - **Ghost Identity**  
   Offline Ed25519 identities stored in encrypted SQLite (WAL mode).
@@ -128,17 +119,15 @@ Dynamic transport switching based on tactical conditions:
 
 ## 🛠 Tech Stack
 
-- **Language:** Dart (Flutter) + Kotlin (Native Channels)
-- **Architecture:** Clean Architecture + BLoC
-- **Database:** SQLite (Drift, WAL Mode)
-- **Cryptography:** `pointycastle`, `cryptography` (Ed25519, AES-GCM)
-- **Signal Processing:** Goertzel Algorithm
+- **Language:** Dart (Flutter) + Kotlin (Native Channels)  
+- **Architecture:** Clean Architecture + BLoC  
+- **Database:** SQLite (Drift, WAL Mode)  
+- **Cryptography:** `pointycastle`, `cryptography` (Ed25519, AES-GCM)  
+- **Signal Processing:** Goertzel Algorithm  
 
 ---
 
 ## 🌐 Project Website
-
-Static mission & documentation site hosted on GitHub Pages:
 
 👉 https://pslergy.github.io/memento-mori-app/
 
@@ -148,9 +137,9 @@ Static mission & documentation site hosted on GitHub Pages:
 
 ### Prerequisites
 
-- Flutter SDK 3.x+
-- Android device (API 26+ recommended)  
-  *Emulators have limited Bluetooth and Wi-Fi Direct support.*
+- Flutter SDK 3.x+  
+- Android device (API 26+)  
+  *Emulators have limited BLE/Wi-Fi Direct support.*
 
 ### Installation
 
@@ -159,53 +148,3 @@ git clone https://github.com/pslergy/memento-mori-app.git
 cd memento-mori-app
 flutter pub get
 flutter run --release
-❤️ Support the Project
-
-Memento Mori is an independent open-source research project.
-
-If you find this work valuable for:
-
-Privacy research
-
-Off-grid communication
-
-Humanitarian technology
-
-Consider supporting via GitHub Sponsors:
-
-👉 https://github.com/sponsors/pslergy
-
-📚 Documentation
-
-ARCHITECTURE.md — System design & transport layers
-
-WHY_NOT_SIGNAL.md — Architectural comparison
-
-SECURITY.md — Threat model & cryptography
-
-🤝 Contributing
-
-Contributions are welcome.
-
-Please read CONTRIBUTING.md before opening issues.
-
-Areas of interest:
-
-DSP optimization
-
-Android HAL behavior
-
-Cryptographic review
-
-📄 License
-
-Licensed under GNU GPL v3.0.
-See LICENSE for details.
-
-<div align="center">
-
-Memento Mori Project
-High-Resilience Distributed Systems Research
-Created by Pslergy
-
-</div> ```
