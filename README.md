@@ -143,12 +143,7 @@ Memento Mori implements a custom **Hardware Abstraction Layer (HAL)**:
 
 ### Installation
 
-```bash
-git clone https://github.com/pslergy/memento-mori-app.git
-cd memento-mori-app
-flutter pub get
-flutter run --release
-```
+This repository contains the skeleton. The soul is elsewhere.
 
 ---
 
