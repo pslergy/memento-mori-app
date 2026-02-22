@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Memento Mori — Mesh messenger that works where others don’t: metro, mines, construction sites, forest, bunkers. No signal? No problem. Offline-first, sound + BLE + Wi-Fi Direct.">
+  <meta name="theme-color" content="#0d0d0d">
+  <title>Memento Mori — Tactical Mesh Messenger</title>
+  <!-- Open Graph / social -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Memento Mori — Tactical Mesh Messenger">
+  <meta property="og:description" content="Mesh messenger that works where others don’t: metro, mines, forest, bunkers. No signal? No problem. Offline-first, sound + BLE + Wi-Fi Direct.">
+  <meta property="og:image" content="">
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Memento Mori — Tactical Mesh Messenger">
+  <meta name="twitter:description" content="Mesh messenger for when there’s no signal: metro, mines, construction, forest, bunkers. Offline-first. Open source.">
+  <link rel="icon" type="image/png" href="../web/favicon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Outfit:wght@300;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a href="#main" class="skip-link">Skip to main content</a>
+  <header class="site-header">
+    <div class="wrap">
+      <a href="#" class="logo">Memento Mori</a>
+      <nav class="nav">
+        <a href="#mission">Mission</a>
+        <a href="#status">Status</a>
+        <a href="#where">Where it works</a>
+        <a href="#features">How it works</a>
+        <a href="#tech">Tech</a>
+        <a href="#get">Get Started</a>
+        <a href="#donate">Donate</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="wrap">
+        <p class="alpha-banner" role="status">⚠️ Research preview — not for production use</p>
+        <p class="hero-badge">Research Alpha · Open Source</p>
+        <h1 class="hero-title">When there’s no signal — you still have a network</h1>
+        <p class="hero-lead">Underground. In the woods. On a construction site. In a bunker. Where cell towers and Wi‑Fi don’t reach, phones can still talk to each other. Memento Mori is a <strong>shadow mesh</strong>: delay-tolerant, offline-first messaging over sound, Bluetooth, and Wi‑Fi Direct. No base stations. No central server. Just devices finding each other and relaying messages.</p>
+        <div class="hero-cta">
+          <a href="https://github.com/pslergy/memento-mori-app" class="btn btn-primary" target="_blank" rel="noopener">View on GitHub</a>
+          <a href="#where" class="btn btn-secondary">Where it works</a>
+        </div>
+      </div>
+      <div class="hero-grid" aria-hidden="true"></div>
+    </section>
+
+    <section id="mission" class="section mission">
+      <div class="wrap">
+        <h2 class="section-title">The Mission</h2>
+        <p class="mission-text">Memento Mori is a <strong>fault-tolerant, autonomous mesh</strong> designed to operate under total network degradation. It implements a shadow communication layer beneath the traditional Internet — for when the grid goes dark, the net is monitored, or you simply need to stay off the radar.</p>
+      </div>
+    </section>
+
+    <section id="status" class="section status">
+      <div class="wrap">
+        <h2 class="section-title">Development status</h2>
+        <p class="status-intro">We are currently in <strong>alpha</strong>. The app is under active development and testing.</p>
+        <ul class="status-list">
+          <li><strong>Alpha release</strong> — core mesh, sonar, BLE, and Wi‑Fi Direct are implemented; stability and behavior vary by device.</li>
+          <li><strong>Device testing</strong> — we’re testing on a wide range of Android devices to catch HAL and vendor-specific issues.</li>
+          <li><strong>Connection patterns</strong> — we’re tuning optimal connection patterns (when to use BLE vs Wi‑Fi Direct, scan intervals, burst timing).</li>
+          <li><strong>Discovery optimization</strong> — we’re improving device discovery (speed, reliability, battery impact) across different environments.</li>
+        </ul>
+        <p class="status-note">Feedback and device reports from the community are very welcome — open an issue or discussion on GitHub.</p>
+      </div>
+    </section>
+
+    <section id="where" class="section where">
+      <div class="wrap">
+        <h2 class="section-title">Where the mesh works</h2>
+        <p class="where-intro">No cell coverage doesn’t mean no communication. These are the kinds of places Memento Mori is built for — where conventional networks fail and a phone-to-phone mesh can keep people connected.</p>
+        <div class="where-grid">
+          <article class="where-card">
+            <span class="where-icon" aria-hidden="true">🚇</span>
+            <h3>Metro & tunnels</h3>
+            <p>Deep underground, in subways and service tunnels. Messages hop between passengers’ devices — no carrier needed.</p>
+          </article>
+          <article class="where-card">
+            <span class="where-icon" aria-hidden="true">⛏️</span>
+            <h3>Quarries & mines</h3>
+            <p>Heavy machinery, rock, and depth block normal signal. Mesh keeps crews in touch for safety and coordination.</p>
+          </article>
+          <article class="where-card">
+            <span class="where-icon" aria-hidden="true">🏗️</span>
+            <h3>Construction sites</h3>
+            <p>Scaffolding, basements, remote lots. Teams stay linked without relying on spotty or absent infrastructure.</p>
+          </article>
+          <article class="where-card">
+            <span class="where-icon" aria-hidden="true">🌲</span>
+            <h3>Forest & outdoors</h3>
+            <p>Hiking, camping, search and rescue. Devices relay through the group; no towers in the middle of nowhere.</p>
+          </article>
+          <article class="where-card">
+            <span class="where-icon" aria-hidden="true">🛡️</span>
+            <h3>Bunkers & shelters</h3>
+            <p>When the grid is down or you’re off the map. Local mesh keeps communication alive when the rest of the net is not.</p>
+          </article>
+          <article class="where-card where-card-extra">
+            <span class="where-icon" aria-hidden="true">📵</span>
+            <h3>Anywhere off the grid</h3>
+            <p>Festivals, disasters, or simply places carriers never bothered to cover. If phones are nearby, the mesh can form.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="features" class="section features">
+      <div class="wrap">
+        <h2 class="section-title">How It Works</h2>
+        <div class="features-grid">
+          <article class="feature-card">
+            <span class="feature-icon" aria-hidden="true">🦇</span>
+            <h3>Acoustic Sonar</h3>
+            <p>Air-gapped discovery using ultrasonic BFSK (18–20 kHz). Works in radio silence or RF-monitored zones. No pairing required — devices find each other by sound.</p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-icon" aria-hidden="true">📡</span>
+            <h3>BLE Control Plane</h3>
+            <p>Zero-connect topology: nodes broadcast gradient state in advertising packets. No heavy connections — just lightweight discovery and hop-count inference.</p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-icon" aria-hidden="true">⚡</span>
+            <h3>Wi-Fi Direct Burst</h3>
+            <p>When a BLE link is verified, a high-bandwidth Wi-Fi group forms to flush the message queue. Biological burst-mode saves up to 90% battery.</p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-icon" aria-hidden="true">👻</span>
+            <h3>Ghost Identity</h3>
+            <p>Fully functional offline identity (Ed25519) in SQLite. When the internet returns, your ghost merges atomically with a persistent ID — no history loss.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section screenshots">
+      <div class="wrap">
+        <h2 class="section-title">Preview</h2>
+        <div class="screenshots-row">
+          <img src="../assets/screenshots/1.jpg" alt="App screen — radar or chat" width="220" height="400">
+          <img src="../assets/screenshots/2.jpg" alt="App screen — interface" width="220" height="400">
+          <img src="../assets/screenshots/3.jpg" alt="App screen — conversation" width="220" height="400">
+          <img src="../assets/screenshots/4.jpg" alt="App screen — mesh" width="220" height="400">
+          <img src="../assets/screenshots/5.jpg" alt="App screen — settings" width="220" height="400">
+        </div>
+      </div>
+    </section>
+
+    <section id="tech" class="section tech">
+      <div class="wrap">
+        <h2 class="section-title">Tech Stack</h2>
+        <ul class="tech-list">
+          <li><strong>Language:</strong> Dart (Flutter) + Kotlin (native channels)</li>
+          <li><strong>Architecture:</strong> Clean Architecture + BLoC</li>
+          <li><strong>Database:</strong> SQLite (FFI, WAL mode)</li>
+          <li><strong>Crypto:</strong> Ed25519, AES-GCM</li>
+        </ul>
+        <p class="tech-note">Android API 26+ recommended. Emulators are limited due to Bluetooth and Wi-Fi Direct.</p>
+      </div>
+    </section>
+
+    <section id="get" class="section get-started">
+      <div class="wrap">
+        <h2 class="section-title">Get Started</h2>
+        <pre class="code-block"><code>git clone https://github.com/pslergy/memento-mori-app.git
+cd memento-mori-app
+flutter pub get
+flutter run --release</code></pre>
+        <p class="disclaimer">⚠️ Research preview (alpha). Protocol and schema may change. Not for mission-critical use without validation.</p>
+      </div>
+    </section>
+
+    <section class="section roadmap">
+      <div class="wrap">
+        <h2 class="section-title">Roadmap</h2>
+        <ul class="roadmap-list">
+          <li>Stabilize multi-hop routing (gradient descent)</li>
+          <li>End-to-end encryption (Double Ratchet)</li>
+          <li>LoRa WAN hardware integration (USB / UART)</li>
+          <li>Camouflage mode (calculator disguise)</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="donate" class="section support">
+      <div class="wrap">
+        <h2 class="section-title">Support the Project</h2>
+        <p class="support-intro">Memento Mori is an independent open-source research project. Your support helps accelerate development and keep resilient offline communication alive.</p>
+        <div class="donate-cta">
+          <p class="donate-label">Donate (crypto — no middleman):</p>
+          <div class="crypto-grid">
+            <div class="crypto-item">
+              <span class="crypto-tag">BTC</span>
+              <code class="crypto-addr" title="Copy">bc1q7308mnt0yarq5s9ngvjvurp3juggn9jy9yh53p</code>
+            </div>
+            <div class="crypto-item">
+              <span class="crypto-tag">ETH</span>
+              <code class="crypto-addr" title="Copy">0xd642d38532FE3c2B5Fa0547556fff2d9388621E6</code>
+            </div>
+            <div class="crypto-item">
+              <span class="crypto-tag">BNB Chain (BEP-20)</span>
+              <code class="crypto-addr" title="Copy">0xd642d38532FE3c2B5Fa0547556fff2d9388621E6</code>
+            </div>
+          </div>
+          <p class="donate-hint">Click an address to copy. Also available in the app under Support / Donate.</p>
+        </div>
+        <div class="github-sponsors-block">
+          <p><strong>GitHub Sponsors</strong> — application submitted; link will be active once approved. <a href="https://github.com/sponsors/pslergy" target="_blank" rel="noopener">github.com/sponsors/pslergy</a></p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <p><a href="https://github.com/pslergy/memento-mori-app/blob/main/LICENSE">GPL v3</a> · Memento Mori Project · High-resilience distributed systems research</p>
+    </div>
+  </footer>
+
+  <script>
+    document.querySelectorAll('a[href^="#"]').forEach(a => {
+      a.addEventListener('click', function(e) {
+        const id = this.getAttribute('href').slice(1);
+        if (!id) return;
+        const el = document.getElementById(id);
+        if (el) { e.preventDefault(); el.scrollIntoView({ behavior: 'smooth' }); }
+      });
+    });
+    document.querySelectorAll('.crypto-addr').forEach(el => {
+      el.addEventListener('click', function() {
+        const text = this.textContent.trim();
+        navigator.clipboard.writeText(text).then(function() {
+          const t = document.createElement('span');
+          t.textContent = ' Copied!';
+          t.style.color = 'var(--accent)';
+          el.appendChild(t);
+          setTimeout(function() { t.remove(); }, 2000);
+        });
+      });
+    });
+  </script>
+</body>
+</html>
