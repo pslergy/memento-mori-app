@@ -13,10 +13,10 @@ Memento Mori is an independent, open source research project. It is developed by
 
 We have applied for funding from the [NLnet Foundation](https://nlnet.nl) as part of their Open Call (April 2026). NLnet supports open source projects that strengthen the open internet and digital rights. If approved, these funds will be used to:
 
-- Test the Sonar (ultrasonic) transport on 30+ Android devices (Huawei, Xiaomi, MediaTek, etc.)
+- Test the Sonar (ultrasonic) transport on **30+ Android devices** (Huawei, Xiaomi, MediaTek, etc.)
 - Optimize the Goertzel algorithm for low-end hardware
-- Finalize the Double Ratchet implementation for forward secrecy
-- Harden the Decoy Mode and Panic Wipe mechanisms
+- Finalize the **Double Ratchet** implementation for forward secrecy
+- Harden the **Decoy Mode** and **Panic Wipe** mechanisms
 - Improve documentation and release a public beta
 
 We expect a decision in mid-2026.
@@ -27,7 +27,7 @@ We expect a decision in mid-2026.
 
 We have applied to join [Open Collective](https://opencollective.com) as a fiscal host for transparent, community-driven funding. Once approved, this page will allow individuals and organizations to sponsor Memento Mori directly.
 
-Check back soon or watch this repository for updates.
+We are also working on setting up alternative donation platforms (GitHub Sponsors, Ko-fi, etc.). Updates will be posted here and in the repository.
 
 ---
 
@@ -35,9 +35,13 @@ Check back soon or watch this repository for updates.
 
 Even without a formal funding platform, you can support Memento Mori in several ways:
 
-- **Test the app** on your Android device (especially if you have a Huawei, Xiaomi, or MediaTek model)
+- **Test the app** on your Android device — especially if you have a **Huawei, Xiaomi, or MediaTek** model.  
+  ⚠️ Note: The core protocol logic (gossip, FSM, decoy mode) is not included in the public repository for security reasons. Testing is currently limited to UI, transport interfaces, and non-core functionality. If you are a security researcher or experienced contributor interested in core access, please open an issue describing your background.
+
 - **Report bugs** or unexpected behavior via [GitHub Issues](https://github.com/pslergy/memento-mori-app/issues)
-- **Contribute code** — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for areas where help is welcome
+
+- **Contribute code** — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for areas where help is welcome (UI, documentation, device testing, DSP optimization)
+
 - **Spread the word** — share the project with anyone who might need offline, censorship-resistant communication
 
 ---
