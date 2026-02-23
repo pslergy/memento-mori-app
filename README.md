@@ -147,25 +147,34 @@ This repository contains the skeleton. The soul is elsewhere.
 
 ---
 
-## ❤️ Support the Project
+## ❤️ Support Memento Mori
 
-Memento Mori is an independent open-source research project.
+Memento Mori is an independent, open-source research project developed by a solo developer. It is **free for everyone**, especially for those in conflict zones and under censorship.
 
-If you find this work valuable for:
+If you find this work valuable — for privacy research, off‑grid communication, or humanitarian technology — please consider supporting it.
 
-- Privacy research  
-- Off-grid communication  
-- Humanitarian technology  
+### 💚 GitHub Sponsors
 
-Consider supporting via GitHub Sponsors:
+You can sponsor me directly via GitHub:
 
-👉 https://github.com/sponsors/pslergy
+👉 [github.com/sponsors/pslergy](https://github.com/sponsors/pslergy)
+
+Even a small monthly donation helps cover development costs, testing devices, and keeps the project sustainable.
+
+### 📄 More options
+
+We are also pursuing grants and setting up transparent funding through Open Collective.  
+For details, current status, and other ways to help (testing, reporting bugs, contributing code), see our **[funding page](funding.md)**.
 
 ---
 
-## 💚 Support the project
+*Memento Mori is built for those who cannot rely on the internet. Your support keeps it alive.*
 
-Memento Mori is developed independently. If you'd like to support its development, check out our [funding page](funding.md) for current opportunities.
+---
+
+
+
+
 
 
 
