@@ -163,6 +163,12 @@ Consider supporting via GitHub Sponsors:
 
 ---
 
+## 💚 Support the project
+
+Memento Mori is developed independently. If you'd like to support its development, check out our [funding page](funding.md) for current opportunities.
+
+
+
 ## 📚 Documentation
 
 - `ARCHITECTURE.md` — System design & transport layers  
