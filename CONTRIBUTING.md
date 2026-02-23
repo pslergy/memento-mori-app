@@ -151,5 +151,6 @@ Please open an **Issue** with the label `question`.
 Clear, technically grounded discussions are always welcome.
 
 ---
+Note: The core protocol logic (gossip, FSM, decoy mode) is not included in this public repository for security reasons. If you are interested in contributing to these areas, please open an issue describing your background and interest. Access may be granted on a case-by-case basis to trusted contributors.
 
 *Memento Mori — In environments where infrastructure fails, protocol design becomes survival.*
