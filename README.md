@@ -100,6 +100,22 @@ Memento Mori implements a custom **Hardware Abstraction Layer (HAL)**:
 
 ---
 
+Commercial SDKs
+
+Some components used in this project are available
+as standalone developer SDKs:
+
+• BLE Transport SDK
+• Offline Sync SDK
+• Discovery Relay SDK
+
+Available for commercial use.
+
+More info:
+link https://github.com/pslergy/flutter-ble-messaging-demo
+
+---
+
 ## 🗺️ Roadmap
 
 - [x] BLE zero-connect discovery  
