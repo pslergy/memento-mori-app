@@ -22,6 +22,29 @@
 
 ---
 
+## Developer SDKs
+
+Some networking components used in this project are available
+as standalone developer SDKs.
+
+### BLE Messaging Transport
+
+A Flutter demo showing peer-to-peer messaging between smartphones
+using Bluetooth Low Energy.
+
+Includes:
+
+• chunked BLE message transfer
+• message framing protocol
+• Huawei device compatibility workaround
+
+Demo and APK:
+
+➡️ https://github.com/pslergy/flutter-ble-messaging-demo
+
+---
+
+
 ## ⚠️ RESEARCH PREVIEW (ALPHA)
 
 > **Memento Mori is currently under active engineering development.**  
