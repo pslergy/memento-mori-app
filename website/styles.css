@@ -1,0 +1,571 @@
+/* Memento Mori — Website styles */
+:root {
+  --bg: #0d0d0d;
+  --bg-elevated: #141414;
+  --fg: #e8e6e3;
+  --fg-muted: #9a9792;
+  --accent: #7dd3a0;
+  --accent-dim: #5a9f76;
+  --border: #2a2a2a;
+  --code-bg: #1a1a1a;
+  --font-sans: 'Outfit', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* Skip link (accessibility) */
+.skip-link {
+  position: absolute;
+  top: -3rem;
+  left: 0.75rem;
+  z-index: 200;
+  padding: 0.5rem 0.75rem;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 0.9rem;
+  font-weight: 500;
+  text-decoration: none;
+  border-radius: 0 0 6px 0;
+  transition: top 0.2s;
+}
+.skip-link:focus {
+  top: 0;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.6;
+  color: var(--fg);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+/* Header */
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  padding: 1rem 0;
+  background: rgba(13, 13, 13, 0.9);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(8px);
+}
+
+.site-header .wrap {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.logo {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 1.1rem;
+  color: var(--fg);
+  text-decoration: none;
+  letter-spacing: 0.02em;
+}
+
+.logo:hover {
+  color: var(--accent);
+}
+
+.nav {
+  display: flex;
+  gap: 1.5rem;
+}
+
+.nav a {
+  color: var(--fg-muted);
+  text-decoration: none;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.nav a:hover {
+  color: var(--accent);
+}
+
+/* Hero */
+.hero {
+  position: relative;
+  padding: 4rem 0 5rem;
+  overflow: hidden;
+}
+
+.hero-grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(125, 211, 160, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(125, 211, 160, 0.03) 1px, transparent 1px);
+  background-size: 48px 48px;
+  pointer-events: none;
+}
+
+.hero .wrap {
+  position: relative;
+  z-index: 1;
+}
+
+.alpha-banner {
+  margin: 0 0 1rem;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8rem;
+  color: var(--fg-muted);
+  background: rgba(255, 180, 0, 0.12);
+  border: 1px solid rgba(255, 180, 0, 0.35);
+  border-radius: 6px;
+  display: inline-block;
+}
+
+.hero-badge {
+  display: inline-block;
+  margin-bottom: 1rem;
+  padding: 0.35rem 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--accent-dim);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.hero-title {
+  margin: 0 0 1rem;
+  font-size: clamp(1.75rem, 4vw, 2.5rem);
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+}
+
+.hero-lead {
+  margin: 0 0 2rem;
+  max-width: 38em;
+  font-size: 1.1rem;
+  color: var(--fg-muted);
+}
+
+.hero-cta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+/* Buttons */
+.btn {
+  display: inline-block;
+  padding: 0.65rem 1.25rem;
+  font-family: var(--font-sans);
+  font-size: 0.95rem;
+  font-weight: 500;
+  text-decoration: none;
+  border-radius: 6px;
+  transition: background 0.2s, color 0.2s;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.btn-primary:hover {
+  background: var(--accent-dim);
+}
+
+.btn-secondary {
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+
+.btn-secondary:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Sections */
+.section {
+  padding: 3.5rem 0;
+  border-top: 1px solid var(--border);
+}
+
+.section-title {
+  margin: 0 0 1.5rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.mission-text {
+  margin: 0;
+  max-width: 42em;
+  font-size: 1.05rem;
+  color: var(--fg-muted);
+}
+
+.mission-text strong {
+  color: var(--fg);
+}
+
+/* Development status */
+.status-intro {
+  margin: 0 0 1rem;
+  font-size: 1.05rem;
+  color: var(--fg-muted);
+}
+
+.status-intro strong {
+  color: var(--accent-dim);
+}
+
+.status-list {
+  margin: 0 0 1rem;
+  padding: 0;
+  list-style: none;
+}
+
+.status-list li {
+  padding: 0.6rem 0;
+  padding-left: 1.5rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.95rem;
+  color: var(--fg-muted);
+  position: relative;
+}
+
+.status-list li::before {
+  content: "•";
+  position: absolute;
+  left: 0;
+  color: var(--accent);
+  font-weight: bold;
+}
+
+.status-list li:last-child {
+  border-bottom: none;
+}
+
+.status-note {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+  font-style: italic;
+}
+
+/* Where the mesh works */
+.where-intro {
+  margin: 0 0 2rem;
+  max-width: 42em;
+  font-size: 1.05rem;
+  color: var(--fg-muted);
+}
+
+.where-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1.25rem;
+}
+
+.where-card {
+  padding: 1.5rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.where-card:hover {
+  border-color: rgba(125, 211, 160, 0.35);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+}
+
+.where-card-extra {
+  border-style: dashed;
+}
+
+.where-icon {
+  display: block;
+  margin-bottom: 0.75rem;
+  font-size: 1.75rem;
+  line-height: 1;
+}
+
+.where-card h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.where-card p {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+  line-height: 1.5;
+}
+
+/* Feature cards */
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1.5rem;
+}
+
+.feature-card {
+  padding: 1.5rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.feature-icon {
+  display: block;
+  margin-bottom: 0.75rem;
+  font-size: 1.5rem;
+}
+
+.feature-card h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.feature-card p {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+}
+
+/* Screenshots */
+.screenshots-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 1rem;
+}
+
+.screenshots-row img {
+  width: 220px;
+  height: auto;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  object-fit: cover;
+}
+
+/* Tech list */
+.tech-list {
+  margin: 0 0 1rem;
+  padding: 0;
+  list-style: none;
+}
+
+.tech-list li {
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+}
+
+.tech-list li:last-of-type {
+  border-bottom: none;
+}
+
+.tech-note {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+}
+
+/* Roadmap */
+.roadmap-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.roadmap-list li {
+  padding: 0.5rem 0;
+  padding-left: 1.5rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.95rem;
+  color: var(--fg-muted);
+  position: relative;
+}
+
+.roadmap-list li::before {
+  content: "→";
+  position: absolute;
+  left: 0;
+  color: var(--accent-dim);
+  font-family: var(--font-mono);
+}
+
+.roadmap-list li:last-child {
+  border-bottom: none;
+}
+
+/* Code block */
+.code-block {
+  margin: 0 0 1rem;
+  padding: 1.25rem 1.5rem;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+
+.code-block code {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--accent);
+  white-space: pre;
+}
+
+.disclaimer {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+}
+
+/* Support / Donate */
+.support-intro {
+  margin: 0 0 1.5rem;
+  color: var(--fg-muted);
+}
+
+.donate-cta {
+  margin-bottom: 1.5rem;
+  padding: 1.5rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.donate-label {
+  margin: 0 0 0.75rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.crypto-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.crypto-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.crypto-tag {
+  flex-shrink: 0;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--bg);
+  background: var(--accent-dim);
+  border-radius: 4px;
+}
+
+.crypto-addr {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  cursor: pointer;
+  padding: 0.25rem 0;
+}
+
+.crypto-addr:hover {
+  color: var(--accent);
+}
+
+.donate-hint {
+  margin: 0.75rem 0 0;
+  font-size: 0.8rem;
+  color: var(--fg-muted);
+}
+
+.github-sponsors-block {
+  padding: 1rem;
+  background: rgba(125, 211, 160, 0.06);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.github-sponsors-block p {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+}
+
+.support a,
+.github-sponsors-block a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.support a:hover,
+.github-sponsors-block a:hover {
+  text-decoration: underline;
+}
+
+/* Footer */
+.site-footer {
+  padding: 2rem 0;
+  border-top: 1px solid var(--border);
+}
+
+.site-footer p {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  text-align: center;
+}
+
+.site-footer a {
+  color: var(--accent-dim);
+  text-decoration: none;
+}
+
+.site-footer a:hover {
+  color: var(--accent);
+}
+
+@media (max-width: 640px) {
+  .site-header .wrap {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1rem;
+  }
+
+  .nav {
+    flex-wrap: wrap;
+  }
+
+  .screenshots-row img {
+    width: 160px;
+  }
+}

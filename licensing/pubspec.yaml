@@ -1,0 +1,9 @@
+name: mesh_stack_licensing
+description: License interfaces for MeshStack SDK. No enforcement logic.
+version: 1.0.0
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.1.0 <4.0.0'
+
+dependencies: {}

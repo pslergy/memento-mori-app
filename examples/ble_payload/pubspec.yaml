@@ -1,0 +1,16 @@
+name: ble_payload_example
+description: Example app demonstrating BLE Payload Pack
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.1.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ble_payload_pack:
+    path: ../../sdk_products/ble_payload_pack
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
