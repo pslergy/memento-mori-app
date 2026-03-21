@@ -1,16 +1,14 @@
-Публичный снимок исходников Memento Mori
+Public source snapshot of Memento Mori
 ==========================================
 
-Эта папка собрана скриптом scripts/export_public_mirror из ПРИВАТНОГО репозитория.
+This folder was assembled by the scripts/export_public_mirror script from the PRIVATE repository.
 
-Что вырезано
-------------
-Удалены чувствительные модули (mesh, BLE-транспорт, gossip, туннели, нативный Android и т.д.)
-по манифесту в приватном репо: tools/opensource/exclude-from-public.txt
+What has been removed
+Sensitive modules (mesh, BLE transport, gossip, tunnels, native Android code, etc.) have been stripped according to the manifest in the private repo: tools/opensource/exclude-from-public.txt
 
-Из публичной копии также удалены ВСЕ файлы с расширением .md (внутренние отчёты, README в подпапках и т.п.).
+All .md files (internal reports, README files in subfolders, etc.) have also been removed from the public copy.
 
-Сборка
-------
-Полная сборка (flutter build) здесь не ожидается: не хватает Dart/Kotlin файлов и могут остаться
-лишние записи в AndroidManifest.xml (например сервисы mesh). Полная сборка — только в приватном дереве.
+Build
+A full build (flutter build) is not expected to work here: Dart/Kotlin files are missing, and there may be leftover entries in AndroidManifest.xml (e.g., mesh services). Full builds only work in the private tree.
+
+If you want to make it sound more technical or more user-friendly, let me know. I can also format it as a README.md for the public mirror folder if needed.
