@@ -110,9 +110,7 @@ Transport diversity, optional **DPI-oriented** channel selection, **hop-count–
 
 ---
 
-## 📦 MeshStack SDK (same repository)
 
-This repo also contains the **MeshStack** modular SDK (`sdk_products/`, `examples/`) for BLE reliability, chunking, offline sync, and discovery. See [**sdk_products/README.md**](sdk_products/README.md) and [**docs/README.md**](docs/README.md).
 
 ---
 
