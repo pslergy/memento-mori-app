@@ -2,6 +2,8 @@
 
 # 💀 Memento Mori
 
+The project is entering the active testing phase.
+
 ### Resilient offline-first mesh infrastructure
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
