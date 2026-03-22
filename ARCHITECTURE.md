@@ -44,7 +44,7 @@ UI (Flutter) │
 
 │ — BLE GATT (primary mesh transport) │
 
-│ — Wi‑Fi Direct (planned, for bulk data) │
+│ — Wi‑Fi Direct (for bulk data) │
 
 │ — Cloud (HTTPS / WebSocket) │
 
