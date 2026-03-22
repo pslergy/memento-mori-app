@@ -122,8 +122,7 @@ Built to withstand active network interference and traffic analysis:
 - Android device (API 26+)  
   *(Emulators have limited BLE/Wi-Fi Direct support. Physical devices are required for transport testing).*
 
-### Installation
-Clone the repository and run `flutter pub get`. 
+
 
 ---
 
