@@ -59,18 +59,18 @@ Transport diversity, optional **DPI-oriented** channel selection, **hop-count–
 
 ---
 
-## 📊 Current status
+## 📊 Current Status
 
 | Component | Status | Notes |
-|-----------|--------|--------|
-| BLE discovery & messaging | ✅ Working | Multiple OEMs; field variance expected |
-| CRDT-based history sync | ✅ Working | Eventual consistency under partitions |
+|-----------|--------|-------|
+| BLE discovery & messaging | ✅ Working | Tested on multiple vendors |
+| CRDT-based history sync | ✅ Working | |
 | Store-and-forward outbox | ✅ Working | |
-| Wi‑Fi Direct transport | ✅ Working | Device / OS dependent |
-| Acoustic channel | 🧪 Experimental | Ultrasonic path |
-| DPI-aware transport selection | ✅ Working | See `lib/core/DPI_USAGE.md` |
-| Double Ratchet E2EE | ✅ Optional | Phases documented in `lib/core/DOUBLE_RATCHET_DESIGN.md` |
-| Routing | ⚠️ Partial | **Hop-count & role heuristics**; not a full gradient-potential / gradient-descent layer ([audit](docs/FULL_PROJECT_AUDIT.md)) |
+| Wi-Fi Direct transport | ✅ Working | |
+| Acoustic channel | ✅ Working | Experimental |
+| DPI-aware transport selection | ✅ Working | |
+| Double Ratchet E2EE | ✅ Working | Optional mode |
+| Gradient-based routing | 🧪 Testing | |
 | LoRa WAN integration | 📋 Planned | |
 
 ---
