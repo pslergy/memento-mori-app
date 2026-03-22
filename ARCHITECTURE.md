@@ -18,22 +18,28 @@ This document describes the system design at a level useful for contributors and
 │ UI (Flutter) │
 │ — Chat views, profile, transport indicators │
 ├─────────────────────────────────────────────────────────────┤
+
 │ App Services │
 │ — API client, WebSocket manager, room state, event bus │
 ├─────────────────────────────────────────────────────────────┤
+
+
 │ Mesh Core │
 │ — Session graph, packet dispatch, gossip relay, CRDT sync │
 │ — Roles: GHOST / CLIENT / BRIDGE (based on connectivity) │
 ├─────────────────────────────────────────────────────────────┤
+
 │ Transport Layer │
 │ — BLE GATT (primary mesh transport) │
 │ — Wi‑Fi Direct (planned, for bulk data) │
 │ — Cloud (HTTPS / WebSocket) │
 ├─────────────────────────────────────────────────────────────┤
+
 │ Persistence │
 │ — SQLite (messages, session state, CRDT logs) │
 │ — Keystore / Keychain (crypto keys, identity material) │
 └─────────────────────────────────────────────────────────────┘
+
 
 text
 
