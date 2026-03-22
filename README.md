@@ -95,10 +95,10 @@ Built to withstand active network interference and traffic analysis:
 - [x] Gossip Protocol  
 - [x] Store-and-Forward Outbox  
 - [x] Decoy Mode & Panic Wipe  
-- [ ] Gradient-based multi-hop routing  
-- [ ] Double Ratchet (E2EE) integration  
+- [x] Gradient-based multi-hop routing  
+- [x] Double Ratchet (E2EE) integration  
 - [ ] LoRa WAN via USB/UART support  
-- [ ] Camouflage UI mode (Calculator disguise)
+- [x] Camouflage UI mode (Calculator disguise)
 
 ---
 
