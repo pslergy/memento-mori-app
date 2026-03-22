@@ -7,7 +7,6 @@
 [![Platform](https://img.shields.io/badge/Platform-Android-green.svg)](https://flutter.dev)
 [![Status](https://img.shields.io/badge/Status-Research%20Alpha-orange.svg)]()
 [![Website](https://img.shields.io/badge/Website-GitHub%20Pages-blue.svg)](https://pslergy.github.io/memento-mori-app/)
-[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-pink.svg)](https://github.com/sponsors/pslergy)
 
 **Autonomous Decentralized Communication for Extreme Environments**  
 *Delay-Tolerant • Zero-Trust • Air-Gapped Capable*
@@ -24,156 +23,108 @@
 
 ---
 
-## ⚠️ RESEARCH PREVIEW (ALPHA)
+## ⚠️ RESEARCH PREVIEW — NOT A PRODUCTION RELEASE
 
-> **Memento Mori is currently under active engineering development.**  
-> The protocol implementation and routing logic are designed for research in **Delay-Tolerant Networks (DTN)** and mobile hardware limitations.  
-> *Note: This repository contains the open-source skeleton. The production-ready transport layers and hardware workarounds are available via our commercial SDKs (see below).*
-
----
-
-## 💼 Commercial SDKs & Enterprise Integration
-
-Building a commercial IoT, Hardware, or off-grid messaging app? Standard Android APIs often fail on fragmented hardware (dropping BLE packets on Huawei/Xiaomi, aggressive background execution limits, etc.). 
-
-We packaged our production-ready transport layers into standalone SDKs that solve these hardware limitations out-of-the-box:
-
-*   **BLE Messaging Transport SDK:** Includes the custom Huawei "Pull-Mode", GATT 133 auto-recovery, and chunked messaging.
-*   **Offline Sync SDK** (CRDT)
-*   **Discovery Relay SDK**
-
-👉 **[Test the Demo APK & Get the Source Code Here](https://github.com/pslergy/flutter-ble-messaging-demo)**
+> This is an independent research project exploring the limits of mobile ad-hoc networking. The code is published for educational purposes and peer review.  
+> **The system is designed for research in Delay-Tolerant Networks (DTN) and operates without centralized infrastructure.**
 
 ---
 
-## 💀 The Mission
+## 🧠 Core Research Areas
 
-**Memento Mori** is a fault-tolerant autonomous mesh infrastructure designed to operate under **total network degradation**. 
-
-It is built for environments where traditional infrastructure fails or is unavailable: disaster recovery zones, remote expeditions, underground facilities, and highly congested or actively interfered RF environments. It leverages multi-layer transports to maintain data integrity and delivery without relying on a central server.
-
----
-
-## 🧠 Core Engineering Innovations
-
-### 1️⃣ Advanced Hardware Interlock (Android Fragmentation Solution)
-Aggressive battery optimization on modern Android devices (Huawei, Xiaomi, Samsung) destroys background P2P connections. Memento Mori implements a custom **Hardware Abstraction Layer (HAL)**:
-- **Vendor-Specific Strategies:** Reverse-engineered BLE behavior to bypass background restrictions (e.g., using inverted Passive Peripheral vs. Active Central logic).
-- **Finite State Machine (FSM):** Deterministic Bluetooth/Wi-Fi management preventing `GATT 133` deadlocks.
-- **Biological Burst-Mode:** Nodes synchronize wake cycles and exchange data in short bursts — reducing battery drain significantly.
+### 1️⃣ Hardware-Aware Transport Layer
+Standard mobile networking APIs assume persistent connectivity. This project explores techniques for maintaining communication under:
+- Aggressive power management (vendor-specific background execution limits)
+- Unreliable radio environments (packet loss, interference, device mobility)
+- Hardware fragmentation across different Android implementations
 
 ### 2️⃣ Multi-Layer Hybrid Transport
-- 🦇 **Acoustic Sonar (L2):** Ultrasonic BFSK modulation (18–20 kHz) using Goertzel detection for extremely close-range, radio-free discovery.
-- 📡 **BLE Control Plane:** Zero-connect topology inference via advertising packets.
-- ⚡ **Wi-Fi Direct (Data Plane):** Automatic high-bandwidth escalation after BLE verification.
+- **BLE Control Plane:** Zero-connect topology discovery
+- **Wi-Fi Direct Data Plane:** On-demand high-bandwidth escalation
+- **Acoustic Channel (Experimental):** Ultrasonic close-range exchange for radio-free scenarios
 
-### 3️⃣ Distributed Consistency (DTN)
-- **Store-and-Forward Architecture:** Encrypted local Outbox.
-- **Gossip Protocol:** Epidemic propagation with anti-chaos limits.
-- **CRDTs:** Convergence guarantee during network partitions.
+### 3️⃣ Distributed Consistency Without Central Coordination
+- **Store-and-Forward** with local persistent queues
+- **Epidemic propagation** with anti-entropy mechanisms
+- **CRDT-based** eventual consistency for partitioned networks
 
-### 4️⃣ Anti-Forensics & Device Security
-Designed to protect data at rest on physically compromised devices:
-- **Decoy Mode:** Dual-password architecture featuring a Real Vault and a Decoy Vault (with an identical UI).
-- **Panic Wipe:** Shake-to-Kill instantly erases encryption keys and sensitive logs.
-- **Ghost Identity:** Offline Ed25519 identities stored in an encrypted SQLite database (WAL mode).
+### 4️⃣ Local Data Protection
+Research into protecting data on devices that may be physically compromised:
+- **Dual-path storage:** Separate data contexts with distinct access methods
+- **Selective data removal:** Targeted key erasure
+- **Offline identity:** Locally-managed cryptographic identities without external dependencies
 
-### 5️⃣ Network Resiliency & Obfuscation
-Built to withstand active network interference and traffic analysis:
-- **DPI Evasion Heuristics:** Advanced socket monitoring to detect Deep Packet Inspection (DPI) anomalies (e.g., TLS handshake manipulation or TCP blackholing).
-- **Traffic Masking:** SNI domain spoofing and asymmetric fallback channels to blend encrypted payloads with standard web traffic.
-- **Immune Protocol:** Nodes exchange successful routing "recipes" offline via BLE, allowing the swarm to adapt to network blocks autonomously.
+### 5️⃣ Network Layer Resilience
+Exploration of techniques for maintaining connectivity under adversarial network conditions:
+- **Transport diversity:** Multiple fallback paths
+- **Traffic pattern obfuscation:** Alignment with common protocols
+- **Adaptive routing:** Swarm-level learning of viable paths
 
 ---
 
-## 🗺️ Roadmap
+## 📊 Current Status
 
-- [x] BLE zero-connect discovery  
-- [x] Hardware Interlock FSM  
-- [x] Acoustic Sonar (BFSK)  
-- [x] Wi-Fi Direct Auto-Negotiation  
-- [x] Gossip Protocol  
-- [x] Store-and-Forward Outbox  
-- [x] Decoy Mode & Panic Wipe  
-- [ ] Gradient-based multi-hop routing   (Test Mode)
-- [x] Double Ratchet (E2EE) integration  
-- [ ] LoRa WAN via USB/UART support  
-- [x] Camouflage UI mode (Calculator disguise)
+| Component | Status | Notes |
+|-----------|--------|-------|
+| BLE discovery & messaging | ✅ Working | Tested on multiple vendors |
+| CRDT-based history sync | ✅ Working | |
+| Store-and-forward outbox | ✅ Working | |
+| Wi-Fi Direct transport | ✅ Working | |
+| Acoustic channel | ✅ Working | Experimental |
+| DPI-aware transport selection | ✅ Working | |
+| Double Ratchet E2EE | ✅ Working | Optional mode |
+| Gradient-based routing | 🧪 Testing | |
+| LoRa WAN integration | 📋 Planned | |
 
 ---
 
 ## 🛠 Tech Stack
 
-- **Language:** Dart (Flutter) + Kotlin (Native Channels)  
-- **Architecture:** Clean Architecture + BLoC  
-- **Database:** SQLite (Drift, WAL Mode)  
-- **Cryptography:** `pointycastle`, `cryptography` (Ed25519, AES-GCM)  
-- **Signal Processing:** Goertzel Algorithm  
-
----
-
-## 🌐 Project Website
-👉 **[pslergy.github.io/memento-mori-app](https://pslergy.github.io/memento-mori-app/)**
+- **Language:** Dart (Flutter) + Kotlin (Platform Channels)
+- **Architecture:** Clean Architecture + BLoC
+- **Database:** SQLite (Drift, WAL Mode)
+- **Cryptography:** `pointycastle`, `cryptography`
+- **Signal Processing:** Goertzel Algorithm
 
 ---
 
 ## 📥 Getting Started
 
 ### Prerequisites
-- Flutter SDK 3.x+  
-- Android device (API 26+)  
-  *(Emulators have limited BLE/Wi-Fi Direct support. Physical devices are required for transport testing).*
+- Flutter SDK 3.x+
+- Android device (API 26+)
+- Physical devices required for transport testing (emulator support limited)
 
+### Build
+```bash
+git clone https://github.com/pslergy/memento-mori-app
+cd memento-mori-app
+flutter pub get
+flutter build apk --release
+📚 Documentation
+Document	Description
+ARCHITECTURE.md	System design and transport layers
+WHY_NOT_SIGNAL.md	Design rationale and comparisons
+SECURITY.md	Threat model and cryptography
+🤝 Contributing
+This is a research project. Contributions in the following areas are welcome:
 
+Digital Signal Processing optimization
 
----
+Android transport behavior analysis
 
-## ❤️ Support the Research
+Cryptographic implementation review
 
-Memento Mori is an independent, open-source research project developed by a solo engineer. It explores the absolute limits of mobile hardware in off-grid scenarios.
+Please read CONTRIBUTING.md before opening issues.
 
-If you find this work valuable for IoT research, disaster-recovery tech, or decentralized systems, please consider supporting its development:
+📄 License
+GNU General Public License v3.0 — see LICENSE for details.
 
-### 💚 GitHub Sponsors
-You can sponsor the hardware research directly via GitHub:  
-👉 **[github.com/sponsors/pslergy](https://github.com/sponsors/pslergy)**
-
-*Even a small monthly donation helps cover development costs, testing devices (like Xiaomi/Huawei testbenches), and keeps the project sustainable.*
-
-
-
----
-
-## 📚 Documentation
-
-- `ARCHITECTURE.md` — System design & transport layers  
-- `WHY_NOT_SIGNAL.md` — Architectural comparison  
-- `SECURITY.md` — Threat model & cryptography  
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome. Please read `CONTRIBUTING.md` before opening issues.
-
-**Areas of interest:**
-- DSP (Digital Signal Processing) optimization  
-- Android HAL behavior & background execution  
-- Cryptographic review  
-
----
-
-## 📄 License
-
-Licensed under **GNU GPL v3.0**.  
-See `LICENSE` for details.
-
----
+This license ensures the software remains free and open for research and educational use.
 
 <div align="center">
+Memento Mori — Remember that systems must survive
 
-**Memento Mori Project**  
-High-Resilience Distributed Systems Research  
-Created by **Pslergy**
+Independent research project
 
-</div>
+</div> ```
