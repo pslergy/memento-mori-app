@@ -140,8 +140,7 @@ You can sponsor the hardware research directly via GitHub:
 
 *Even a small monthly donation helps cover development costs, testing devices (like Xiaomi/Huawei testbenches), and keeps the project sustainable.*
 
-### 📄 More options
-For details, current status, and other ways to help (testing, reporting bugs, contributing code), see our **[Funding Page](funding.md)**.
+
 
 ---
 
