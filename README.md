@@ -104,6 +104,7 @@ Document	Description
 ARCHITECTURE.md	System design and transport layers
 WHY_NOT_SIGNAL.md	Design rationale and comparisons
 SECURITY.md	Threat model and cryptography
+
 🤝 Contributing
 This is a research project. Contributions in the following areas are welcome:
 
@@ -114,6 +115,7 @@ Android transport behavior analysis
 Cryptographic implementation review
 
 Please read CONTRIBUTING.md before opening issues.
+
 
 📄 License
 GNU General Public License v3.0 — see LICENSE for details.
