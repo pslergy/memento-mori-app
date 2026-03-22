@@ -96,11 +96,9 @@ Exploration of techniques for maintaining connectivity under adversarial network
 - Physical devices required for transport testing (emulator support limited)
 
 ### Build
-```bash
+bash
 git clone https://github.com/pslergy/memento-mori-app
-cd memento-mori-app
-flutter pub get
-flutter build apk --release
+
 📚 Documentation
 Document	Description
 ARCHITECTURE.md	System design and transport layers
@@ -127,4 +125,4 @@ Memento Mori — Remember that systems must survive
 
 Independent research project
 
-</div> ```
+</div> 
