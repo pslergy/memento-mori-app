@@ -120,8 +120,7 @@ We practice responsible disclosure and respond on a best-effort basis. No bug bo
 |------|---------|
 | `ARCHITECTURE.md` | System design and transport layers |
 | `WHY_NOT_SIGNAL.md` | Architectural comparison |
-| `lib/core/DOUBLE_RATCHET_DESIGN.md` | Ratchet implementation details |
-| `docs/E2EE_PRIORITIES.md` | Deferred cryptographic features |
+
 
 ---
 
