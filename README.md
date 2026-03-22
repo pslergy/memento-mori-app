@@ -105,8 +105,7 @@ Transport diversity, optional **DPI-oriented** channel selection, **hop-count–
 | [**ARCHITECTURE.md**](ARCHITECTURE.md) | System design & transport layers |
 | [**WHY_NOT_SIGNAL.md**](WHY_NOT_SIGNAL.md) | Design rationale vs Signal-class messengers |
 | [**SECURITY.md**](SECURITY.md) | Threat model & cryptography (high level) |
-| [**docs/E2EE_PRIORITIES.md**](docs/E2EE_PRIORITIES.md) | E2EE roadmap / deferred server pre-keys |
-| [**docs/E2EE_USER_FAQ_RU.md**](docs/E2EE_USER_FAQ_RU.md) | User-oriented FAQ (Russian) |
+
 
 ---
 
