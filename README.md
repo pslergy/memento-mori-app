@@ -1,130 +1,137 @@
 <div align="center">
 
-# 💀 Memento Mori  
-### Resilient Offline-First Mesh Infrastructure
+# 💀 Memento Mori
+
+### Resilient offline-first mesh infrastructure
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Android-green.svg)](https://flutter.dev)
 [![Status](https://img.shields.io/badge/Status-Research%20Alpha-orange.svg)]()
 [![Website](https://img.shields.io/badge/Website-GitHub%20Pages-blue.svg)](https://pslergy.github.io/memento-mori-app/)
 
-**Autonomous Decentralized Communication for Extreme Environments**  
-*Delay-Tolerant • Zero-Trust • Air-Gapped Capable*
+**Autonomous decentralized communication for constrained networks**  
+*Delay-tolerant • Mesh-first • Air-gap–friendly scenarios*
 
 <br>
 
-<img src="assets/screenshots/1.jpg" width="220" alt="Radar UI"/>
-<img src="assets/screenshots/2.jpg" width="220" alt="Chat UI"/>
-<img src="assets/screenshots/3.jpg" width="220" alt="Mesh Settings"/>
-<img src="assets/screenshots/4.jpg" width="220" alt="Mesh Settings"/>
-<img src="assets/screenshots/5.jpg" width="220" alt="Mesh Settings"/>
+<!-- Add screenshots under assets/screenshots/ for the gallery below -->
+<img src="assets/screenshots/1.jpg" width="220" alt="Radar UI" />
+<img src="assets/screenshots/2.jpg" width="220" alt="Chat UI" />
+<img src="assets/screenshots/3.jpg" width="220" alt="Mesh settings" />
+<img src="assets/screenshots/4.jpg" width="220" alt="Mesh settings" />
+<img src="assets/screenshots/5.jpg" width="220" alt="Mesh settings" />
 
 </div>
 
 ---
 
-## ⚠️ RESEARCH PREVIEW — NOT A PRODUCTION RELEASE
+## ⚠️ Research preview — not a production release
 
-> This is an independent research project exploring the limits of mobile ad-hoc networking. The code is published for educational purposes and peer review.  
-> **The system is designed for research in Delay-Tolerant Networks (DTN) and operates without centralized infrastructure.**
-
----
-
-## 🧠 Core Research Areas
-
-### 1️⃣ Hardware-Aware Transport Layer
-Standard mobile networking APIs assume persistent connectivity. This project explores techniques for maintaining communication under:
-- Aggressive power management (vendor-specific background execution limits)
-- Unreliable radio environments (packet loss, interference, device mobility)
-- Hardware fragmentation across different Android implementations
-
-### 2️⃣ Multi-Layer Hybrid Transport
-- **BLE Control Plane:** Zero-connect topology discovery
-- **Wi-Fi Direct Data Plane:** On-demand high-bandwidth escalation
-- **Acoustic Channel (Experimental):** Ultrasonic close-range exchange for radio-free scenarios
-
-### 3️⃣ Distributed Consistency Without Central Coordination
-- **Store-and-Forward** with local persistent queues
-- **Epidemic propagation** with anti-entropy mechanisms
-- **CRDT-based** eventual consistency for partitioned networks
-
-### 4️⃣ Local Data Protection
-Research into protecting data on devices that may be physically compromised:
-- **Dual-path storage:** Separate data contexts with distinct access methods
-- **Selective data removal:** Targeted key erasure
-- **Offline identity:** Locally-managed cryptographic identities without external dependencies
-
-### 5️⃣ Network Layer Resilience
-Exploration of techniques for maintaining connectivity under adversarial network conditions:
-- **Transport diversity:** Multiple fallback paths
-- **Traffic pattern obfuscation:** Alignment with common protocols
-- **Adaptive routing:** Swarm-level learning of viable paths
+Independent research into **delay-tolerant** and **ad hoc** mobile networking. Code is published for **education and peer review**. The mesh path can operate **without relying on a single central messaging plane**; optional cloud features may still be used when available.
 
 ---
 
-## 📊 Current Status
+## 🧠 Core research areas
+
+### 1. Hardware-aware transport
+
+Coping with vendor power limits, flaky radio, and Android BLE quirks (background limits, `GATT_BUSY`, fragmentation).
+
+### 2. Hybrid transport stack
+
+| Layer | Role |
+|-------|------|
+| **BLE** | Discovery, control, store-and-forward messaging |
+| **Wi‑Fi Direct** | On-demand higher throughput where supported |
+| **Acoustic (experimental)** | Close-range exchange without BLE/Wi‑Fi |
+
+### 3. Distributed consistency
+
+Store-and-forward queues, **epidemic-style** relay with TTL/dedup, **CRDT-oriented** sync for partitioned histories.
+
+### 4. Local data protection
+
+Dual-context storage (e.g. REAL / decoy paths), selective key handling, offline-oriented identity material. See [**SECURITY.md**](SECURITY.md) for limits and threat model.
+
+### 5. Resilience & obfuscation
+
+Transport diversity, optional **DPI-oriented** channel selection, **hop-count–based** uplink heuristics (GHOST/BRIDGE roles). *Not* a full continuous “gradient field” router — see status table below.
+
+---
+
+## 📊 Current status
 
 | Component | Status | Notes |
-|-----------|--------|-------|
-| BLE discovery & messaging | ✅ Working | Tested on multiple vendors |
-| CRDT-based history sync | ✅ Working | |
+|-----------|--------|--------|
+| BLE discovery & messaging | ✅ Working | Multiple OEMs; field variance expected |
+| CRDT-based history sync | ✅ Working | Eventual consistency under partitions |
 | Store-and-forward outbox | ✅ Working | |
-| Wi-Fi Direct transport | ✅ Working | |
-| Acoustic channel | ✅ Working | Experimental |
-| DPI-aware transport selection | ✅ Working | |
-| Double Ratchet E2EE | ✅ Working | Optional mode |
-| Gradient-based routing | 🧪 Testing | |
+| Wi‑Fi Direct transport | ✅ Working | Device / OS dependent |
+| Acoustic channel | 🧪 Experimental | Ultrasonic path |
+| DPI-aware transport selection | ✅ Working | See `lib/core/DPI_USAGE.md` |
+| Double Ratchet E2EE | ✅ Optional | Phases documented in `lib/core/DOUBLE_RATCHET_DESIGN.md` |
+| Routing | ⚠️ Partial | **Hop-count & role heuristics**; not a full gradient-potential / gradient-descent layer ([audit](docs/FULL_PROJECT_AUDIT.md)) |
 | LoRa WAN integration | 📋 Planned | |
 
 ---
 
-## 🛠 Tech Stack
+## 🛠 Tech stack
 
-- **Language:** Dart (Flutter) + Kotlin (Platform Channels)
-- **Architecture:** Clean Architecture + BLoC
-- **Database:** SQLite (Drift, WAL Mode)
-- **Cryptography:** `pointycastle`, `cryptography`
-- **Signal Processing:** Goertzel Algorithm
+| Area | Stack |
+|------|--------|
+| App | **Dart** (Flutter), **Kotlin** (platform channels) |
+| DI / state | **get_it**, **Provider** (not BLoC in the main app) |
+| Local DB | **SQLite** via **sqflite** |
+| Crypto | **`cryptography`**, **`crypto`** (see SECURITY.md — not a Signal clone) |
+| DSP | Goertzel / FFT utilities where used for acoustic experiments |
 
 ---
 
-## 📥 Getting Started
+## 📥 Getting started
 
 ### Prerequisites
-- Flutter SDK 3.x+
-- Android device (API 26+)
-- Physical devices required for transport testing (emulator support limited)
 
-### Build
-bash
-git clone https://github.com/pslergy/memento-mori-app
-
-📚 Documentation
-Document	Description
-ARCHITECTURE.md	System design and transport layers
-WHY_NOT_SIGNAL.md	Design rationale and comparisons
-SECURITY.md	Threat model and cryptography
-
-🤝 Contributing
-This is a research project. Contributions in the following areas are welcome:
-
-Digital Signal Processing optimization
-
-Android transport behavior analysis
-
-Cryptographic implementation review
-
-Please read CONTRIBUTING.md before opening issues.
+- Flutter SDK **3.x** (`>=3.1.0` per `pubspec.yaml`)
+- **Android** device (API 26+ recommended)
+- **Physical devices** for meaningful mesh / BLE tests (emulator coverage is limited)
 
 
-📄 License
-GNU General Public License v3.0 — see LICENSE for details.
+---
 
-This license ensures the software remains free and open for research and educational use.
+## 📚 Documentation
+
+| Document | Description |
+|----------|-------------|
+| [**ARCHITECTURE.md**](ARCHITECTURE.md) | System design & transport layers |
+| [**WHY_NOT_SIGNAL.md**](WHY_NOT_SIGNAL.md) | Design rationale vs Signal-class messengers |
+| [**SECURITY.md**](SECURITY.md) | Threat model & cryptography (high level) |
+| [**docs/E2EE_PRIORITIES.md**](docs/E2EE_PRIORITIES.md) | E2EE roadmap / deferred server pre-keys |
+| [**docs/E2EE_USER_FAQ_RU.md**](docs/E2EE_USER_FAQ_RU.md) | User-oriented FAQ (Russian) |
+
+---
+
+## 📦 MeshStack SDK (same repository)
+
+This repo also contains the **MeshStack** modular SDK (`sdk_products/`, `examples/`) for BLE reliability, chunking, offline sync, and discovery. See [**sdk_products/README.md**](sdk_products/README.md) and [**docs/README.md**](docs/README.md).
+
+---
+
+## 🤝 Contributing
+
+Research welcome in transport behavior, crypto review, and DSP. Please read [**CONTRIBUTING.md**](CONTRIBUTING.md) before opening issues or PRs.
+
+---
+
+## 📄 License
+
+**GNU General Public License v3.0** — see [LICENSE](LICENSE).
+
+---
 
 <div align="center">
-Memento Mori — Remember that systems must survive
 
-Independent research project
+**Memento Mori** — *memento mori*: systems should survive disconnections.
 
-</div> 
+*Independent research project.*
+
+</div>
