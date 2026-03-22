@@ -17,6 +17,8 @@
 <img src="assets/screenshots/1.jpg" width="220" alt="Radar UI"/>
 <img src="assets/screenshots/2.jpg" width="220" alt="Chat UI"/>
 <img src="assets/screenshots/3.jpg" width="220" alt="Mesh Settings"/>
+<img src="assets/screenshots/4.jpg" width="220" alt="Mesh Settings"/>
+<img src="assets/screenshots/5.jpg" width="220" alt="Mesh Settings"/>
 
 </div>
 
