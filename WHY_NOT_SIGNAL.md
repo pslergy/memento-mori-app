@@ -83,8 +83,7 @@ The goal is a **resilient hybrid mesh + cloud messenger** with documented crypto
 |------|---------|
 | `ARCHITECTURE.md` | System design and transport layers |
 | `SECURITY.md` | Threat model and cryptography limits |
-| `lib/core/DOUBLE_RATCHET_DESIGN.md` | Ratchet implementation details |
-| `docs/E2EE_PRIORITIES.md` | Deferred cryptographic features |
+
 
 ---
 
