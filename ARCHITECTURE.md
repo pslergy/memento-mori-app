@@ -73,7 +73,7 @@ All core services are registered via `get_it` and injected into feature modules.
 | **Cloud (HTTPS)** | Account operations, REST API, push when online | Subject to network filtering; fallback via `backendChannels` rotation |
 | **Cloud (WebSocket)** | Real-time delivery when online | Same constraints as HTTPS |
 | **BLE (GATT)** | Neighbor messaging, discovery, multi-hop gossip | Limited bandwidth (~20 bytes per characteristic), high latency, device-specific reliability |
-| **Wi‑Fi Direct** (planned) | Bulk sync (history, media), fallback when BLE unstable | Requires group owner negotiation; power-intensive |
+| **Wi‑Fi Direct**  | Bulk sync (history, media), fallback when BLE unstable | Requires group owner negotiation; power-intensive |
 | **P2P TCP** (optional) | LAN / ad-hoc paths | Platform-dependent, often blocked by network policies |
 
 **Key property:** Transports carry **opaque ciphertext** only. All application-level framing (message IDs, ratchet headers, CRDT payloads) is encrypted before reaching the transport layer.
