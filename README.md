@@ -71,7 +71,7 @@ Transport diversity, optional **DPI-oriented** channel selection, **hop-count–
 | Wi-Fi Direct transport | ✅ Working | |
 | Acoustic channel | ✅ Working | Experimental |
 | DPI-aware transport selection | ✅ Working | |
-| Double Ratchet E2EE | ✅ Working | Optional mode |
+| Symmetrical Ratchet with Epoch-based Sync | ✅ Working | Optional mode |
 | Gradient-based routing | 🧪 Testing | |
 | LoRa WAN integration | 📋 Planned | |
 
