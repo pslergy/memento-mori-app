@@ -3,18 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="Memento Mori — Mesh messenger that works where others don’t: metro, mines, construction sites, forest, bunkers. No signal? No problem. Offline-first, sound + BLE + Wi-Fi Direct.">
+  <meta name="description" content="Memento Mori — A connection that cannot be shut down. Mesh messaging for emergencies, off-grid zones, and private speech. Bluetooth, Wi‑Fi Direct, no single center — works even without the internet.">
   <meta name="theme-color" content="#0d0d0d">
-  <title>Memento Mori — Tactical Mesh Messenger</title>
+  <title>Memento Mori — A connection that cannot be shut down</title>
   <!-- Open Graph / social -->
   <meta property="og:type" content="website">
-  <meta property="og:title" content="Memento Mori — Tactical Mesh Messenger">
-  <meta property="og:description" content="Mesh messenger that works where others don’t: metro, mines, forest, bunkers. No signal? No problem. Offline-first, sound + BLE + Wi-Fi Direct.">
+  <meta property="og:title" content="Memento Mori — A connection that cannot be shut down">
+  <meta property="og:description" content="A connection that cannot be shut down — mesh messaging without a single center. Works even without the internet: BLE, Wi‑Fi Direct, sound.">
   <meta property="og:image" content="">
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Memento Mori — Tactical Mesh Messenger">
-  <meta name="twitter:description" content="Mesh messenger for when there’s no signal: metro, mines, construction, forest, bunkers. Offline-first. Open source.">
+  <meta name="twitter:title" content="Memento Mori — A connection that cannot be shut down">
+  <meta name="twitter:description" content="Mesh messenger — no single center, private speech, works off-grid. Bluetooth &amp; Wi‑Fi Direct.">
   <link rel="icon" type="image/png" href="../web/favicon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -26,12 +26,15 @@
   <header class="site-header">
     <div class="wrap">
       <a href="#" class="logo">Memento Mori</a>
-      <nav class="nav">
+      <nav class="nav" aria-label="Primary">
+        <a href="#philosophy">Why we build</a>
         <a href="#mission">Mission</a>
         <a href="#status">Status</a>
         <a href="#where">Where it works</a>
         <a href="#features">How it works</a>
         <a href="#tech">Tech</a>
+        <a href="#partners">Partners</a>
+        <a href="#sponsorship">Sponsorship</a>
         <a href="#get">Get Started</a>
         <a href="#donate">Donate</a>
       </nav>
@@ -43,14 +46,38 @@
       <div class="wrap">
         <p class="alpha-banner" role="status">⚠️ Research preview — not for production use</p>
         <p class="hero-badge">Research Alpha · Open Source</p>
-        <h1 class="hero-title">When there’s no signal — you still have a network</h1>
-        <p class="hero-lead">Underground. In the woods. On a construction site. In a bunker. Where cell towers and Wi‑Fi don’t reach, phones can still talk to each other. Memento Mori is a <strong>shadow mesh</strong>: delay-tolerant, offline-first messaging over sound, Bluetooth, and Wi‑Fi Direct. No base stations. No central server. Just devices finding each other and relaying messages.</p>
+        <h1 class="hero-title">A connection that cannot be shut down</h1>
+        <p class="hero-tagline">When ordinary apps go silent — the mesh still speaks.</p>
+        <p class="hero-lead">We build a messenger for open spaces, emergencies, and places where staying in touch is not a luxury but a lifeline. Underground, in the woods, on a site, in a shelter — where towers fail, devices can still find each other. Memento Mori is a <strong>shadow mesh</strong>: delay‑tolerant, offline‑first messaging over sound, Bluetooth, and Wi‑Fi Direct. <strong>No single center.</strong> No base station you can unplug. It works <strong>even when there is no internet</strong> — because your phones are the network.</p>
         <div class="hero-cta">
           <a href="https://github.com/pslergy/memento-mori-app" class="btn btn-primary" target="_blank" rel="noopener">View on GitHub</a>
           <a href="#where" class="btn btn-secondary">Where it works</a>
         </div>
       </div>
       <div class="hero-grid" aria-hidden="true"></div>
+    </section>
+
+    <section id="philosophy" class="section philosophy">
+      <div class="wrap">
+        <h2 class="section-title">Why we build</h2>
+        <div class="philosophy-columns">
+          <div class="philosophy-block">
+            <h3 class="philosophy-h">Staying reachable when the world isn’t fair</h3>
+            <p>Our priority is simple: people should stay connected even when circumstances turn against them. Often, communication is the last thing that can stand between someone and harm — or bring help when it matters most.</p>
+          </div>
+          <div class="philosophy-block">
+            <h3 class="philosophy-h">Private and anonymous speech</h3>
+            <p>We reject the idea that people should be stripped of confidential, anonymous communication. Anonymity is not about hiding from accountability — it is about <strong>remaining yourself</strong> when speaking freely is risky. To erase anonymity is to erase room for an honest inner life.</p>
+          </div>
+          <div class="philosophy-block">
+            <h3 class="philosophy-h">No off switch</h3>
+            <p>There is no single choke point. The stack is built for <strong>direct links between devices</strong> — Bluetooth, Wi‑Fi, whatever channel is available. You cannot “turn off” the whole thing from one datacenter, because <strong>there isn’t one</strong>. The mesh persists where people are willing to relay for each other.</p>
+          </div>
+        </div>
+        <blockquote class="manifesto-quote">
+          <p>Human beings remain human only as long as they are free to speak and to think freely.</p>
+        </blockquote>
+      </div>
     </section>
 
     <section id="mission" class="section mission">
@@ -190,10 +217,35 @@ flutter run --release</code></pre>
       </div>
     </section>
 
+    <section id="partners" class="section partners">
+      <div class="wrap">
+        <h2 class="section-title">Partners &amp; supporters</h2>
+        <p class="partners-intro">We are grateful to organizations that help us ship resilient, people‑first communication. This space is reserved for their logos and links.</p>
+        <div class="partners-grid" aria-label="Partner logos">
+          <div class="partners-empty">
+            <p class="partners-empty-title">No partners listed yet</p>
+            <p class="partners-empty-text">If your company shares our mission — the right to connect and to speak freely — we’d welcome your support. Reach us at <a href="mailto:pslergy@gmail.com">pslergy@gmail.com</a>.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="sponsorship" class="section sponsorship">
+      <div class="wrap">
+        <h2 class="section-title">Support the right to connect</h2>
+        <p class="sponsorship-lead">Projects that defend anonymity and freedom of expression need backing today more than ever. If you believe that <strong>the right to speak confidentially is part of the right to remain yourself</strong>, you can help this work move forward.</p>
+        <p class="sponsorship-body">Your support is a contribution to a world where connection stays within reach for everyone — whatever the circumstances — and where technology serves people instead of controlling them.</p>
+        <blockquote class="manifesto-quote manifesto-quote--compact">
+          <p>Human beings remain human only as long as they are free to speak and to think freely.</p>
+        </blockquote>
+        <p class="sponsorship-contact">Contact: <a href="mailto:pslergy@gmail.com">pslergy@gmail.com</a></p>
+      </div>
+    </section>
+
     <section id="donate" class="section support">
       <div class="wrap">
-        <h2 class="section-title">Support the Project</h2>
-        <p class="support-intro">Memento Mori is an independent open-source research project. Your support helps accelerate development and keep resilient offline communication alive.</p>
+        <h2 class="section-title">Support the project</h2>
+        <p class="support-intro">Memento Mori is an independent open-source research effort. Donations and sponsorship help us ship faster and keep resilient, censorship-resistant communication on real devices.</p>
         <div class="donate-cta">
           <p class="donate-label">Donate (crypto — no middleman):</p>
           <div class="crypto-grid">
@@ -221,7 +273,8 @@ flutter run --release</code></pre>
 
   <footer class="site-footer">
     <div class="wrap">
-      <p><a href="https://github.com/pslergy/memento-mori-app/blob/main/LICENSE">GPL v3</a> · Memento Mori Project · High-resilience distributed systems research</p>
+      <p><a href="https://github.com/pslergy/memento-mori-app/blob/main/LICENSE">GPL v3</a> · Memento Mori · High-resilience distributed systems research</p>
+      <p class="footer-contact"><a href="mailto:pslergy@gmail.com">pslergy@gmail.com</a></p>
     </div>
   </footer>
 

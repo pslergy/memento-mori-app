@@ -1,0 +1,54 @@
+# Publishes website/ to GitHub Pages (Settings → Pages → Source: GitHub Actions).
+# Intended for the PUBLIC mirror branch only — push website + this file to `public`, not to the private main.
+name: Deploy GitHub Pages
+
+on:
+  push:
+    branches: [public]
+    paths:
+      - 'website/**'
+      - '.github/workflows/github-pages.yml'
+      - 'web/favicon.png'
+      - 'assets/screenshots/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble site (website + assets from repo root)
+        run: |
+          set -e
+          mkdir -p _site/assets/screenshots
+          cp -r website/. _site/
+          if [ -f web/favicon.png ]; then cp web/favicon.png _site/favicon.png; fi
+          if [ -d assets/screenshots ]; then
+            cp -r assets/screenshots/. _site/assets/screenshots/ 2>/dev/null || true
+          fi
+          sed -i 's|href="../web/favicon.png"|href="favicon.png"|g' _site/index.html
+          sed -i 's|src="../assets/screenshots/|src="assets/screenshots/|g' _site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
