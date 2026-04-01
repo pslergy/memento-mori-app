@@ -1,6 +1,7 @@
 <div align="center">
 
 # 💀 Memento Mori
+https://pslergy.github.io/memento-mori-app
 
 The project is entering the active testing phase.
 
