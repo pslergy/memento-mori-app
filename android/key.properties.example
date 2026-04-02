@@ -1,0 +1,7 @@
+# Скопируйте в key.properties и заполните. Не коммитьте key.properties.
+# Положите my-key.jks в эту папку (android/).
+
+storePassword=
+keyPassword=
+keyAlias=
+storeFile=my-key.jks

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Копия установленного APK для Share / ACTION_SEND (cacheDir/apk_share/) -->
+    <cache-path name="apk_share" path="apk_share" />
+    <external-files-path name="apk_received" path="." />
+    <files-path name="apk_received" path="." />
+</paths>

@@ -1,0 +1,112 @@
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.buildDir = '../build'
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+
+// --- 🔥 ЛЕЧЕБНЫЙ БЛОК 🔥 ---
+subprojects {
+    project.configurations.all {
+        resolutionStrategy {
+            // Flutter TextInputPlugin calls EditorInfoCompat.setStylusHandwritingEnabled (API added in core 1.12+).
+            // Pinning 1.10.1 caused NoSuchMethodError when opening the keyboard on newer Flutter / Android.
+            force 'androidx.core:core:1.15.0'
+            force 'androidx.core:core-ktx:1.15.0'
+            // Добавляем фикс для AppCompat, чтобы тема нашлась
+            force 'androidx.appcompat:appcompat:1.7.0'
+        }
+    }
+
+    afterEvaluate { project ->
+        if (project.hasProperty('android')) {
+            project.android {
+                // ✅ Принудительно ставим 36 всем плагинам, чтобы они не ругались
+                compileSdk = 36
+
+                compileOptions {
+                    sourceCompatibility JavaVersion.VERSION_17
+                    targetCompatibility JavaVersion.VERSION_17
+                }
+
+                // Внедряем namespace в старые библиотеки
+                if (namespace == null) {
+                    if (project.name == 'flutter_bluetooth_serial') {
+                        namespace 'io.github.edufolly.flutterbluetoothserial'
+                    }
+                    // Добавь другие плагины здесь, если будут ошибки namespace
+                }
+            }
+        }
+
+        project.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+            kotlinOptions {
+                jvmTarget = "17"
+            }
+        }
+    }
+}
+// -----------------------------------------------------------
+
+// Do not use evaluationDependsOn(':app') on all subprojects — it breaks plugin project
+// evaluation order and can make :app compile without plugin classes on the classpath.
+
+// flutter_ble_peripheral 2.0.1: duplicate onAdvertisingSetStarted → "Reply already submitted".
+// Register when com.android.library is applied (no sub.afterEvaluate — conflicts with evaluationDependsOn).
+subprojects { sub ->
+    sub.pluginManager.withPlugin('com.android.library') {
+        if (sub.name != 'flutter_ble_peripheral') {
+            return
+        }
+        def repoRoot = rootProject.projectDir.parentFile
+        def depsFile = new File(repoRoot, '.flutter-plugins-dependencies')
+        def patchFile = new File(repoRoot, 'scripts/patches/PeripheralAdvertisingSetCallback.kt')
+
+        sub.tasks.register('applyBlePeripheralPatch') {
+            group = 'patching'
+            description = 'Copy PeripheralAdvertisingSetCallback.kt fix into flutter_ble_peripheral (pub cache)'
+            doLast {
+                if (!depsFile.exists()) {
+                    logger.warn('applyBlePeripheralPatch: .flutter-plugins-dependencies missing (run flutter pub get)')
+                    return
+                }
+                if (!patchFile.exists()) {
+                    throw new GradleException("applyBlePeripheralPatch: patch missing at ${patchFile.absolutePath}")
+                }
+                def json = new groovy.json.JsonSlurper().parse(depsFile)
+                def androidPlugins = json.plugins?.android
+                if (androidPlugins == null) {
+                    logger.warn('applyBlePeripheralPatch: no android plugins in JSON')
+                    return
+                }
+                def entry = androidPlugins.find { it.name == 'flutter_ble_peripheral' }
+                if (entry == null) {
+                    logger.warn('applyBlePeripheralPatch: flutter_ble_peripheral not listed for android')
+                    return
+                }
+                def pluginPath = new File(entry.path as String)
+                def targetDir = new File(pluginPath, 'android/src/main/kotlin/dev/steenbakker/flutter_ble_peripheral/callbacks')
+                def targetFile = new File(targetDir, 'PeripheralAdvertisingSetCallback.kt')
+                if (!targetDir.isDirectory()) {
+                    logger.warn("applyBlePeripheralPatch: unexpected layout, skip (${targetDir})")
+                    return
+                }
+                sub.copy {
+                    from patchFile
+                    into targetDir
+                }
+                logger.lifecycle("applyBlePeripheralPatch: updated ${targetFile.absolutePath}")
+            }
+        }
+        sub.tasks.named('preBuild').configure { dependsOn sub.tasks.named('applyBlePeripheralPatch') }
+    }
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}
