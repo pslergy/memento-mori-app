@@ -1,3 +1,0 @@
-git add website/index.html docs/index.html
-git commit -m "Website copy corrections"
-git push origin main
