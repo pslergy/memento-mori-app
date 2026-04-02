@@ -422,6 +422,25 @@ body {
   border-bottom: none;
 }
 
+/* Public source notice (replaces build instructions) */
+.source-intro {
+  margin: 0 0 1.25rem;
+  font-size: 1.05rem;
+  line-height: 1.65;
+  color: var(--fg);
+  max-width: 72ch;
+}
+
+.source-intro a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.source-intro a:hover {
+  color: var(--accent-dim);
+}
+
 /* Code block */
 .code-block {
   margin: 0 0 1rem;

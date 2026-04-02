@@ -150,32 +150,18 @@ body {
 }
 
 .hero-title {
-  margin: 0 0 0.5rem;
+  margin: 0 0 1rem;
   font-size: clamp(1.75rem, 4vw, 2.5rem);
   font-weight: 700;
   line-height: 1.2;
   letter-spacing: -0.02em;
 }
 
-.hero-tagline {
-  margin: 0 0 1.25rem;
-  font-family: var(--font-mono);
-  font-size: clamp(0.95rem, 2vw, 1.1rem);
-  font-weight: 500;
-  color: var(--accent-dim);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
 .hero-lead {
   margin: 0 0 2rem;
-  max-width: 40em;
-  font-size: 1.05rem;
+  max-width: 38em;
+  font-size: 1.1rem;
   color: var(--fg-muted);
-}
-
-.hero-lead strong {
-  color: var(--fg);
 }
 
 .hero-cta {
@@ -237,141 +223,6 @@ body {
 
 .mission-text strong {
   color: var(--fg);
-}
-
-/* Philosophy / manifesto */
-.philosophy-columns {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 1.75rem;
-  margin-bottom: 2.5rem;
-}
-
-.philosophy-block {
-  padding: 1.5rem;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  border-top: 3px solid rgba(125, 211, 160, 0.45);
-}
-
-.philosophy-h {
-  margin: 0 0 0.75rem;
-  font-size: 1.05rem;
-  font-weight: 600;
-  color: var(--fg);
-  letter-spacing: -0.01em;
-}
-
-.philosophy-block p {
-  margin: 0;
-  font-size: 0.95rem;
-  color: var(--fg-muted);
-  line-height: 1.65;
-}
-
-.manifesto-quote {
-  margin: 0;
-  padding: 1.5rem 1.5rem 1.5rem 1.75rem;
-  border-left: 4px solid var(--accent-dim);
-  background: rgba(125, 211, 160, 0.05);
-  border-radius: 0 10px 10px 0;
-}
-
-.manifesto-quote p {
-  margin: 0;
-  font-size: 1.15rem;
-  font-style: italic;
-  font-weight: 500;
-  color: var(--fg);
-  line-height: 1.5;
-}
-
-.manifesto-quote--compact {
-  margin-top: 1rem;
-}
-
-.manifesto-quote--compact p {
-  font-size: 1.05rem;
-}
-
-/* Partners */
-.partners-intro {
-  margin: 0 0 1.5rem;
-  max-width: 42em;
-  color: var(--fg-muted);
-  font-size: 1.02rem;
-}
-
-.partners-grid {
-  min-height: 120px;
-}
-
-.partners-empty {
-  padding: 2rem 1.5rem;
-  text-align: center;
-  background: var(--bg-elevated);
-  border: 2px dashed var(--border);
-  border-radius: 12px;
-}
-
-.partners-empty-title {
-  margin: 0 0 0.5rem;
-  font-family: var(--font-mono);
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: var(--fg-muted);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
-.partners-empty-text {
-  margin: 0;
-  max-width: 36em;
-  margin-left: auto;
-  margin-right: auto;
-  font-size: 0.95rem;
-  color: var(--fg-muted);
-  line-height: 1.6;
-}
-
-.partners-empty a {
-  color: var(--accent);
-  text-decoration: none;
-  font-weight: 500;
-}
-
-.partners-empty a:hover {
-  text-decoration: underline;
-}
-
-/* Sponsorship narrative */
-.sponsorship-lead,
-.sponsorship-body {
-  margin: 0 0 1rem;
-  max-width: 42em;
-  font-size: 1.05rem;
-  color: var(--fg-muted);
-  line-height: 1.65;
-}
-
-.sponsorship-lead strong {
-  color: var(--fg);
-}
-
-.sponsorship-contact {
-  margin: 1.25rem 0 0;
-  font-family: var(--font-mono);
-  font-size: 0.95rem;
-}
-
-.sponsorship-contact a {
-  color: var(--accent);
-  text-decoration: none;
-}
-
-.sponsorship-contact a:hover {
-  text-decoration: underline;
 }
 
 /* Development status */
@@ -571,6 +422,25 @@ body {
   border-bottom: none;
 }
 
+/* Public source notice (replaces build instructions) */
+.source-intro {
+  margin: 0 0 1.25rem;
+  font-size: 1.05rem;
+  line-height: 1.65;
+  color: var(--fg);
+  max-width: 72ch;
+}
+
+.source-intro a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.source-intro a:hover {
+  color: var(--accent-dim);
+}
+
 /* Code block */
 .code-block {
   margin: 0 0 1rem;
@@ -694,21 +564,6 @@ body {
   text-align: center;
 }
 
-.footer-contact {
-  margin-top: 0.5rem !important;
-}
-
-.footer-contact a {
-  color: var(--accent-dim);
-  text-decoration: none;
-  font-family: var(--font-mono);
-  font-size: 0.8rem;
-}
-
-.footer-contact a:hover {
-  color: var(--accent);
-}
-
 .site-footer a {
   color: var(--accent-dim);
   text-decoration: none;
@@ -716,17 +571,6 @@ body {
 
 .site-footer a:hover {
   color: var(--accent);
-}
-
-@media (max-width: 900px) {
-  .nav {
-    gap: 0.75rem 1rem;
-    max-width: 100%;
-  }
-
-  .nav a {
-    font-size: 0.82rem;
-  }
 }
 
 @media (max-width: 640px) {
@@ -738,7 +582,6 @@ body {
 
   .nav {
     flex-wrap: wrap;
-    row-gap: 0.5rem;
   }
 
   .screenshots-row img {
