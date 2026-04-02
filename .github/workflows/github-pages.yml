@@ -1,10 +1,10 @@
 # Publishes website/ to GitHub Pages (Settings → Pages → Source: GitHub Actions).
-# Intended for the PUBLIC mirror branch only — push website + this file to `public`, not to the private main.
+# Runs on pushes to `main` or `public` (paths: website/, this workflow, favicon, screenshots).
 name: Deploy GitHub Pages
 
 on:
   push:
-    branches: [public]
+    branches: [main, public]
     paths:
       - 'website/**'
       - '.github/workflows/github-pages.yml'
