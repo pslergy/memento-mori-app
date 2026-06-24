@@ -23,6 +23,9 @@ The project is entering the active testing phase.
 <img src="assets/screenshots/3.jpg" width="220" alt="Mesh settings" />
 <img src="assets/screenshots/4.jpg" width="220" alt="Mesh settings" />
 <img src="assets/screenshots/5.jpg" width="220" alt="Mesh settings" />
+<img src="assets/screenshots/7.png" width="220" alt="Mesh settings" />
+<img src="assets/screenshots/8.png" width="220" alt="Mesh settings" />
+<img src="assets/screenshots/9.png" width="220" alt="Mesh settings" />
 
 </div>
 
