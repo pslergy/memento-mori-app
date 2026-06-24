@@ -1,4 +1,14 @@
+# Memento Mori Field Test Logs
 
+## 2026-06-24 — BLE GATT relay, Huawei ↔ Xiaomi (GHOST ↔ GHOST)
+
+**Test summary:**
+- **Local device:** Huawei (restrictive vendor, peripheral-only mode)
+- **Remote device:** Xiaomi (initiates GATT connection)
+- **Result:** 2 pending messages delivered, outbox cleared, CRDT sync started.
+
+<details>
+<summary>Click to expand full log</summary>
 [17:33:00] 🔍 [BT-SCAN] Configuring scan: duration=30s, role=GHOST, filter=NONE (check tactical names for both BRIDGE and GHOST)
 [17:33:00] 🔍 [BT-SCAN] Received 5 scan result(s), updating discovery context...
 [17:33:00] 🔍 [DEBUG] RAW SCAN DATA:
@@ -548,3 +558,14 @@
 17:35:43 > 🦷 [BT] 🛑 [GATT-SERVER] GATT server stopped
 [17:35:43] [RELAY] Background TCP stopped (was started as relay GO)
 17:35:43 > 📊 [GOSSIP] summary: accepted=2 droppedRate=0 droppedTtl=0 relayGatt=0 relayBle=0 relayNet=0 outbox=0
+
+</details>
+
+### Key moments in this log
+1. **Discovery:** GHOST detects multiple peers via BLE manufacturer data (`0xFFFF`) even when `localName` is empty.
+2. **Vendor adaptation:** `local=HUAWEI peer=UNKNOWN → peerInitiates` — the Huawei device correctly avoids initiating GATT and waits for the peer to connect (avoiding `GATT_BUSY`).
+3. **Cascade control:** `Transfer already in progress` shows proper mutex handling, preventing duplicate connections.
+4. **Fragmentation:** Message `temp_1773326054244` split into 2 fragments (60+32 bytes), reassembled successfully.
+5. **Outbox pull:** Central device sends `OUTBOX_REQUEST`, server responds with 3 pending messages, all removed from outbox after confirmation.
+6. **CRDT sync:** After outbox delivery, `HEAD_EXCHANGE` starts for 3 chats — confirms CRDT anti-entropy works.
+7. **Gossip deduplication:** `Message temp_177 already exists in DB - skipping relay` — flood protection works.
