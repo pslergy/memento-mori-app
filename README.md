@@ -108,7 +108,7 @@ Transport diversity, optional **DPI-oriented** channel selection, **hop-count–
 | [**ARCHITECTURE.md**](ARCHITECTURE.md) | System design & transport layers |
 | [**WHY_NOT_SIGNAL.md**](WHY_NOT_SIGNAL.md) | Design rationale vs Signal-class messengers |
 | [**SECURITY.md**](SECURITY.md) | Threat model & cryptography (high level) |
-| [**FIELD\_TEST\_LOGS**](LOGS.md) | Real-world BLE GATT relay logs (Huawei ↔ Xiaomi) |
+| [**Field Test Log**](field_test_2026_06_23.pdf) | GHOST ↔ GHOST BLE GATT relay, Huawei ↔ Xiaomi |
 
 
 ---
