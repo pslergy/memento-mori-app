@@ -109,7 +109,7 @@
 [17:33:31] ℹ️ [Ghost] No BRIDGE found after scan
 17:33:36 > 🦷 [Gossip] Device prefers PERIPHERAL (Huawei/Honor) — skipping BLE relay, using Sonar
 17:33:36 > 🦠 [Epidemic] run: pending=2, relay_attempts=2
-[24.06.2026 14:49] Маман: [17:33:43] 📡 [Uplink-Seeker] Probing neighbors for internet access...
+[17:33:43] 📡 [Uplink-Seeker] Probing neighbors for internet access...
 [17:33:43] 🔍 [BT-SCAN] Starting BLE scan (role: GHOST)
 [17:33:43] 📡 [ADV] Setting tactical name: 'M_100_1_GHOS' (length: 12)
 17:33:43 > 🦷 [BT] ℹ️ [ADV] Keeping GATT server active (advertising-only stop)
@@ -165,7 +165,7 @@
 [17:33:46]	📋 Cooldown: EXPIRED (key: MAC:70:A3:83:33:4D:83, remaining: 0s)
 [17:33:46]	📋 Transfer active: true (0s)
 [17:33:46] ⏸️ [Ghost] Connection blocked: Transfer already in progress
-[24.06.2026 14:49] Маман: [17:33:46] 🔍 [BT-SCAN] Summary: Found 1 mesh device(s)
+[17:33:46] 🔍 [BT-SCAN] Summary: Found 1 mesh device(s)
 [17:33:46] 🔍 [BT-SCAN] Received 2 scan result(s), updating discovery context...
 [17:33:46] 🔍 [DEBUG] RAW SCAN DATA:
 [17:33:46]	MAC: ••:••:••:••:4D:83
@@ -224,7 +224,7 @@
 [17:33:47] 🔍 [BT-SCAN] Summary: Found 1 mesh device(s)
 [17:33:47] 📤 [GHOST↔GHOST] roleDecision=peer closer to internet, shouldConnect=true
 [17:33:47] [BLE-STRATEGY] local=HUAWEI peer=UNKNOWN → peerInitiates
-[24.06.2026 14:49] Маман: [17:33:47] 📤 [GHOST↔GHOST] Strategy: not initiating GATT (restrictive vendor or passive), waiting for peer to connect
+[17:33:47] 📤 [GHOST↔GHOST] Strategy: not initiating GATT (restrictive vendor or passive), waiting for peer to connect
 [17:33:53] 🧹 Pruned dead nodes. Active: 1
 17:33:56 > 🦠 [Epidemic] Infecting superior node: D:83
 17:33:57 > 📤 [GOSSIP] Message pulse_nu not found in DB - will relay to neighbors...
@@ -285,7 +285,7 @@
 [17:34:26] 🔍 [BT-SCAN] Starting BLE scan (role: GHOST)
 [17:34:26] 📡 [ADV] Setting tactical name: 'M_100_1_GHOS' (length: 12)
 17:34:26 > 🦷 [BT] ℹ️ [ADV] Keeping GATT server active (advertising-only stop)
-[24.06.2026 14:49] Маман: 17:34:26 > 🦷 [BT] 🛑 [ADV] Native advertiser stopped
+17:34:26 > 🦷 [BT] 🛑 [ADV] Native advertiser stopped
 17:34:26 > 🦷 [BT] ℹ️ [ADV] isAdvertising=false, skipping stop call
 17:34:26 > 🦷 [BT] 💤 FSM → IDLE
 17:34:26 > 🦷 [BT] ⏸️ [ADV] Too soon since last operation (10ms), waiting 1989ms...
@@ -399,7 +399,7 @@
 [17:34:35] 💾 [CASCADE-FIX] ScanResult saved IMMEDIATELY at cascade start (MAC: D6:01:3E)
 [17:34:35] ⛓️ Engaging Cascade for node 72:AA:DC:D6:01:3E
 [17:34:35]	📋 Cooldown will be set ONLY after failed attempt (not before!)
-[24.06.2026 14:49] Маман: [17:34:35] 🔍 [BT-SCAN] Summary: Found 1 mesh device(s)
+[17:34:35] 🔍 [BT-SCAN] Summary: Found 1 mesh device(s)
 [17:34:35] 🔍 [ROLE-CHECK] My role: GHOST, My hops: 100, My pending: 3
 [17:34:35] 🔍 [ROLE-CHECK] Peer role: GHOST, Peer hops: 99
 [17:34:36] 📤 [GHOST↔GHOST] roleDecision=peer closer to internet, shouldConnect=true
@@ -453,7 +453,9 @@
 17:34:43 > 🔍 [FRAGMENT-DEBUG] frag['idx']: 0 (type: int)
 17:34:43 > 🔍 [FRAGMENT-DEBUG] frag['tot']: 2
 17:34:43 > 🔍 [FRAGMENT-DEBUG] frag['data']: 60 bytes
-[24.06.2026 14:49] Маман: 17:34:43 > 📦 [FRAGMENT] fragment_received: mid=temp_177... idx=0/2 sender=GHOST_17...
+
+
+17:34:43 > 📦 [FRAGMENT] fragment_received: mid=temp_177... idx=0/2 sender=GHOST_17...
 17:34:43 > 💾 [FRAGMENT] fragment_stored: temp_1773326054244 idx=0/2
 17:34:43 > 📊 [FRAGMENT] Progress: 1/2 for temp_1773326054244
 17:34:43 > 🔍 [FRAGMENT-DEBUG] Saved fragments indices: [0]
@@ -507,7 +509,7 @@
 17:34:44 > 🦷 [BT]	📋 Full data length: 25 bytes
 17:34:44 > 🦷 [BT]	[BLE-DIAG] raw data length: 25
 17:34:44 > 🦷 [BT]	[BLE-DIAG] first 50 bytes (base64): eyJ0eXBlIjoiT1VUQk9YX1JFUVVFU1QifQ==
-[24.06.2026 14:49] Маман: 17:34:44 > 🦷 [BT]	✅ [JSON] Parsed complete message successfully!
+17:34:44 > 🦷 [BT]	✅ [JSON] Parsed complete message successfully!
 17:34:44 > 🦷 [BT]	📋 Message type: OUTBOX_REQUEST
 17:34:44 > 🦷 [BT]	📋 Message ID: unknown...
 17:34:44 > 🦷 [BT]	[BLE-DIAG] jsonDecode: success
