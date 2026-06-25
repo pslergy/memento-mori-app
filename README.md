@@ -201,6 +201,6 @@ Memento Mori — memento mori: systems should survive disconnections.
 
 Independent research project. Core mesh algorithms are proprietary until formal validation. Community client and core protocols remain open-source.
 
-*Independent research project.*
+
 
 </div>
