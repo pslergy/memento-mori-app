@@ -13,7 +13,8 @@ The project is entering the active testing phase.
 [![Website](https://img.shields.io/badge/Website-GitHub%20Pages-blue.svg)](https://pslergy.github.io/memento-mori-app/)
 
 **Autonomous decentralized communication for constrained networks**  
-*Delay-tolerant • Mesh-first • Air-gap–friendly scenarios*
+*Built on a resilient mesh networking protocol — no servers, no internet, no single point of failure.
+Delay-tolerant • Mesh-first • Air-gap–friendly scenarios*
 
 <br>
 
@@ -50,6 +51,7 @@ Independent research into **delay-tolerant** and **ad hoc** mobile networking. C
 | **Censorship** | 50+ countries restrict or block communication apps |
 
 **Satellite phones** are expensive ($500–1000 + $1/min). **Radios** require licensing and don't scale. **Existing messengers** need internet.
+Memento Mori replaces the need for centralized servers with a self-organizing network protocol. Devices communicate directly, relaying data through the mesh without relying on any infrastructure.
 
 ---
 
@@ -65,6 +67,8 @@ Independent research into **delay-tolerant** and **ad hoc** mobile networking. C
 
 
 ## 🧠 Core research areas
+
+At its core, Memento Mori implements a decentralized mesh networking protocol — a set of rules for how devices discover each other, route messages, and synchronize data without a central server. This protocol is transport-agnostic (BLE, Wi-Fi Direct, acoustic) and designed for high-latency, low-connectivity environments.
 
 ### 1. Hardware-aware transport
 
@@ -82,6 +86,8 @@ Coping with vendor power limits, flaky radio, and Android BLE quirks (background
 ### 3. Distributed consistency
 
 Store-and-forward queues, **epidemic-style** relay with TTL/dedup, **CRDT-oriented** sync for partitioned histories. Full sync cycle: `HEAD_EXCHANGE` → `REQUEST_RANGE` → `LOG_ENTRIES`.
+
+These mechanisms form the backbone of the mesh networking protocol, ensuring reliable delivery even when nodes are only intermittently connected.
 
 ### 4. Local data protection
 
@@ -105,6 +111,7 @@ Transport diversity, optional **DPI-oriented** channel selection, **hop-count–
 | DPI-aware transport selection | ✅ Working | Smart channel selection |
 | Symmetrical Ratchet with Epoch-based Sync | ✅ Working | Optional mode |
 | Bridge (Internet Gateway) | ✅ Working | Host header substitution, HMAC signing |
+|  Mesh networking protocol |	✅ Working |	Decentralized, self-organizing, transport-agnostic |
 | Multi-Hop (3+ devices) | 🧪 Testing | Architecture ready, field validation needed |
 | Epidemic cycle | 🧪 Testing | Implemented but disabled by default |
 | Gradient-based routing | 🧪 Testing | Requires calibration with real data |
