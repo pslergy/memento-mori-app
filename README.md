@@ -68,7 +68,7 @@ Independent research into **delay-tolerant** and **ad hoc** mobile networking. C
 
 ### 1. Hardware-aware transport
 
-Coping with vendor power limits, flaky radio, and Android BLE quirks (background limits, `GATT_BUSY`, fragmentation).
+Coping with vendor power limits, flaky radio, and Android BLE quirks (background limits, `GATT_BUSY`, fragmentation). Supported vendors include **Huawei, Samsung, Tecno, Xiaomi, Honor** with vendor-specific profiles.
 
 ### 2. Hybrid transport stack
 
@@ -77,10 +77,11 @@ Coping with vendor power limits, flaky radio, and Android BLE quirks (background
 | **BLE** | Discovery, control, store-and-forward messaging |
 | **Wi‑Fi Direct** | On-demand higher throughput where supported |
 | **Acoustic (experimental)** | Close-range exchange without BLE/Wi‑Fi |
+| **LoRaWAN (planned)** | Long-range, low-bandwidth extension |
 
 ### 3. Distributed consistency
 
-Store-and-forward queues, **epidemic-style** relay with TTL/dedup, **CRDT-oriented** sync for partitioned histories.
+Store-and-forward queues, **epidemic-style** relay with TTL/dedup, **CRDT-oriented** sync for partitioned histories. Full sync cycle: `HEAD_EXCHANGE` → `REQUEST_RANGE` → `LOG_ENTRIES`.
 
 ### 4. Local data protection
 
@@ -96,15 +97,32 @@ Transport diversity, optional **DPI-oriented** channel selection, **hop-count–
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| BLE discovery & messaging | ✅ Working | Tested on multiple vendors |
-| CRDT-based history sync | ✅ Working | |
-| Store-and-forward outbox | ✅ Working | |
-| Wi-Fi Direct transport | ✅ Working | |
-| Acoustic channel | ✅ Working | Experimental |
-| DPI-aware transport selection | ✅ Working | |
+| BLE discovery & messaging | ✅ Working | Tested on Huawei, Samsung, Tecno, Xiaomi |
+| CRDT-based history sync | ✅ Working | Full cycle implemented |
+| Store-and-forward outbox | ✅ Working | Outbox → scan → connect → send → ACK → delete |
+| Wi-Fi Direct transport | ✅ Working | TCP fallback when BLE congested |
+| Acoustic channel | ✅ Working | Experimental, close-range |
+| DPI-aware transport selection | ✅ Working | Smart channel selection |
 | Symmetrical Ratchet with Epoch-based Sync | ✅ Working | Optional mode |
-| Gradient-based routing | 🧪 Testing | |
-| LoRa WAN integration | 📋 Planned | |
+| Bridge (Internet Gateway) | ✅ Working | Host header substitution, HMAC signing |
+| Multi-Hop (3+ devices) | 🧪 Testing | Architecture ready, field validation needed |
+| Epidemic cycle | 🧪 Testing | Implemented but disabled by default |
+| Gradient-based routing | 🧪 Testing | Requires calibration with real data |
+| LoRaWAN integration | 📋 Planned | For extended range |
+| Field tests (real terrain) | 📋 Planned | Forest, mountains, urban |
+| Stress tests (5–10+ nodes) | 📋 Planned | Network behavior under load |
+
+---
+
+## 🚧 Known Risks & Mitigations
+
+| Risk | Description | Mitigation |
+| :--- | :--- | :--- |
+| **Spray-and-Wait starvation** | Messages may not forward if neighbor's `deliveryScore < 0.5` | Calibration with real-field data |
+| **Entropy filtering** | May suppress popular message retransmission | Fine-tune coefficients |
+| **BLE scan congestion** | Scan blocked during GATT connection | Optimize `NetworkPhaseContext` phase model |
+| **Multi-hop reliability** | Not tested on 3+ devices | Test with 5–7 device fleet |
+| **Real terrain performance** | Forest/mountain/urban coverage unknown | Dedicated field test campaign |
 
 ---
 
@@ -179,7 +197,9 @@ Research welcome in transport behavior, crypto review, and DSP. Please read [**C
 
 <div align="center">
 
-**Memento Mori** — *memento mori*: systems should survive disconnections.
+Memento Mori — memento mori: systems should survive disconnections.
+
+Independent research project. Core mesh algorithms are proprietary until formal validation. Community client and core protocols remain open-source.
 
 *Independent research project.*
 
