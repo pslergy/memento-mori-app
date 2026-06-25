@@ -37,6 +37,33 @@ Independent research into **delay-tolerant** and **ad hoc** mobile networking. C
 
 ---
 
+## 🌍 The Global Problem
+
+**2.6 billion people** worldwide lack reliable internet access. Hundreds of millions more face routine censorship, network shutdowns, or are left without communication during natural disasters. In remote areas, mountains, mines, and disaster zones, people are cut off.
+
+| Challenge | Impact |
+| :--- | :--- |
+| **Network shutdowns** | 100+ documented internet shutdowns in 2024 alone |
+| **No cellular coverage** | 60%+ of landmass in many countries lacks coverage |
+| **Disaster zones** | Earthquakes, hurricanes, floods — cellular infrastructure fails first |
+| **Remote operations** | Mines, forests, offshore — no connectivity, high risk |
+| **Censorship** | 50+ countries restrict or block communication apps |
+
+**Satellite phones** are expensive ($500–1000 + $1/min). **Radios** require licensing and don't scale. **Existing messengers** need internet.
+
+---
+
+| Sector | Use Case | Typical Nodes |
+| :--- | :--- | :--- |
+| 🚨 **Search & Rescue** | Coordinating teams in remote areas | 10–100 |
+| 🌊 **NGOs & Humanitarian** | Aid missions in disaster zones | 50–500 |
+| ⛑️ **Emergency Services** | Fire, flood, earthquake response | 100–1000+ |
+| 🏔️ **Mining & Energy** | Operations in underground/offshore sites | 50–200 |
+| 🌲 **Forestry & Agriculture** | Remote land management | 20–100 |
+| 🗣️ **Journalists & Activists** | Secure communication under censorship | 5–50 |
+| 🏕️ **Adventure & Tourism** | Expeditions, trekking, sailing | 2–20 |
+
+
 ## 🧠 Core research areas
 
 ### 1. Hardware-aware transport
@@ -115,6 +142,24 @@ Transport diversity, optional **DPI-oriented** channel selection, **hop-count–
 
 
 ---
+
+📈 Business Model (Enterprise)
+Pay-Per-Node Licensing — value scales with deployment size.
+
+Deployment Size	Approx. Nodes	Target Sector
+Small Team	5–10	Search & rescue, expeditions
+Medium Operation	50–200	Mining, forestry, NGO missions
+Large Enterprise	500–2000+	Emergency services, government
+Custom	Varies	Military, critical infrastructure
+Additional Revenue: Customization, LoRa integration, API, support & maintenance.
+
+🗺️ Roadmap
+Timeline	Milestone
+Month 1	Test fleet (5–7 devices), multi-hop validation, stress tests
+Month 2	Field tests (forest, mountains, urban), calibration
+Month 3	LoRaWAN integration, UI/UX MVP enhancements
+Month 4–6	Pilot programs with enterprise clients, user testing
+Month 7+	General availability, support for iOS
 
 
 
