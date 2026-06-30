@@ -5,7 +5,16 @@ https://pslergy.github.io/memento-mori-app
 
 The project is entering the active testing phase.
 
-### Resilient offline-first mesh infrastructure
+## Project maturity
+
+Current TRL (Technology Readiness Level): 3–4
+
+✅ Core architecture implemented
+✅ Single-hop operation validated
+🧪 Multi-hop field validation in progress
+📋 Enterprise pilot programs planned
+
+### Research platform for decentralized resilient communications
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Android-green.svg)](https://flutter.dev)
@@ -118,6 +127,34 @@ Transport diversity, optional **DPI-oriented** channel selection, **hop-count–
 | LoRaWAN integration | 📋 Planned | For extended range |
 | Field tests (real terrain) | 📋 Planned | Forest, mountains, urban |
 | Stress tests (5–10+ nodes) | 📋 Planned | Network behavior under load |
+
+---
+## Roadmap: Native Core Transition
+
+Memento Mori is evolving from a Flutter/Dart prototype into a production-oriented multi-language architecture.
+
+Current architecture successfully validates:
+
+BLE mesh communication;
+DTN message routing;
+CRDT synchronization;
+gossip-based propagation;
+adaptive transport strategies.
+
+To improve performance, portability and production readiness, core networking components are being gradually migrated to:
+
+C++ — mesh networking, DTN routing, cryptography and transport abstraction;
+Go — relay services, discovery, telemetry and backend infrastructure.
+
+Flutter remains the primary cross-platform UI framework.
+
+This transition aims to provide:
+
+lower latency;
+reduced memory usage;
+native platform integration;
+better scalability;
+future embedded and Linux deployments.
 
 ---
 
